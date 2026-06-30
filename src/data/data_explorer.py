@@ -10,16 +10,18 @@ import seaborn as sns
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.db.oracle_connection import OracleConnector
+from src.db.mssql_connection import MSSQLConnector
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def explore_data():
-    logger.info("Starting data exploration...")
+def explore_data(sample_size=1000):
+    """Utility function to check data distributions and basic stats."""
+    logger.info("Initializing data exploration...")
     
     try:
-        conn = OracleConnector()
+        # Load a sample from database
+        conn = MSSQLConnector()
         # Instead of loading everything, we can get counts and sample data
         # Check snapshot dates
         snapshot_query = f"SELECT {config.SNAPSHOT_COL}, COUNT(*) as CNT FROM {config.TRAIN_TABLE} GROUP BY {config.SNAPSHOT_COL} ORDER BY {config.SNAPSHOT_COL}"

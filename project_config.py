@@ -2,11 +2,10 @@ import os
 from pathlib import Path
 
 # ── Database ─────────────────────────────────────────────
-ORACLE_HOST = os.getenv("ORACLE_HOST", "localhost")
-ORACLE_PORT = int(os.getenv("ORACLE_PORT", "1521"))
-ORACLE_SERVICE = os.getenv("ORACLE_SERVICE", "ORCL")
-ORACLE_USER = os.getenv("ORACLE_USER", "admin")
-ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD", "password")
+MSSQL_SERVER = os.getenv("MSSQL_SERVER", "localhost")
+MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "EDP")
+MSSQL_USER = os.getenv("MSSQL_USER", "sa")
+MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "password")
 
 # ── Tables & Columns ────────────────────────────────────
 TRAIN_TABLE = "EDP_Feature_Train"

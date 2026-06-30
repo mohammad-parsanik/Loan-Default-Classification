@@ -36,6 +36,7 @@ class DomainAwareImputer(BaseEstimator, TransformerMixin):
                 valid_data = col_data[~np.isnan(col_data)]
                 self.max_days_since[i] = np.max(valid_data) + 1 if len(valid_data) > 0 else 9999
                 
+        self.is_fitted_ = True
         return self
         
     def transform(self, X):
@@ -83,6 +84,7 @@ class OutlierClipper(BaseEstimator, TransformerMixin):
                 p99 = np.percentile(col_data, 99)
                 self.percentiles[i] = (p1, p99)
                 
+        self.is_fitted_ = True
         return self
         
     def transform(self, X):
@@ -108,6 +110,7 @@ class PortfolioRobustScaler(BaseEstimator, TransformerMixin):
         self.scaler = RobustScaler()
         
     def fit(self, X, y=None):
+        self.is_fitted_ = True
         if not self.scale_indices:
             return self
             

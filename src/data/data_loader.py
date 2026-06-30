@@ -2,18 +2,20 @@ import pandas as pd
 import numpy as np
 import logging
 import sys
+import joblib
 from pathlib import Path
+from tqdm import tqdm
 
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.db.oracle_connection import OracleConnector
+from src.db.mssql_connection import MSSQLConnector
 
 logger = logging.getLogger(__name__)
 
 class DataLoader:
-    def __init__(self, oracle_connector=None):
-        self.conn = oracle_connector
+    def __init__(self, mssql_connector=None):
+        self.conn = mssql_connector
         
     def _compute_capped_label(self, group: pd.DataFrame) -> int:
         """
@@ -45,7 +47,7 @@ class DataLoader:
         grouped = df.groupby([config.CUSTOMER_COL, config.SNAPSHOT_COL])
         
         instances = []
-        for (national_code, snapshot_date), group in grouped:
+        for (national_code, snapshot_date), group in tqdm(grouped, desc="Customer Portfolios", total=len(grouped)):
             # Calculate target
             label = self._compute_capped_label(group)
             
@@ -67,37 +69,55 @@ class DataLoader:
         logger.info(f"Created {len(instances)} customer portfolio instances.")
         return instances, features
 
-    def load_train_portfolios(self, snapshot_dates: list = None, max_loans: int = None) -> tuple:
+    def load_train_portfolios(self, snapshot_dates: list = None, max_loans: int = None, use_cache: bool = True) -> tuple:
         """
         End-to-end load of training data from Oracle to portfolio instances.
         Returns (instances, feature_names).
         """
+        cache_path = config.DATA_DIR / "train_portfolios_cache.joblib"
+        if use_cache and cache_path.exists():
+            logger.info(f"Loading cached training portfolios from {cache_path}")
+            return joblib.load(cache_path)
+            
         if self.conn is None:
-            self.conn = OracleConnector()
+            self.conn = MSSQLConnector()
             close_conn = True
         else:
             close_conn = False
             
         try:
             df = self.conn.load_training_data(snapshot_dates=snapshot_dates)
-            return self.process_raw_data(df, max_loans)
+            instances, features = self.process_raw_data(df, max_loans)
+            if use_cache:
+                logger.info(f"Saving training portfolios to cache {cache_path}")
+                joblib.dump((instances, features), cache_path)
+            return instances, features
         finally:
             if close_conn:
                 self.conn.close()
                 
-    def load_pred_portfolios(self, snapshot_date: int, max_loans: int = None) -> tuple:
+    def load_pred_portfolios(self, snapshot_date: int, max_loans: int = None, use_cache: bool = True) -> tuple:
         """
         End-to-end load of prediction data from Oracle to portfolio instances.
         """
+        cache_path = config.DATA_DIR / f"pred_portfolios_cache_{snapshot_date}.joblib"
+        if use_cache and cache_path.exists():
+            logger.info(f"Loading cached prediction portfolios from {cache_path}")
+            return joblib.load(cache_path)
+            
         if self.conn is None:
-            self.conn = OracleConnector()
+            self.conn = MSSQLConnector()
             close_conn = True
         else:
             close_conn = False
             
         try:
             df = self.conn.load_prediction_data(snapshot_date=snapshot_date)
-            return self.process_raw_data(df, max_loans)
+            instances, features = self.process_raw_data(df, max_loans)
+            if use_cache:
+                logger.info(f"Saving prediction portfolios to cache {cache_path}")
+                joblib.dump((instances, features), cache_path)
+            return instances, features
         finally:
             if close_conn:
                 self.conn.close()

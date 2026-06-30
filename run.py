@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import joblib
 import torch
+from tqdm import tqdm
 
 import project_config as config
 from src.data.data_explorer import explore_data
@@ -51,17 +52,19 @@ def train_pipeline():
     preprocessor.fit(X_train_raw)
     
     # Transform all splits
-    def apply_prep(inst_list):
+    def apply_prep(inst_list, name="data"):
         if not inst_list: return []
+        logger.info(f"Extracting features for {name}...")
         X = [i['features'] for i in inst_list]
+        logger.info(f"Scaling {name} features...")
         X_scaled = preprocessor.transform(X)
-        for i, inst in enumerate(inst_list):
+        for i, inst in enumerate(tqdm(inst_list, desc=f"Updating {name} features", total=len(inst_list))):
             inst['features'] = X_scaled[i]
         return inst_list
         
-    train_inst = apply_prep(train_inst)
-    val_inst = apply_prep(val_inst)
-    test_inst = apply_prep(test_inst)
+    train_inst = apply_prep(train_inst, "Train")
+    val_inst = apply_prep(val_inst, "Val")
+    test_inst = apply_prep(test_inst, "Test")
     
     # Save preprocessor
     joblib.dump(preprocessor, run_dir / "scaler.pkl")
