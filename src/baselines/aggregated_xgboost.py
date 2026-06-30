@@ -1,98 +1,94 @@
+"""
+Aggregated XGBoost baseline.
+
+For each customer portfolio, computes min/max/mean/std across all loan features
+and appends loan count → flat feature vector.  Trained directly with XGBoost
+(no neural network).
+
+Used as a comparison benchmark: the DeepSets pipeline must beat this by ≥ 3% Macro F1.
+"""
+
+import logging
+from typing import Optional
+
 import numpy as np
 import xgboost as xgb
-from sklearn.metrics import f1_score, cohen_kappa_score, brier_score_loss
-import logging
-from typing import List, Dict
+
+from src.evaluation.metrics import compute_metrics
 
 logger = logging.getLogger(__name__)
 
+
 class AggregatedXGBoostBaseline:
     """
-    Baseline model that flattens portfolios by computing min, max, mean, std
-    for all features across a customer's loans.
+    Flattens portfolios via min/max/mean/std statistics per feature, then trains XGBoost.
+    Works with instances in the standard dict format:
+        {'features': (n_loans, n_features) np.float32, 'label': int, ...}
     """
-    def __init__(self, random_state=42):
+
+    def __init__(self, random_state: int = 42):
+        self.random_state = random_state
+        self.model: Optional[xgb.XGBClassifier] = None
+
+    def _aggregate(self, instances: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+        """Convert portfolio instances → flat feature matrix."""
+        X, y = [], []
+        for inst in instances:
+            f = inst["features"]  # (n_loans, n_features)
+            row = np.concatenate([
+                np.min(f,  axis=0),
+                np.max(f,  axis=0),
+                np.mean(f, axis=0),
+                np.std(f,  axis=0),
+                [inst["n_loans"]],
+            ])
+            X.append(row)
+            y.append(inst["label"])
+        return np.vstack(X), np.array(y, dtype=np.int32)
+
+    @staticmethod
+    def _sample_weights(y: np.ndarray) -> np.ndarray:
+        classes, counts = np.unique(y, return_counts=True)
+        w = {c: len(y) / (len(classes) * cnt) for c, cnt in zip(classes, counts)}
+        return np.array([w[yi] for yi in y])
+
+    def train(self, train_inst: list[dict], val_inst: Optional[list[dict]] = None) -> None:
+        logger.info("Aggregating features for baseline…")
+        X_train, y_train = self._aggregate(train_inst)
+        sw_train = self._sample_weights(y_train)
+
+        eval_set = None
+        if val_inst:
+            X_val, y_val = self._aggregate(val_inst)
+            eval_set = [(X_val, y_val)]
+
+        logger.info(f"Training XGBoost on {X_train.shape[1]} aggregated features…")
         self.model = xgb.XGBClassifier(
-            objective='multi:softprob',
+            objective="multi:softprob",
             num_class=3,
             n_estimators=200,
             max_depth=5,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            random_state=random_state,
-            n_jobs=-1
+            random_state=self.random_state,
+            n_jobs=-1,
         )
-        
-    def _aggregate_features(self, instances: List[Dict]) -> tuple:
-        """Convert list of portfolio instances to flat feature matrix."""
-        X = []
-        y = []
-        
-        for inst in instances:
-            features = inst['features']  # (n_loans, n_features)
-            
-            # Compute stats
-            f_min = np.min(features, axis=0)
-            f_max = np.max(features, axis=0)
-            f_mean = np.mean(features, axis=0)
-            f_std = np.std(features, axis=0)
-            
-            # Include n_loans as a feature
-            n_loans = np.array([inst['n_loans']])
-            
-            # Concatenate all stats
-            flat_features = np.concatenate([f_min, f_max, f_mean, f_std, n_loans])
-            
-            X.append(flat_features)
-            y.append(inst['label'])
-            
-        return np.vstack(X), np.array(y)
-        
-    def train(self, train_inst: List[Dict], val_inst: List[Dict] = None):
-        logger.info("Aggregating features for baseline...")
-        X_train, y_train = self._aggregate_features(train_inst)
-        
-        eval_set = None
-        if val_inst:
-            X_val, y_val = self._aggregate_features(val_inst)
-            eval_set = [(X_val, y_val)]
-            
-        logger.info(f"Training XGBoost on {X_train.shape[1]} aggregated features...")
-        
-        # Calculate sample weights (inverse class frequency)
-        classes, counts = np.unique(y_train, return_counts=True)
-        weight_dict = {c: len(y_train) / (len(classes) * count) for c, count in zip(classes, counts)}
-        sample_weights = np.array([weight_dict[y] for y in y_train])
-        
         self.model.fit(
             X_train, y_train,
             eval_set=eval_set,
-            sample_weight=sample_weights,
-            verbose=False
+            sample_weight=sw_train,
+            verbose=False,
         )
         logger.info("Baseline training complete.")
-        
-    def evaluate(self, test_inst: List[Dict]) -> dict:
-        X_test, y_test = self._aggregate_features(test_inst)
-        
+
+    def evaluate(self, test_inst: list[dict]) -> dict:
+        X_test, y_test = self._aggregate(test_inst)
         probs = self.model.predict_proba(X_test)
         preds = self.model.predict(X_test)
-        
-        # Metrics
-        macro_f1 = f1_score(y_test, preds, average='macro')
-        qwk = cohen_kappa_score(y_test, preds, weights='quadratic')
-        
-        # One-hot encode true labels for Brier score
-        y_true_oh = np.zeros((len(y_test), 3))
-        y_true_oh[np.arange(len(y_test)), y_test] = 1
-        brier = np.mean([brier_score_loss(y_true_oh[:, c], probs[:, c]) for c in range(3)])
-        
-        metrics = {
-            "macro_f1": float(macro_f1),
-            "qwk": float(qwk),
-            "brier_score": float(brier)
-        }
-        
-        logger.info(f"Baseline Results: Macro F1={macro_f1:.4f}, QWK={qwk:.4f}, Brier={brier:.4f}")
+        metrics = compute_metrics(y_test, preds, probs)
+        logger.info(
+            f"Baseline → Macro F1={metrics['macro_f1']:.4f}, "
+            f"QWK={metrics['qwk']:.4f}, Brier={metrics.get('brier_score', '?'):.4f}"
+        )
         return metrics

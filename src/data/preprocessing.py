@@ -1,140 +1,173 @@
-import numpy as np
+"""
+Vectorised preprocessing pipeline.
+
+Performance vs. original:
+  - All three transformers now operate on a flat (N_total_loans, N_features) matrix
+    rather than looping over individual customer instances.
+  - fit()   : vstack once → compute stats
+  - transform() : vstack → transform matrix in one pass → np.split back
+  - Eliminates 3 redundant np.copy() passes and millions of Python iterations.
+"""
+
 import logging
+from typing import Optional
+
+import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
 logger = logging.getLogger(__name__)
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _vstack_split(X: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Stack list of 2-D arrays → flat matrix; also return sizes for re-splitting."""
+    sizes = np.array([arr.shape[0] for arr in X], dtype=np.int32)
+    flat = np.vstack(X)
+    return flat, sizes
+
+
+def _split_back(flat: np.ndarray, sizes: np.ndarray) -> list[np.ndarray]:
+    """Reverse of _vstack_split — split flat matrix into per-instance arrays."""
+    split_indices = np.cumsum(sizes[:-1])
+    return np.split(flat, split_indices)
+
+
+# ── Step 1: Domain-aware imputer ──────────────────────────────────────────────
+
 class DomainAwareImputer(BaseEstimator, TransformerMixin):
     """
-    Custom imputer based on feature groups.
-    - Trajectory/Flags/Counts -> 0
-    - days_since -> max_train + 1
-    - Ratios/Amounts -> median
+    Imputes NaN values by feature group:
+      - DAYS_SINCE_*   → max value seen in training + 1  (event never happened)
+      - *AMNT* / *RATIO* → median (fitted on training flat matrix)
+      - Everything else → 0  (trajectory lags, binary flags, counts)
     """
-    def __init__(self, feature_names):
+
+    def __init__(self, feature_names: list[str]):
         self.feature_names = feature_names
-        self.medians = {}
-        self.max_days_since = {}
-        
-    def fit(self, X, y=None):
-        # Flatten all customer portfolios to compute global statistics
-        # X is a list of 2D numpy arrays (n_loans, n_features)
-        all_loans = np.vstack(X)
-        
+
+    def fit(self, X: list[np.ndarray], y=None):
+        flat, _ = _vstack_split(X)          # (N_total, F)
+
+        self.fill_values_: dict[int, float] = {}
+
         for i, col in enumerate(self.feature_names):
-            col_data = all_loans[:, i]
-            
-            # Learn medians for amounts and ratios
-            if "AMNT" in col or "RATIO" in col:
-                valid_data = col_data[~np.isnan(col_data)]
-                self.medians[i] = np.median(valid_data) if len(valid_data) > 0 else 0
-                
-            # Learn max + 1 for days_since
-            elif col.startswith("DAYS_SINCE"):
-                valid_data = col_data[~np.isnan(col_data)]
-                self.max_days_since[i] = np.max(valid_data) + 1 if len(valid_data) > 0 else 9999
-                
+            col_data = flat[:, i]
+            valid    = col_data[~np.isnan(col_data)]
+
+            if col.startswith("DAYS_SINCE"):
+                self.fill_values_[i] = float(valid.max() + 1) if len(valid) else 9999.0
+            elif "AMNT" in col or "RATIO" in col:
+                self.fill_values_[i] = float(np.median(valid)) if len(valid) else 0.0
+            else:
+                self.fill_values_[i] = 0.0
+
         self.is_fitted_ = True
         return self
-        
-    def transform(self, X):
-        X_out = []
-        for instance in X:
-            # Copy to avoid modifying original
-            inst = np.copy(instance)
-            
-            for i, col in enumerate(self.feature_names):
-                mask = np.isnan(inst[:, i])
-                if not np.any(mask):
-                    continue
-                    
-                if "AMNT" in col or "RATIO" in col:
-                    inst[mask, i] = self.medians.get(i, 0)
-                elif col.startswith("DAYS_SINCE"):
-                    inst[mask, i] = self.max_days_since.get(i, 9999)
-                else:
-                    # Trajectory, flags, counts default to 0
-                    inst[mask, i] = 0
-            
-            X_out.append(inst)
-        return X_out
 
+    def transform(self, X: list[np.ndarray], y=None) -> list[np.ndarray]:
+        flat, sizes = _vstack_split(X)      # single allocation
+
+        for i, fill in self.fill_values_.items():
+            nan_mask = np.isnan(flat[:, i])
+            if nan_mask.any():
+                flat[nan_mask, i] = fill
+
+        return _split_back(flat, sizes)
+
+
+# ── Step 2: Outlier clipper ───────────────────────────────────────────────────
 
 class OutlierClipper(BaseEstimator, TransformerMixin):
-    """Clips features at 1st and 99th percentile."""
-    def __init__(self, feature_names, binary_features):
-        self.feature_names = feature_names
-        self.binary_features = binary_features
-        self.percentiles = {}
-        
-    def fit(self, X, y=None):
-        all_loans = np.vstack(X)
-        
+    """
+    Clips continuous features at [1st, 99th] percentile.
+    Ratios (*RATIO*) are clipped to [0, 1].
+    Binary features are skipped.
+    """
+
+    def __init__(self, feature_names: list[str], binary_features: list[str]):
+        self.feature_names  = feature_names
+        self.binary_features = set(binary_features)
+
+    def fit(self, X: list[np.ndarray], y=None):
+        flat, _ = _vstack_split(X)
+
+        self.bounds_: dict[int, tuple[float, float]] = {}
+
         for i, col in enumerate(self.feature_names):
             if col in self.binary_features:
                 continue
-            
-            col_data = all_loans[:, i]
+            col_data = flat[:, i]
             if "RATIO" in col:
-                self.percentiles[i] = (0.0, 1.0)
+                self.bounds_[i] = (0.0, 1.0)
             else:
-                p1 = np.percentile(col_data, 1)
-                p99 = np.percentile(col_data, 99)
-                self.percentiles[i] = (p1, p99)
-                
+                p1  = float(np.percentile(col_data, 1))
+                p99 = float(np.percentile(col_data, 99))
+                self.bounds_[i] = (p1, p99)
+
         self.is_fitted_ = True
         return self
-        
-    def transform(self, X):
-        X_out = []
-        for instance in X:
-            inst = np.copy(instance)
-            for i, bounds in self.percentiles.items():
-                inst[:, i] = np.clip(inst[:, i], bounds[0], bounds[1])
-            X_out.append(inst)
-        return X_out
 
+    def transform(self, X: list[np.ndarray], y=None) -> list[np.ndarray]:
+        flat, sizes = _vstack_split(X)
+
+        for i, (lo, hi) in self.bounds_.items():
+            np.clip(flat[:, i], lo, hi, out=flat[:, i])
+
+        return _split_back(flat, sizes)
+
+
+# ── Step 3: RobustScaler (non-binary only) ────────────────────────────────────
 
 class PortfolioRobustScaler(BaseEstimator, TransformerMixin):
-    """Applies RobustScaler to non-binary columns."""
-    def __init__(self, feature_names, binary_features):
-        self.feature_names = feature_names
-        self.binary_features = binary_features
-        
-        self.scale_indices = [
-            i for i, col in enumerate(self.feature_names) 
-            if col not in self.binary_features
+    """
+    Applies sklearn RobustScaler to all non-binary columns.
+    Binary features pass through unchanged.
+    """
+
+    def __init__(self, feature_names: list[str], binary_features: list[str]):
+        self.feature_names   = feature_names
+        self.binary_features = set(binary_features)
+
+        self.scale_indices_: list[int] = [
+            i for i, col in enumerate(feature_names) if col not in self.binary_features
         ]
-        self.scaler = RobustScaler()
-        
-    def fit(self, X, y=None):
+
+    def fit(self, X: list[np.ndarray], y=None):
         self.is_fitted_ = True
-        if not self.scale_indices:
+        if not self.scale_indices_:
             return self
-            
-        all_loans = np.vstack(X)
-        self.scaler.fit(all_loans[:, self.scale_indices])
+
+        flat, _ = _vstack_split(X)
+        self.scaler_ = RobustScaler()
+        self.scaler_.fit(flat[:, self.scale_indices_])
         return self
-        
-    def transform(self, X):
-        if not self.scale_indices:
+
+    def transform(self, X: list[np.ndarray], y=None) -> list[np.ndarray]:
+        if not self.scale_indices_:
             return X
-            
-        X_out = []
-        for instance in X:
-            inst = np.copy(instance)
-            # transform takes 2D array, we scale just the selected columns
-            inst[:, self.scale_indices] = self.scaler.transform(inst[:, self.scale_indices])
-            X_out.append(inst)
-        return X_out
+
+        flat, sizes = _vstack_split(X)
+        flat[:, self.scale_indices_] = self.scaler_.transform(flat[:, self.scale_indices_])
+        return _split_back(flat, sizes)
 
 
-def create_preprocessing_pipeline(feature_names, binary_features):
-    """Creates the full sklearn Pipeline for preprocessing portfolio instances."""
-    return Pipeline([
-        ('imputer', DomainAwareImputer(feature_names)),
-        ('clipper', OutlierClipper(feature_names, binary_features)),
-        ('scaler', PortfolioRobustScaler(feature_names, binary_features))
-    ])
+# ── Factory ───────────────────────────────────────────────────────────────────
+
+def create_preprocessing_pipeline(
+    feature_names: list[str],
+    binary_features: list[str],
+) -> Pipeline:
+    """
+    Creates the full sklearn Pipeline for preprocessing portfolio instances.
+    Accepts and returns list[np.ndarray] (one per customer portfolio).
+    """
+    return Pipeline(
+        [
+            ("imputer", DomainAwareImputer(feature_names)),
+            ("clipper", OutlierClipper(feature_names, binary_features)),
+            ("scaler",  PortfolioRobustScaler(feature_names, binary_features)),
+        ]
+    )

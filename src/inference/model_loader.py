@@ -1,59 +1,62 @@
-import torch
-import xgboost as xgb
-import joblib
 import json
 import logging
 from pathlib import Path
-import sys
 
-# Add project root to path
+import joblib
+import torch
+import xgboost as xgb
+
+import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.model.set_transformer import SetTransformer
+from src.model.deep_sets import DeepSets
 
 logger = logging.getLogger(__name__)
 
+
 class ModelLoader:
+    """Loads the full inference pipeline from an artifact directory."""
+
     def __init__(self, artifact_dir: Path):
         self.artifact_dir = artifact_dir
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
     def load_pipeline(self):
-        """Loads the scaler, transformer, and XGBoost models."""
-        logger.info(f"Loading models from {self.artifact_dir}...")
-        
-        # 1. Load Metadata
-        with open(self.artifact_dir / "metadata.json", "r") as f:
-            metadata = json.load(f)
-            
-        feature_count = metadata['feature_count']
-        max_loans = metadata['max_loans_per_customer_99th']
-        
-        # 2. Load Preprocessing Pipeline
-        scaler_path = self.artifact_dir / "scaler.pkl"
-        scaler = joblib.load(scaler_path)
+        """
+        Returns:
+            (scaler, deep_sets_model, xgb_model, max_loans, feature_names)
+        """
+        logger.info(f"Loading pipeline from {self.artifact_dir}…")
+
+        # Metadata
+        with open(self.artifact_dir / "metadata.json") as f:
+            meta = json.load(f)
+
+        feature_count = meta["feature_count"]
+        max_loans     = meta["max_loans_per_customer_99th"]
+        features      = meta.get("features", [])
+
+        # Scaler
+        scaler = joblib.load(self.artifact_dir / "scaler.pkl")
         logger.info("Loaded scaler pipeline.")
-        
-        # 3. Load Set-Transformer
-        transformer = SetTransformer(
+
+        # DeepSets model
+        model = DeepSets(
             n_features=feature_count,
-            d_model=config.D_MODEL,
-            n_heads=config.N_HEADS,
-            n_layers=config.N_LAYERS,
-            d_feedforward=config.D_FEEDFORWARD,
-            dropout=0.0  # Turn off dropout for inference
+            hidden_dim=config.DEEPSETS_HIDDEN_DIM,
+            embedding_dim=config.DEEPSETS_EMBED_DIM,
+            dropout=0.0,   # dropout off for inference
         )
-        
-        transformer_path = self.artifact_dir / "set_transformer.pt"
-        transformer.load_state_dict(torch.load(transformer_path, map_location=self.device))
-        transformer.to(self.device)
-        transformer.eval()
-        logger.info("Loaded Set-Transformer.")
-        
-        # 4. Load XGBoost
-        xgb_path = self.artifact_dir / "xgboost_model.json"
+        model.load_state_dict(
+            torch.load(self.artifact_dir / "deep_sets.pt", map_location=self.device)
+        )
+        model.to(self.device)
+        model.eval()
+        logger.info("Loaded DeepSets model.")
+
+        # XGBoost
         xgb_model = xgb.XGBClassifier()
-        xgb_model.load_model(xgb_path)
-        logger.info("Loaded XGBoost Meta-Learner.")
-        
-        return scaler, transformer, xgb_model, max_loans
+        xgb_model.load_model(self.artifact_dir / "xgboost_model.json")
+        logger.info("Loaded XGBoost meta-learner.")
+
+        return scaler, model, xgb_model, max_loans, features

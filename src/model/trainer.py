@@ -1,118 +1,180 @@
+"""
+Trainer for the DeepSets model.
+
+Fixes vs. original:
+  - scheduler.step(epoch + 1) — was step() which reset LR every epoch
+  - Per-epoch checkpoint saves to <checkpoint_dir>/epoch_{N:03d}.pt
+  - Returns loss/metric history for loss-curve plotting
+  - Logs wall-clock time per epoch
+"""
+
+import copy
+import logging
+import time
+from pathlib import Path
+from typing import Optional
+
 import torch
 import torch.nn.utils as nn_utils
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-import logging
-import copy
 from tqdm import tqdm
+
 from src.evaluation.metrics import compute_metrics
 
 logger = logging.getLogger(__name__)
 
+
 class TransformerTrainer:
-    """Trainer for the Set-Transformer using PyTorch."""
-    def __init__(self, model, criterion, config, device="cpu"):
-        self.model = model.to(device)
-        self.criterion = criterion.to(device)
-        self.device = device
-        self.config = config
-        
+    """
+    Generic trainer — works with any model that has the same forward signature as
+    DeepSets (features, padding_mask) → (logits, embedding).
+    """
+
+    def __init__(self, model, criterion, config, device: str = "cpu",
+                 checkpoint_dir: Optional[Path] = None):
+        self.model      = model.to(device)
+        self.criterion  = criterion.to(device)
+        self.device     = device
+        self.config     = config
+        self.checkpoint_dir = checkpoint_dir
+
         self.optimizer = AdamW(
-            self.model.parameters(), 
-            lr=config.LEARNING_RATE, 
-            weight_decay=config.WEIGHT_DECAY
+            self.model.parameters(),
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY,
         )
+        # CosineAnnealingWarmRestarts requires epoch index passed to step()
         self.scheduler = CosineAnnealingWarmRestarts(
-            self.optimizer, 
-            T_0=10, 
-            T_mult=2, 
-            eta_min=1e-6
+            self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
         )
-        
-    def train_epoch(self, dataloader):
+
+    # ── Single epoch ──────────────────────────────────────────────────────────
+
+    def train_epoch(self, dataloader) -> float:
         self.model.train()
         total_loss = 0.0
-        
-        for batch in tqdm(dataloader, desc="Training", leave=False):
-            features = batch['features'].to(self.device)
-            padding_mask = batch['padding_mask'].to(self.device)
-            labels = batch['label'].to(self.device)
-            
-            self.optimizer.zero_grad()
-            
+
+        for batch in tqdm(dataloader, desc="  train", leave=False):
+            features     = batch["features"].to(self.device)
+            padding_mask = batch["padding_mask"].to(self.device)
+            labels       = batch["label"].to(self.device)
+
+            self.optimizer.zero_grad(set_to_none=True)   # slightly faster than zero_grad()
+
             logits, _ = self.model(features, padding_mask)
             loss = self.criterion(logits, labels)
-            
+
             loss.backward()
             nn_utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
             self.optimizer.step()
+
             total_loss += loss.item() * features.size(0)
-            
+
         return total_loss / len(dataloader.dataset)
-        
-    def evaluate(self, dataloader):
+
+    def evaluate(self, dataloader) -> tuple[float, dict]:
         self.model.eval()
         total_loss = 0.0
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        
+        all_preds, all_labels, all_probs = [], [], []
+
         with torch.no_grad():
             for batch in dataloader:
-                features = batch['features'].to(self.device)
-                padding_mask = batch['padding_mask'].to(self.device)
-                labels = batch['label'].to(self.device)
-                
+                features     = batch["features"].to(self.device)
+                padding_mask = batch["padding_mask"].to(self.device)
+                labels       = batch["label"].to(self.device)
+
                 logits, _ = self.model(features, padding_mask)
                 loss = self.criterion(logits, labels)
-                
                 total_loss += loss.item() * features.size(0)
-                
+
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(probs, dim=1)
-                
+
                 all_probs.append(probs.cpu())
                 all_preds.append(preds.cpu())
                 all_labels.append(labels.cpu())
-                
-        avg_loss = total_loss / len(dataloader.dataset)
-        all_preds = torch.cat(all_preds).numpy()
-        all_labels = torch.cat(all_labels).numpy()
-        all_probs = torch.cat(all_probs).numpy()
-        
-        metrics = compute_metrics(all_labels, all_preds, all_probs)
-        return avg_loss, metrics
 
-    def train(self, train_dl, val_dl):
-        best_val_f1 = -1.0
-        best_model_state = None
-        patience_counter = 0
-        
-        logger.info(f"Starting training for {self.config.EPOCHS} epochs on {self.device}...")
-        
+        avg_loss  = total_loss / len(dataloader.dataset)
+        all_preds  = torch.cat(all_preds).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+        all_probs  = torch.cat(all_probs).numpy()
+
+        return avg_loss, compute_metrics(all_labels, all_preds, all_probs)
+
+    # ── Full training loop ────────────────────────────────────────────────────
+
+    def train(self, train_dl, val_dl) -> tuple[float, dict]:
+        """
+        Train for up to config.EPOCHS epochs with early stopping on val Macro F1.
+
+        Returns:
+            (best_val_f1, history)
+            history: dict with lists 'train_loss', 'val_loss', 'val_f1'
+        """
+        best_val_f1    = -1.0
+        best_state     = None
+        patience_ctr   = 0
+        history        = {"train_loss": [], "val_loss": [], "val_f1": []}
+
+        if self.checkpoint_dir:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"Starting training for up to {self.config.EPOCHS} epochs "
+            f"on {self.device} (patience={self.config.PATIENCE})…"
+        )
+
         for epoch in range(self.config.EPOCHS):
-            train_loss = self.train_epoch(train_dl)
+            t0 = time.perf_counter()
+
+            train_loss            = self.train_epoch(train_dl)
             val_loss, val_metrics = self.evaluate(val_dl)
-            
-            self.scheduler.step()
-            
-            val_f1 = val_metrics['macro_f1']
-            logger.info(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Macro F1: {val_f1:.4f}")
-            
+
+            # Fix: pass epoch index so cosine schedule advances correctly
+            self.scheduler.step(epoch + 1)
+
+            val_f1 = val_metrics["macro_f1"]
+            elapsed = time.perf_counter() - t0
+
+            logger.info(
+                f"Epoch {epoch+1:03d}/{self.config.EPOCHS} | "
+                f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+                f"val_f1={val_f1:.4f}  lr={self.scheduler.get_last_lr()[0]:.2e}  "
+                f"({elapsed:.1f}s)"
+            )
+
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["val_f1"].append(val_f1)
+
+            # Per-epoch checkpoint
+            if self.checkpoint_dir:
+                ckpt_path = self.checkpoint_dir / f"epoch_{epoch+1:03d}.pt"
+                torch.save(
+                    {
+                        "epoch":       epoch + 1,
+                        "model_state": self.model.state_dict(),
+                        "optimizer":   self.optimizer.state_dict(),
+                        "scheduler":   self.scheduler.state_dict(),
+                        "val_f1":      val_f1,
+                        "history":     history,
+                    },
+                    ckpt_path,
+                )
+
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
-                best_model_state = copy.deepcopy(self.model.state_dict())
-                patience_counter = 0
-                logger.info(f"  -> New best model! (Macro F1: {val_f1:.4f})")
+                best_state  = copy.deepcopy(self.model.state_dict())
+                patience_ctr = 0
+                logger.info(f"  ↑ New best model (val_f1={val_f1:.4f})")
             else:
-                patience_counter += 1
-                if patience_counter >= self.config.PATIENCE:
-                    logger.info(f"Early stopping triggered after {epoch+1} epochs.")
+                patience_ctr += 1
+                if patience_ctr >= self.config.PATIENCE:
+                    logger.info(f"Early stopping at epoch {epoch+1}.")
                     break
-                    
-        # Load best model
-        if best_model_state:
-            self.model.load_state_dict(best_model_state)
-            
-        return best_val_f1
+
+        if best_state:
+            self.model.load_state_dict(best_state)
+
+        return best_val_f1, history
