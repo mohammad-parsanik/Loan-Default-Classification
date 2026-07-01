@@ -103,12 +103,11 @@ class XGBoostMetaLearner:
             early_stop = xgb.callback.EarlyStopping(
                 rounds=20, metric_name="mlogloss", data_name="validation_0"
             )
-            mdl = xgb.XGBClassifier(**params)
+            mdl = xgb.XGBClassifier(**params, callbacks=[early_stop])
             mdl.fit(
                 X_train, y_train,
                 sample_weight=sw_train,
                 eval_set=[(X_val, y_val)],
-                callbacks=[early_stop],
                 verbose=False,
             )
 

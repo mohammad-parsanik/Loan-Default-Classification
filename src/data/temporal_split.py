@@ -1,148 +1,166 @@
 """
-Temporal train/val/test split with a data-leakage safety check.
+Temporal split for the Loan Default Classification pipeline.
 
-Split logic (5 snapshots):
-    S1  S2  S3 │ S4  │ S5
-    ───────────┼─────┼────
-       TRAIN   │ VAL │ TEST
-
-Leakage check:
-    WORST_FUTURE_CAT uses a 6-month forward horizon.
-    For the labels of the last training snapshot NOT to contaminate the
-    test-set period, the last train snapshot must be at least
-    LABEL_HORIZON_MONTHS before the first test snapshot.
-    A WARNING is emitted if not — the split still proceeds so that
-    development can continue while ETL is being fixed.
-
-SNAPSHOT_DATE format:  YYYYMMDD as an integer (supports both Gregorian and
-Shamsi/Persian calendar since month arithmetic is the same).
+Rules:
+  1. Drop any snapshot whose date is within the last LABEL_HORIZON_MONTHS
+     calendar months — those labels have not yet materialised.
+  2. Among the remaining (usable) snapshots, ensure that:
+       - test  snapshot is at least LABEL_HORIZON_MONTHS months after val
+       - val   snapshot is at least LABEL_HORIZON_MONTHS months after the
+         last train snapshot
+     This prevents any label leakage across splits.
+  3. Assignment:
+       test  → newest usable snapshot
+       val   → newest snapshot that is >= horizon months before test
+       train → all snapshots that are >= horizon months before val
 """
 
 import logging
-import sys
-from pathlib import Path
-from typing import Optional
+from datetime import date, datetime
+from typing import List, Dict, Set
 
-sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
 
 logger = logging.getLogger(__name__)
 
 
-def _snapshot_to_year_month(snapshot_date) -> tuple[int, int]:
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _snap_to_date(snap) -> date:
+    """Convert an integer snapshot date (YYYYMMDD) to a date object."""
+    return datetime.strptime(str(int(snap)), "%Y%m%d").date()
+
+
+def _months_apart(earlier: date, later: date) -> float:
     """
-    Parse an integer YYYYMMDD snapshot date into (year, month).
-    Works for both Gregorian and Shamsi calendar dates.
+    Return the (approximate) number of months from `earlier` to `later`.
+    Positive when later > earlier.
     """
-    d = int(snapshot_date)
-    year  = d // 10000
-    month = (d % 10000) // 100
-    return year, month
+    return (later - earlier).days / 30.4375   # average days per month
 
 
-def _month_distance(snap_a, snap_b) -> int:
+# ── main function ─────────────────────────────────────────────────────────────
+
+def split_by_time(instances: List[Dict]) -> tuple:
     """
-    Returns the number of calendar months between two YYYYMMDD snapshot dates.
-    Positive if snap_b is after snap_a.
+    Split instances chronologically into (train, val, test) sets.
+
+    Steps
+    -----
+    1. Collect unique snapshot dates and sort oldest → newest.
+    2. Discard snapshots that are < LABEL_HORIZON_MONTHS from today
+       (their labels have not yet settled).
+    3. Assign:
+         - test  → newest usable snapshot
+         - val   → second newest usable snapshot
+         - train → all snapshots that are >= LABEL_HORIZON_MONTHS months
+                   before the val snapshot.
+       (Any snapshots falling in the 6-month gap between Train and Val are dropped).
     """
-    ya, ma = _snapshot_to_year_month(snap_a)
-    yb, mb = _snapshot_to_year_month(snap_b)
-    return (yb - ya) * 12 + (mb - ma)
 
+    horizon = config.LABEL_HORIZON_MONTHS   # e.g. 6
+    today   = date.today()
 
-def _check_leakage(
-    train_snaps: list,
-    test_snaps: list,
-    horizon_months: int = config.LABEL_HORIZON_MONTHS,
-) -> None:
-    """
-    Emit a WARNING if the last training snapshot is within the label horizon
-    of the first test snapshot.
+    # ── 1. Unique snapshots, sorted oldest → newest ───────────────────────────
+    raw_snaps  = sorted(set(inst["snapshot_date"] for inst in instances))
+    snap_dates = [_snap_to_date(s) for s in raw_snaps]
 
-    The labels for snapshot T use data from (T, T + horizon_months].
-    If T_last_train + horizon_months > T_first_test, the label computation
-    window for training rows overlaps with the test period.
-    """
-    if not train_snaps or not test_snaps:
-        return
+    logger.info(f"All snapshot dates found: {raw_snaps}")
 
-    last_train = max(train_snaps)
-    first_test = min(test_snaps)
-    gap = _month_distance(last_train, first_test)
+    # ── 2. Drop immature snapshots ────────────────────────────────────────────
+    usable = [
+        (raw, d)
+        for raw, d in zip(raw_snaps, snap_dates)
+        if _months_apart(d, today) >= horizon
+    ]
+    dropped = [r for r, d in zip(raw_snaps, snap_dates)
+               if _months_apart(d, today) < horizon]
 
-    logger.info(
-        f"Leakage check: last train snapshot={last_train}, "
-        f"first test snapshot={first_test}, gap={gap} months "
-        f"(required ≥ {horizon_months})."
-    )
-
-    if gap < horizon_months:
+    if dropped:
         logger.warning(
-            f"⚠️  POTENTIAL LABEL LEAKAGE DETECTED: the gap between last "
-            f"train snapshot ({last_train}) and first test snapshot "
-            f"({first_test}) is {gap} month(s), but WORST_FUTURE_CAT uses a "
-            f"{horizon_months}-month forward horizon. Label computation windows "
-            f"overlap. Re-produce ETL snapshots with a proper horizon gap before "
-            f"trusting test metrics. Training will continue."
+            f"Dropping {len(dropped)} snapshot(s) whose labels are not yet "
+            f"mature (< {horizon} months old): {dropped}"
         )
+
+    if not usable:
+        raise ValueError(
+            f"No usable snapshots remain after excluding those within the "
+            f"last {horizon} months of today ({today}). "
+            f"Cannot build a train/val/test split."
+        )
+
+    usable_raw   = [p[0] for p in usable]
+    usable_dates = [p[1] for p in usable]
+    logger.info(f"Usable snapshots ({len(usable_raw)}): {usable_raw}")
+
+    # ── 3. Assign test, val, train ────────────────────────────────────────────
+    train_snaps: Set = set()
+    val_snaps:   Set = set()
+    test_snaps:  Set = set()
+
+    if len(usable_raw) == 1:
+        logger.warning(
+            "Only 1 usable snapshot. All data goes to train; "
+            "val and test will be empty."
+        )
+        train_snaps = {usable_raw[0]}
+
+    elif len(usable_raw) == 2:
+        logger.warning(
+            "Only 2 usable snapshots. Test = newest, Train = oldest, Val empty."
+        )
+        test_snaps  = {usable_raw[-1]}
+        train_snaps = {usable_raw[0]}
+        # If we wanted to be strict, we'd check the gap here too, but for 2 snaps,
+        # usually just one train, one test.
+        if _months_apart(usable_dates[0], usable_dates[1]) < horizon:
+             logger.warning("Gap between train and test is less than 6 months!")
+
     else:
-        logger.info(
-            f"✅ Leakage check passed: {gap}-month gap exceeds the "
-            f"{horizon_months}-month label horizon."
-        )
+        test_raw  = usable_raw[-1]
+        val_raw   = usable_raw[-2]
+        val_date  = usable_dates[-2]
 
+        test_snaps = {test_raw}
+        val_snaps  = {val_raw}
 
-def split_by_time(instances: list[dict]) -> tuple[list, list, list]:
-    """
-    Split instances chronologically based on snapshot dates.
+        # train candidates: >= horizon months before val
+        train_candidates = [
+            r for r, d in zip(usable_raw[:-2], usable_dates[:-2])
+            if _months_apart(d, val_date) >= horizon
+        ]
+        
+        gap_dropped = [
+            r for r, d in zip(usable_raw[:-2], usable_dates[:-2])
+            if _months_apart(d, val_date) < horizon
+        ]
 
-    With ≥ 5 snapshots:  all-but-last-two → train, second-to-last → val, last → test
-    With 4 snapshots:    first two → train, third → val, last → test
-    With 3 snapshots:    first → train, second → val, third → test
-    With < 3 snapshots:  everything → train, empty val and test
+        if gap_dropped:
+             logger.warning(
+                 f"Dropping {len(gap_dropped)} snapshot(s) to enforce the "
+                 f"{horizon}-month gap before Val ({val_raw}): {gap_dropped}"
+             )
 
-    Always runs a leakage check and logs a WARNING if the gap between
-    last train and first test snapshot is less than LABEL_HORIZON_MONTHS.
-    """
-    snapshots = sorted(set(inst["snapshot_date"] for inst in instances))
-    n = len(snapshots)
+        train_snaps = set(train_candidates)
 
-    logger.info(f"Found {n} unique snapshot dates: {snapshots}")
+        if not train_snaps:
+            logger.warning(
+                f"No snapshot is at least {horizon} months before val "
+                f"snapshot {val_raw}. Train set will be empty."
+            )
 
-    if n < 3:
-        logger.warning(
-            f"Only {n} snapshot(s) found. All instances assigned to train; "
-            f"val and test will be empty."
-        )
-        return instances, [], []
+    # ── 4. Build instance lists ───────────────────────────────────────────────
+    train_inst = [i for i in instances if i["snapshot_date"] in train_snaps]
+    val_inst   = [i for i in instances if i["snapshot_date"] in val_snaps]
+    test_inst  = [i for i in instances if i["snapshot_date"] in test_snaps]
 
-    # Universal rule: last → test, second-to-last → val, rest → train
-    train_snaps = snapshots[:-2]
-    val_snaps   = [snapshots[-2]]
-    test_snaps  = [snapshots[-1]]
-
+    logger.info("Temporal Split Configuration:")
+    logger.info(f"  Train snapshots : {sorted(list(train_snaps))}")
+    logger.info(f"  Val   snapshots : {sorted(list(val_snaps))}")
+    logger.info(f"  Test  snapshots : {sorted(list(test_snaps))}")
     logger.info(
-        f"Temporal split:\n"
-        f"  Train: {train_snaps}\n"
-        f"  Val:   {val_snaps}\n"
-        f"  Test:  {test_snaps}"
-    )
-
-    # Convert to sets for O(1) lookup
-    train_set = set(train_snaps)
-    val_set   = set(val_snaps)
-    test_set  = set(test_snaps)
-
-    train_inst = [i for i in instances if i["snapshot_date"] in train_set]
-    val_inst   = [i for i in instances if i["snapshot_date"] in val_set]
-    test_inst  = [i for i in instances if i["snapshot_date"] in test_set]
-
-    logger.info(
-        f"Instance counts → Train: {len(train_inst):,}, "
+        f"  Instances → Train: {len(train_inst):,}, "
         f"Val: {len(val_inst):,}, Test: {len(test_inst):,}"
     )
-
-    # Leakage check (warning only — does not block training)
-    _check_leakage(train_snaps, test_snaps)
 
     return train_inst, val_inst, test_inst

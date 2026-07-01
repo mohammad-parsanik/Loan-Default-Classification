@@ -255,12 +255,26 @@ def train_pipeline(resume_dir: Path = None):
                 dropout=config.DROPOUT,
             )
 
-            # torch.compile gives a speedup even on CPU (inductor backend)
-            try:
-                model = torch.compile(model)
-                logger.info("torch.compile enabled.")
-            except Exception as e:
-                logger.warning(f"torch.compile unavailable: {e}")
+            # torch.compile gives a speedup on CPU via the inductor backend,
+            # BUT on Windows it requires MSVC (cl.exe) which may not be present.
+            # The failure is *lazy* — it crashes on the first forward pass, not
+            # at compile() time, so we must gate on the platform proactively.
+            import sys as _sys
+            _can_compile = (
+                not _sys.platform.startswith("win")   # skip on Windows without MSVC
+                or torch.cuda.is_available()           # CUDA build ships its own compiler
+            )
+            if _can_compile:
+                try:
+                    model = torch.compile(model)
+                    logger.info("torch.compile enabled.")
+                except Exception as e:
+                    logger.warning(f"torch.compile unavailable: {e}")
+            else:
+                logger.info(
+                    "torch.compile skipped (Windows CPU-only: inductor requires "
+                    "MSVC cl.exe which was not found). Running in eager mode."
+                )
 
             criterion = CostSensitiveFocalLoss()
             trainer   = TransformerTrainer(

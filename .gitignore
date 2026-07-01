@@ -42,6 +42,7 @@ env/
 *.log
 *.sqlite
 logs/
+/results_1
 
 # IDEs
 .vscode/

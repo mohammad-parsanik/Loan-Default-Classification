@@ -123,8 +123,8 @@ class DataLoader:
         # Pre-extract numpy arrays (avoids per-group pandas overhead)
         X_all        = df[feature_cols].values.astype(np.float32)   # (N, F)
         y_all        = df[config.TARGET_COL].values                  # (N,)
-        customers    = df[config.CUSTOMER_COL].values                # (N,)
-        snapshots    = df[config.SNAPSHOT_COL].values                # (N,)
+        customers    = df[config.CUSTOMER_COL].to_numpy(dtype=object)                # (N,)
+        snapshots    = df[config.SNAPSHOT_COL].to_numpy(dtype=object)                # (N,)
 
         # Build composite group key and find group boundaries
         composite = np.char.add(
