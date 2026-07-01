@@ -8,6 +8,7 @@
 optimization_implementation_plan.md
 src/.DS_Store
 .DS_Store
+Walk-Forward Validation Implementation.md
 
 # Python
 __pycache__/
@@ -52,3 +53,4 @@ logs/
 /data/
 /models/
 /artifacts/
+/explore_output

@@ -38,6 +38,15 @@ BINARY_FEATURES = [
 # >= LABEL_HORIZON_MONTHS before the first test snapshot.
 LABEL_HORIZON_MONTHS = 6
 
+# ── Walk-Forward Validation ──────────────────────────────
+# Set WALK_FORWARD_ENABLED = True to run rolling-window cross-validation
+# across all valid (train, val, test) fold combinations.
+# Set to False to use a single static temporal split (original behaviour).
+WALK_FORWARD_ENABLED  = True
+# Minimum number of training snapshots required for a fold to be valid.
+# Folds with fewer training snapshots are skipped.
+MIN_TRAIN_SNAPSHOTS   = 1
+
 # ── Cache ────────────────────────────────────────────────
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)
 # to force cache invalidation without touching any code logic.
