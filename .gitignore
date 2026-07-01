@@ -49,6 +49,6 @@ logs/
 .idea/
 
 # Data and Models
-data/
-models/
-artifacts/
+/data/
+/models/
+/artifacts/
