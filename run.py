@@ -339,6 +339,12 @@ def train_pipeline(resume_dir: Path = None):
         ckpt.save("evaluation", final_metrics)
         ckpt.mark_done("evaluation")
 
+        # Export test embeddings and labels for downstream SHAP analysis
+        # (Consumed by explore_shap.py)
+        np.save(run_dir / "test_embeddings.npy", X_test_emb)
+        np.save(run_dir / "test_labels.npy", y_test)
+        logger.info("Exported test_embeddings.npy and test_labels.npy for SHAP.")
+
         # Plots
         with timed("Plots", timing):
             plot_confusion_matrix(y_test, y_pred,             save_path=plots_dir / "confusion_matrix.png")
