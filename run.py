@@ -200,6 +200,8 @@ def train_single_fold(
 
             for split_name, split in [("Train", train_inst), ("Val", val_inst), ("Test", test_inst)]:
                 logger.info(f"  Transforming {split_name} ({len(split):,} instances)…")
+                if not split:
+                    continue
                 X_raw    = [i["features"] for i in split]
                 X_scaled = preprocessor.transform(X_raw)
                 for inst, x in zip(split, X_scaled):

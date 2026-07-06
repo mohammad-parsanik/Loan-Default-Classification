@@ -9,6 +9,7 @@ optimization_implementation_plan.md
 src/.DS_Store
 .DS_Store
 Walk-Forward Validation Implementation.md
+leakage_analysis.md
 
 # Python
 __pycache__/
@@ -43,7 +44,7 @@ env/
 *.log
 *.sqlite
 logs/
-/results_1
+/results_*/
 
 # IDEs
 .vscode/

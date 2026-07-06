@@ -107,6 +107,7 @@ class TransformerTrainer:
     def train(self, train_dl, val_dl) -> tuple[float, dict]:
         """
         Train for up to config.EPOCHS epochs with early stopping on val Macro F1.
+        If validation optimization is disabled (val_dl is empty), trains for FIXED_EPOCHS.
 
         Returns:
             (best_val_f1, history)
@@ -120,33 +121,49 @@ class TransformerTrainer:
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        use_val = val_dl is not None and len(val_dl) > 0
+        n_epochs = self.config.EPOCHS if use_val else getattr(self.config, "FIXED_EPOCHS", 15)
+
         logger.info(
-            f"Starting training for up to {self.config.EPOCHS} epochs "
-            f"on {self.device} (patience={self.config.PATIENCE})…"
+            f"Starting training for up to {n_epochs} epochs "
+            f"on {self.device} (patience={self.config.PATIENCE if use_val else 'N/A'})…"
         )
 
-        for epoch in range(self.config.EPOCHS):
+        for epoch in range(n_epochs):
             t0 = time.perf_counter()
 
-            train_loss            = self.train_epoch(train_dl)
-            val_loss, val_metrics = self.evaluate(val_dl)
+            train_loss = self.train_epoch(train_dl)
+            
+            if use_val:
+                val_loss, val_metrics = self.evaluate(val_dl)
+                val_f1 = val_metrics["macro_f1"]
+            else:
+                val_loss, val_f1 = 0.0, 0.0
 
             # Fix: pass epoch index so cosine schedule advances correctly
             self.scheduler.step(epoch + 1)
 
-            val_f1 = val_metrics["macro_f1"]
             elapsed = time.perf_counter() - t0
 
-            logger.info(
-                f"Epoch {epoch+1:03d}/{self.config.EPOCHS} | "
-                f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-                f"val_f1={val_f1:.4f}  lr={self.scheduler.get_last_lr()[0]:.2e}  "
-                f"({elapsed:.1f}s)"
-            )
+            if use_val:
+                logger.info(
+                    f"Epoch {epoch+1:03d}/{n_epochs} | "
+                    f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+                    f"val_f1={val_f1:.4f}  lr={self.scheduler.get_last_lr()[0]:.2e}  "
+                    f"({elapsed:.1f}s)"
+                )
+            else:
+                logger.info(
+                    f"Epoch {epoch+1:03d}/{n_epochs} | "
+                    f"train_loss={train_loss:.4f}  "
+                    f"lr={self.scheduler.get_last_lr()[0]:.2e}  "
+                    f"({elapsed:.1f}s)"
+                )
 
             history["train_loss"].append(train_loss)
-            history["val_loss"].append(val_loss)
-            history["val_f1"].append(val_f1)
+            if use_val:
+                history["val_loss"].append(val_loss)
+                history["val_f1"].append(val_f1)
 
             # Per-epoch checkpoint
             if self.checkpoint_dir:
@@ -163,16 +180,20 @@ class TransformerTrainer:
                     ckpt_path,
                 )
 
-            if val_f1 > best_val_f1:
-                best_val_f1 = val_f1
-                best_state  = copy.deepcopy(self.model.state_dict())
-                patience_ctr = 0
-                logger.info(f"  ↑ New best model (val_f1={val_f1:.4f})")
+            if use_val:
+                if val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    best_state  = copy.deepcopy(self.model.state_dict())
+                    patience_ctr = 0
+                    logger.info(f"  ↑ New best model (val_f1={val_f1:.4f})")
+                else:
+                    patience_ctr += 1
+                    if patience_ctr >= self.config.PATIENCE:
+                        logger.info(f"Early stopping at epoch {epoch+1}.")
+                        break
             else:
-                patience_ctr += 1
-                if patience_ctr >= self.config.PATIENCE:
-                    logger.info(f"Early stopping at epoch {epoch+1}.")
-                    break
+                best_state = copy.deepcopy(self.model.state_dict())
+                best_val_f1 = 0.0
 
         if best_state:
             self.model.load_state_dict(best_state)

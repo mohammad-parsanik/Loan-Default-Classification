@@ -129,63 +129,83 @@ class XGBoostMetaLearner:
     ) -> None:
         logger.info("Extracting embeddings for XGBoost training…")
         X_train, y_train = self._extract_embeddings(train_dl)
-        X_val,   y_val   = self._extract_embeddings(val_dl)
-
         sw_train = self._sample_weights(y_train)
+        
+        use_val = val_dl is not None and len(val_dl) > 0
 
-        # ── Optuna study (SQLite → crash-safe) ────────────────────────────────
-        storage = None
-        if self.study_db:
-            storage = f"sqlite:///{self.study_db}"
-            logger.info(f"Optuna storage: {storage}")
+        if use_val:
+            X_val, y_val = self._extract_embeddings(val_dl)
 
-        study = optuna.create_study(
-            study_name="xgb_meta",
-            direction="maximize",
-            storage=storage,
-            load_if_exists=True,   # resume if study already exists
-        )
+            # ── Optuna study (SQLite → crash-safe) ────────────────────────────────
+            storage = None
+            if self.study_db:
+                storage = f"sqlite:///{self.study_db}"
+                logger.info(f"Optuna storage: {storage}")
 
-        # How many trials remain?
-        completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-        remaining = n_trials - completed
-        if remaining <= 0:
-            logger.info(f"Study already has {completed} completed trials — skipping Optuna.")
+            study = optuna.create_study(
+                study_name="xgb_meta",
+                direction="maximize",
+                storage=storage,
+                load_if_exists=True,   # resume if study already exists
+            )
+
+            # How many trials remain?
+            completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+            remaining = n_trials - completed
+            if remaining <= 0:
+                logger.info(f"Study already has {completed} completed trials — skipping Optuna.")
+            else:
+                logger.info(
+                    f"Running {remaining} Optuna trials "
+                    f"({completed} already completed)…"
+                )
+                objective = self._build_objective(X_train, y_train, sw_train, X_val, y_val)
+                study.optimize(
+                    objective,
+                    n_trials=remaining,
+                    n_jobs=2,          # 2 parallel trials (see n_jobs comment in objective)
+                    show_progress_bar=True,
+                )
+
+            self.best_params = study.best_params
+            best_trial       = study.best_trial
+            best_n_est       = best_trial.user_attrs.get("best_iteration", self.best_params["n_estimators"])
+
+            logger.info(f"Best Optuna Macro F1: {study.best_value:.4f}")
+            logger.info(f"Best params: {self.best_params}")
+            logger.info(f"Best n_estimators (from early stopping): {best_n_est}")
+
+            # ── Retrain on Train+Val with best params ──────────────────────────────
+            logger.info("Retraining on Train+Val with best parameters…")
+            X_full = np.vstack([X_train, X_val])
+            y_full = np.concatenate([y_train, y_val])
+            sw_full = self._sample_weights(y_full)
+
+            final_params = {
+                "objective":   "multi:softprob",
+                "num_class":   3,
+                "random_state": self.random_state,
+                "n_jobs":      -1,          # use all cores for final model
+                "n_estimators": best_n_est, # use the early-stopping-determined count
+            }
+            final_params.update({k: v for k, v in self.best_params.items() if k != "n_estimators"})
         else:
-            logger.info(
-                f"Running {remaining} Optuna trials "
-                f"({completed} already completed)…"
-            )
-            objective = self._build_objective(X_train, y_train, sw_train, X_val, y_val)
-            study.optimize(
-                objective,
-                n_trials=remaining,
-                n_jobs=2,          # 2 parallel trials (see n_jobs comment in objective)
-                show_progress_bar=True,
-            )
-
-        self.best_params = study.best_params
-        best_trial       = study.best_trial
-        best_n_est       = best_trial.user_attrs.get("best_iteration", self.best_params["n_estimators"])
-
-        logger.info(f"Best Optuna Macro F1: {study.best_value:.4f}")
-        logger.info(f"Best params: {self.best_params}")
-        logger.info(f"Best n_estimators (from early stopping): {best_n_est}")
-
-        # ── Retrain on Train+Val with best params ──────────────────────────────
-        logger.info("Retraining on Train+Val with best parameters…")
-        X_full = np.vstack([X_train, X_val])
-        y_full = np.concatenate([y_train, y_val])
-        sw_full = self._sample_weights(y_full)
-
-        final_params = {
-            "objective":   "multi:softprob",
-            "num_class":   3,
-            "random_state": self.random_state,
-            "n_jobs":      -1,          # use all cores for final model
-            "n_estimators": best_n_est, # use the early-stopping-determined count
-        }
-        final_params.update({k: v for k, v in self.best_params.items() if k != "n_estimators"})
+            logger.info("Validation optimization disabled. Training XGBoost with fixed default parameters on Train set.")
+            X_full = X_train
+            y_full = y_train
+            sw_full = sw_train
+            
+            final_params = {
+                "objective":   "multi:softprob",
+                "num_class":   3,
+                "random_state": self.random_state,
+                "n_jobs":      -1,
+                "n_estimators": 100,
+                "max_depth": 6,
+                "learning_rate": 0.1,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+            }
 
         self.xgb_model = xgb.XGBClassifier(**final_params)
         self.xgb_model.fit(X_full, y_full, sample_weight=sw_full, verbose=False)

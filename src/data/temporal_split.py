@@ -138,36 +138,67 @@ def split_by_time(instances: List[Dict]) -> tuple:
 
     else:
         test_raw  = usable_raw[-1]
-        val_raw   = usable_raw[-2]
-        val_date  = usable_dates[-2]
+        test_date = usable_dates[-1]
 
-        test_snaps = {test_raw}
-        val_snaps  = {val_raw}
-
-        # train candidates: >= horizon months before val
-        train_candidates = [
-            r for r, d in zip(usable_raw[:-2], usable_dates[:-2])
-            if _months_apart(d, val_date) >= horizon
-        ]
-        
-        gap_dropped = [
-            r for r, d in zip(usable_raw[:-2], usable_dates[:-2])
-            if _months_apart(d, val_date) < horizon
-        ]
-
-        if gap_dropped:
-             logger.warning(
-                 f"Dropping {len(gap_dropped)} snapshot(s) to enforce the "
-                 f"{horizon}-month gap before Val ({val_raw}): {gap_dropped}"
-             )
-
-        train_snaps = set(train_candidates)
-
-        if not train_snaps:
-            logger.warning(
-                f"No snapshot is at least {horizon} months before val "
-                f"snapshot {val_raw}. Train set will be empty."
-            )
+        if getattr(config, "OPTIMIZE_ON_VALIDATION", True):
+            val_raw   = usable_raw[-2]
+            val_date  = usable_dates[-2]
+            
+            test_snaps = {test_raw}
+            val_snaps  = {val_raw}
+            
+            # train candidates: >= horizon months before val
+            train_candidates = [
+                r for r, d in zip(usable_raw[:-2], usable_dates[:-2])
+                if _months_apart(d, val_date) >= horizon
+            ]
+            
+            gap_dropped = [
+                r for r, d in zip(usable_raw[:-2], usable_dates[:-2])
+                if _months_apart(d, val_date) < horizon
+            ]
+            
+            if gap_dropped:
+                 logger.warning(
+                     f"Dropping {len(gap_dropped)} snapshot(s) to enforce the "
+                     f"{horizon}-month gap before Val ({val_raw}): {gap_dropped}"
+                 )
+                 
+            train_snaps = set(train_candidates)
+            
+            if not train_snaps:
+                logger.warning(
+                    f"No snapshot is at least {horizon} months before val "
+                    f"snapshot {val_raw}. Train set will be empty."
+                )
+        else:
+            test_snaps = {test_raw}
+            val_snaps  = set()
+            
+            # train candidates: >= horizon months before test
+            train_candidates = [
+                r for r, d in zip(usable_raw[:-1], usable_dates[:-1])
+                if _months_apart(d, test_date) >= horizon
+            ]
+            
+            gap_dropped = [
+                r for r, d in zip(usable_raw[:-1], usable_dates[:-1])
+                if _months_apart(d, test_date) < horizon
+            ]
+            
+            if gap_dropped:
+                 logger.warning(
+                     f"Dropping {len(gap_dropped)} snapshot(s) to enforce the "
+                     f"{horizon}-month gap before Test ({test_raw}): {gap_dropped}"
+                 )
+                 
+            train_snaps = set(train_candidates)
+            
+            if not train_snaps:
+                logger.warning(
+                    f"No snapshot is at least {horizon} months before test "
+                    f"snapshot {test_raw}. Train set will be empty."
+                )
 
     # ── 4. Build instance lists ───────────────────────────────────────────────
     train_inst = [i for i in instances if i["snapshot_date"] in train_snaps]

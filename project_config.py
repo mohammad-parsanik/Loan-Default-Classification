@@ -38,14 +38,21 @@ BINARY_FEATURES = [
 # >= LABEL_HORIZON_MONTHS before the first test snapshot.
 LABEL_HORIZON_MONTHS = 6
 
-# ── Walk-Forward Validation ──────────────────────────────
+# ── Walk-Forward Validation & Optimization ───────────────
 # Set WALK_FORWARD_ENABLED = True to run rolling-window cross-validation
 # across all valid (train, val, test) fold combinations.
-# Set to False to use a single static temporal split (original behaviour).
-WALK_FORWARD_ENABLED  = True
+# Set to False to use a single static temporal split.
+WALK_FORWARD_ENABLED  = False
+
 # Minimum number of training snapshots required for a fold to be valid.
 # Folds with fewer training snapshots are skipped.
 MIN_TRAIN_SNAPSHOTS   = 1
+
+# Set OPTIMIZE_ON_VALIDATION = True to use a validation set for early
+# stopping and Optuna hyperparameter tuning. Set to False to train on
+# more data and test directly without validation leakage.
+OPTIMIZE_ON_VALIDATION = False
+
 
 # ── Cache ────────────────────────────────────────────────
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)
@@ -61,6 +68,7 @@ BATCH_SIZE           = 512
 LEARNING_RATE        = 5e-4
 WEIGHT_DECAY         = 1e-4
 EPOCHS               = 80
+FIXED_EPOCHS         = 15     # Used when OPTIMIZE_ON_VALIDATION = False
 PATIENCE             = 10
 NUM_WORKERS          = 2      # Small payload (MAX_LOANS≤7); 0 is also fine
 RANDOM_SEED          = 42

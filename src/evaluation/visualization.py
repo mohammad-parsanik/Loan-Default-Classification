@@ -94,23 +94,29 @@ def plot_training_curves(
 
     # Left: losses
     ax1.plot(epochs, history["train_loss"], label="Train Loss", color="steelblue")
-    ax1.plot(epochs, history["val_loss"],   label="Val Loss",   color="darkorange")
+    if history.get("val_loss"):
+        ax1.plot(epochs, history["val_loss"],   label="Val Loss",   color="darkorange")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss")
-    ax1.set_title("Training & Validation Loss")
+    ax1.set_title("Training & Validation Loss" if history.get("val_loss") else "Training Loss")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
     # Right: val F1
-    ax2.plot(epochs, history["val_f1"], label="Val Macro F1", color="mediumseagreen")
-    best_epoch = int(np.argmax(history["val_f1"])) + 1
-    best_f1    = max(history["val_f1"])
-    ax2.axvline(best_epoch, color="crimson", linestyle="--", alpha=0.6,
-                label=f"Best epoch {best_epoch} (F1={best_f1:.4f})")
+    if history.get("val_f1"):
+        ax2.plot(epochs, history["val_f1"], label="Val Macro F1", color="mediumseagreen")
+        best_epoch = int(np.argmax(history["val_f1"])) + 1
+        best_f1    = max(history["val_f1"])
+        ax2.axvline(best_epoch, color="crimson", linestyle="--", alpha=0.6,
+                    label=f"Best epoch {best_epoch} (F1={best_f1:.4f})")
+        ax2.set_title("Validation Macro F1")
+        ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, "Validation Disabled", ha="center", va="center", color="gray", fontsize=12)
+        ax2.set_title("Validation Macro F1 (Disabled)")
+        
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Macro F1")
-    ax2.set_title("Validation Macro F1")
-    ax2.legend()
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
