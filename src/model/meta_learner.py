@@ -17,6 +17,7 @@ import optuna
 import torch
 import xgboost as xgb
 
+import project_config as config
 from src.evaluation.metrics import compute_metrics
 
 logger = logging.getLogger(__name__)
@@ -175,11 +176,18 @@ class XGBoostMetaLearner:
             logger.info(f"Best params: {self.best_params}")
             logger.info(f"Best n_estimators (from early stopping): {best_n_est}")
 
-            # ── Retrain on Train+Val with best params ──────────────────────────────
-            logger.info("Retraining on Train+Val with best parameters…")
-            X_full = np.vstack([X_train, X_val])
-            y_full = np.concatenate([y_train, y_val])
-            sw_full = self._sample_weights(y_full)
+            # ── Final training set ─────────────────────────────────────────────────
+            # Customer-disjoint val must stay OUT of the final model: it is
+            # reused afterwards to fit the probability calibrator, which is
+            # only honest on data the final model never trained on.
+            if getattr(config, "VAL_SPLIT_MODE", "temporal") == "customer":
+                logger.info("Retraining on Train only (val reserved for calibration)…")
+                X_full, y_full, sw_full = X_train, y_train, sw_train
+            else:
+                logger.info("Retraining on Train+Val with best parameters…")
+                X_full = np.vstack([X_train, X_val])
+                y_full = np.concatenate([y_train, y_val])
+                sw_full = self._sample_weights(y_full)
 
             final_params = {
                 "objective":   "multi:softprob",

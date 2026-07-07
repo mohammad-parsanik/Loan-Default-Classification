@@ -144,10 +144,15 @@ These are the key toggles a new agent needs to understand:
 | Flag | Current Value | Purpose |
 |------|---------------|---------|
 | `WALK_FORWARD_ENABLED` | `False` | `True` = rolling-window CV across all valid folds. `False` = single static temporal split. Currently `False` because walk-forward found 0 valid folds with the available data (see Section 5). |
-| `OPTIMIZE_ON_VALIDATION` | `False` | `True` = use val set for early stopping + Optuna. `False` = skip Optuna, train for FIXED_EPOCHS with fixed XGB params, no val set created. This was introduced to eliminate Val-Test leakage (see Section 5). |
+| `OPTIMIZE_ON_VALIDATION` | `True` | `True` = use a val set for early stopping + Optuna. `False` = skip Optuna, train for FIXED_EPOCHS with fixed XGB params, no val set created (Run 3 mode). |
+| `VAL_SPLIT_MODE` | `"customer"` | How the val set is built when optimizing: `"customer"` = in-time customer-disjoint holdout (leakage-free tuning, see §6). `"temporal"` = legacy second-newest-snapshot val (leaky, Run 2). |
+| `CUSTOMER_VAL_FRACTION` | `0.20` | Share of customers held out when `VAL_SPLIT_MODE="customer"`. |
+| `COST_MATRIX` | 3×3 | Single source of truth for costs. Shared by the DeepSets loss, the expected-cost decision rule (`src/evaluation/decision.py`), and the `avg_cost` metric. |
+| `BASELINE_COST_WEIGHTS` | `True` | Baseline XGBoost sample weights scaled by cost-matrix row sums (same nudge the DeepSets gets from its loss) — makes the baseline-vs-model comparison fair. |
+| `RECALIBRATE_ON_PREDICT` | `True` | At predict time, refit the probability calibrator on the newest matured-label snapshot (tracks base-rate drift). |
 | `FIXED_EPOCHS` | `15` | Number of DeepSets training epochs when `OPTIMIZE_ON_VALIDATION = False`. |
 | `LABEL_HORIZON_MONTHS` | `6` | Forward prediction window. Also the minimum gap required between splits. |
-| `DATA_VERSION` | `"v1.0"` | Bump this to force NPZ cache invalidation when ETL changes. |
+| `DATA_VERSION` | `"v1.1"` | Bump this to force NPZ cache invalidation when ETL changes. v1.1 = truncation sort fix + `current_cats` in cache (old caches/run dirs are not resumable). |
 | `MAX_LOANS_PER_CUSTOMER` | `None` | Computed at runtime (99th percentile). Currently resolves to `2`. |
 
 ---
@@ -192,7 +197,8 @@ These are the key toggles a new agent needs to understand:
 ### Run 3 — Leakage-Free Run (OPTIMIZE_ON_VALIDATION = False)
 - **Date:** July 2, 2026
 - **Config:** `OPTIMIZE_ON_VALIDATION = False`, `WALK_FORWARD_ENABLED = False`
-- Ran in a fresh run dir (`artifacts/20260702_110830`); a mid-run crash was fixed and the run resumed, which is why the log shows `[skip]` lines. The data cache, preprocessing, and portfolio artifacts were reused; DeepSets hyperparameters came from the config file. **Unverified:** whether the DeepSets weights were retrained fresh for `FIXED_EPOCHS=15` in this run, or whether the loaded checkpoint originated from Run 2's early-stopped training (which was epoch-selected against the leaky Oct'25 val set — residual model-selection leakage in the encoder). To verify on the server: open `artifacts/20260702_110830/fold_01/stages/deepsets.done` — `best_val_f1: 0.0` means fresh no-validation training (leakage-free); a value ≈ 0.77 means Run 2's checkpoint was reused. A fresh run also leaves exactly `epoch_001.pt`–`epoch_015.pt` in `fold_01/checkpoints/` and a training-curves plot with no val curve.
+- Ran in a fresh run dir (`artifacts/20260702_110830`); a mid-run crash was fixed and the run resumed, which is why the log shows `[skip]` lines. The data cache, preprocessing, and portfolio artifacts were reused; DeepSets hyperparameters came from the config file.
+- **Verified clean (July 7, 2026):** the checkpoint directory contains exactly 15 `epoch_*.pt` files — the DeepSets weights were retrained fresh for `FIXED_EPOCHS=15` under the no-validation config, NOT reused from Run 2's early-stopped training. Run 3's metrics are genuinely unbiased.
 - **Snapshots:** Train: [Oct'24, Jan'25, Apr'25], Val: ∅ (no val set), Test: [Nov'25]
 - **Data:** 1.92M train / 0 val / 633K test instances
 - **Results:**
@@ -219,18 +225,33 @@ Strict walk-forward requires **two** 6-month buffer gaps: Train→Val and Val→
 ### The Val-Test Overlap Problem
 In the static split fallback, Val (Oct'25) and Test (Nov'25) are only 1 month apart. Their 6-month label windows overlap by 5 months. When Optuna and early stopping optimize against the Val labels, they are indirectly optimizing against the Test window — this is **model selection leakage**. The 0.7090 Macro F1 from Run 2 is biased upward.
 
-### The Resolution: `OPTIMIZE_ON_VALIDATION` Toggle
+### Resolution 1 (Run 3): `OPTIMIZE_ON_VALIDATION = False`
 When set to `False`:
 - `temporal_split.py` creates no validation set; the gap is enforced directly against test
 - `trainer.py` trains for `FIXED_EPOCHS` without early stopping
 - `meta_learner.py` uses fixed XGB hyperparameters (no Optuna)
 - Result: **unbiased test metrics**, but potentially worse model (no tuning)
 
+### Resolution 2 (July 7, 2026 — current default): customer-disjoint in-time validation
+`OPTIMIZE_ON_VALIDATION = True` + `VAL_SPLIT_MODE = "customer"`:
+- Train snapshots stay ≥ 6 months before test (same as the no-val branch)
+- A `CUSTOMER_VAL_FRACTION` (20%) customer-disjoint holdout is carved from the
+  train snapshots (stable md5 hash of `NATIONAL_CODE` — same customer never on
+  both sides)
+- Early stopping + Optuna run against this holdout. Its labels come from the
+  training era and never overlap the test label window → **tuning restored,
+  test metrics stay unbiased**
+- The final XGBoost trains on the 80% only; the 20% is reused to fit the
+  probability calibrator (honest only on data the final model never saw)
+- Caveat: hyperparameters are selected for cross-customer generalisation
+  within the training era, not across time — a much smaller, non-leaking risk
+
 ### Trade-off Summary
 | Approach | Test F1 | Bias | When to Use |
 |----------|---------|------|-------------|
-| `OPTIMIZE_ON_VALIDATION = True` | 0.7090 | **Biased** (upper bound) | When you need the best production model and accept inflated metrics |
-| `OPTIMIZE_ON_VALIDATION = False` | 0.6997 | **Unbiased** | When you need honest performance estimates for stakeholder reporting |
+| `True` + `VAL_SPLIT_MODE="temporal"` | 0.7090 | **Biased** (upper bound) | Legacy Run 2 behaviour; avoid |
+| `False` | 0.6997 | **Unbiased**, no tuning | Honest baseline without any val set |
+| `True` + `VAL_SPLIT_MODE="customer"` | TBD (Run 4) | **Unbiased**, tuning enabled | Current default |
 
 ---
 
@@ -244,7 +265,9 @@ Three standalone scripts exist in the project root for data quality analysis. Th
 | `explore_umap.py` | UMAP projection of raw features or model embeddings with CLI-tunable hyperparameters. |
 | `explore_shap.py` | SHAP TreeExplainer on XGBoost meta-learner. Needs `.npy` embeddings copied from the training server. |
 
-**Key finding from IV analysis:** Top features (`LOAN_CATEGORY`, `DPD_DAYS`) had very high IV values (>0.50, which normally signals leakage). After investigation, the conclusion was these are **genuinely strong signals** — they're point-in-time observations available at prediction time. The zero-variance binary features were also retained as they may gain signal with more snapshot data.
+**Key finding from IV analysis:** Top features (`LOAN_CATEGORY`, `DPD_DAYS`) had very high IV values (>0.50, which normally signals leakage). After investigation, the conclusion was these are **genuinely strong signals** — they're point-in-time observations available at prediction time. Note this is partly mechanical: DPD is a counter, so for already-delinquent customers the future label is largely predetermined by continued accrual. That is why evaluation is now also reported per current-category slice (the currently-clean slice is the real early-warning task).
+
+**Correction (July 7, 2026) — the "ten dead features" were an analysis artifact, not an ETL bug.** The old `explore_iv_woe.py` quantile binning collapsed to a single bin for any feature with ≳80% of its mass on one value, silently forcing IV = 0.0 for all 7 binary flags, `COUNT_90PLUS_DPD_LAST_3M`, and the closed-loan DPD columns. A DB check confirmed these columns ARE populated and varying. The binning is fixed (`_make_bins`: per-value bins for low-cardinality features, mode-vs-rest fallback for skewed ones); **re-run the script on the server to get true IVs** before drawing feature conclusions.
 
 ---
 
@@ -313,16 +336,30 @@ Loan Default Classification/
 2. **`Implementation_plan.md` is the original design doc** — many details have evolved (DeepSets replaced Transformer, Oracle replaced by MSSQL, walk-forward added then found infeasible). Treat it as historical context, not current truth.
 3. **`set_transformer.py` is dead code.** It exists but is never imported by `run.py`. The pipeline uses `deep_sets.py`.
 4. **Snapshot dates are stored as floats** (e.g., `20241021.0`), not integers or datetime. All temporal logic in `temporal_split.py` converts them to `datetime.date` for gap calculations.
-5. **The baseline consistently matches or beats DeepSets+XGB on Macro F1.** This is expected with MAX_LOANS=2. The DeepSets model's advantage is in Cat-2 recall (87% vs baseline's 76-78%) due to the cost-sensitive focal loss.
+5. **The baseline consistently matches or beats DeepSets+XGB on Macro F1.** This is expected with MAX_LOANS=2. The DeepSets model's Cat-2 recall advantage (87% vs 76-78% in Runs 2-3) was **confounded**: the DeepSets had a cost-sensitive loss while the baseline used plain argmax. Since July 7, 2026 both systems are evaluated under the same expected-cost decision rule (`cost_rule` metrics) — use those for architecture comparisons.
 6. **`torch.compile` is disabled on the Windows training server** (inductor requires MSVC). The model runs in eager mode.
-7. **Label-informed truncation bug (open):** `data_loader.process_raw_data` sorts each customer's loans by `WORST_FUTURE_DPD` (a label) descending, and the dataset keeps only the first `MAX_LOANS=2` rows — so for the ~1% of customers with 3+ loans, the label selects which loans the model sees. It also breaks inference: `EDP_Feature_pred` has no `WORST_FUTURE_*` columns, so `load_pred_portfolios` → `sort_values` will fail. Fix by sorting on a prediction-time feature (e.g., `DPD_DAYS` desc) in both paths.
+7. **Label-informed truncation bug (FIXED July 7, 2026):** `process_raw_data` used to sort each customer's loans by `WORST_FUTURE_DPD` (a label) before `MAX_LOANS` truncation — the label selected which loans the model saw, and the predict path crashed because `EDP_Feature_pred` has no `WORST_FUTURE_*` columns. Now sorts by `DPD_DAYS` desc in both paths; unlabelled tables get `label = -1`. Requires cache rebuild (`DATA_VERSION` v1.1).
 
 ---
 
-## 11. What's Next (Prioritized)
+## 11. Changes of July 7, 2026 (methodology overhaul — not yet run on server)
 
-1. **Wait for More Data (highest impact):** 2-3 more monthly snapshots will enable proper walk-forward validation with 6-month gaps. This is the single most impactful improvement.
-2. **Re-evaluate Architecture:** With MAX_LOANS=2, a simpler approach (direct XGBoost on raw features with cost-sensitive loss) might be competitive. Consider if the DeepSets → XGBoost two-stage pipeline is justified versus a single-stage model.
-3. **Feature Re-evaluation:** Re-run `explore_iv_woe.py` after new snapshots to verify high-IV features are genuinely strong and not artifacts of limited data.
-4. **Reduce Horizon (if business allows):** Shrinking from 6 to 3 months would halve the required gap sizes, enabling walk-forward immediately with existing data.
-5. **Production Deployment:** The inference pipeline (`src/inference/predictor.py`) exists but has not been tested end-to-end on the prediction table (`EDP_Feature_pred`).
+All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB).
+
+1. **Truncation leak + predict-path crash fixed** (`data_loader.py`) — see Gotcha 7.
+2. **Expected-cost decision rule** (`src/evaluation/decision.py`): predictions and the top-K ranking use `argmin(probs @ COST_MATRIX)` instead of argmax / ad-hoc `2·P₂+P₁`. Applied identically to baseline and model via `metrics.full_evaluation`.
+3. **Customer-disjoint in-time validation** (`temporal_split.split_train_by_customer`, `VAL_SPLIT_MODE="customer"`): restores early stopping + Optuna without test leakage (§6, Resolution 2).
+4. **Per-class isotonic calibration** (`src/evaluation/calibration.py`): fitted on the customer holdout (both baseline and meta-learner), saved as `calibrator.pkl`, applied before decisions/ranking. `Predictor` refreshes it on the newest matured snapshot when `RECALIBRATE_ON_PREDICT=True`.
+5. **Stratified evaluation**: every instance now carries `current_cat` (current worst `LOAN_CATEGORY`, capped to 3 classes, computed over ALL loans pre-truncation). Test metrics are reported per slice (`by_current_cat`). The `current_cat_0` slice — currently-clean customers — is the real early-warning task; aggregate F1 is inflated by the mechanical already-delinquent slices.
+6. **`metadata.json` now written per fold** — `ModelLoader` always required it but nothing produced it (inference would have failed).
+7. **IV binning fixed** in `explore_iv_woe.py` (see §7 correction). `explore_output/iv_report.csv` is stale until re-run.
+8. Cost matrix consolidated into `project_config.COST_MATRIX` (was duplicated in `losses.py` and `metrics.py`).
+
+## 12. What's Next (Prioritized)
+
+1. **Run 4 on the server:** delete/ignore old cache (v1.1 rebuild is automatic), then `python run.py train` with the new defaults (`OPTIMIZE_ON_VALIDATION=True`, `VAL_SPLIT_MODE="customer"`). Old run dirs are NOT resumable (instance dicts lack `current_cat`). This one run delivers: unbiased-but-tuned test metrics, the fair baseline-vs-DeepSets comparison under the shared cost rule, calibrated probabilities, and the per-slice numbers.
+2. **Re-run `explore_iv_woe.py`** (after the cache rebuild) for true IVs of the flags/rare-event features the old binning zeroed out.
+3. **Architecture decision:** if baseline ≈ DeepSets+XGB on the `cost_rule` and `current_cat_0` metrics in Run 4, retire the DeepSets stage — single XGBoost on named aggregated features is simpler, faster, and SHAP-explainable to auditors.
+4. **Wait for more data:** 2-3 more monthly snapshots enable strict walk-forward validation.
+5. **Reduce horizon (if business allows):** 6 → 3 months halves the gap requirements.
+6. **Production deployment:** predict path is now unit-tested but still needs one end-to-end run against `EDP_Feature_pred` on the server.

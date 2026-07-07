@@ -51,7 +51,12 @@ from src.evaluation.fold_aggregator import (
     log_fold_summary,
     save_fold_summary,
 )
-from src.evaluation.metrics import bootstrap_confidence_intervals, compute_metrics
+from src.evaluation.calibration import PerClassIsotonicCalibrator
+from src.evaluation.metrics import (
+    bootstrap_confidence_intervals,
+    compute_metrics,
+    full_evaluation,
+)
 from src.evaluation.visualization import (
     plot_confusion_matrix,
     plot_embeddings_umap,
@@ -185,6 +190,17 @@ def train_single_fold(
         max_loans = config.MAX_LOANS_PER_CUSTOMER
         logger.info(f"{fold_label} | Using configured MAX_LOANS: {max_loans}")
 
+    # Inference metadata (ModelLoader reads this at predict time)
+    (fold_dir / "metadata.json").write_text(json.dumps({
+        "feature_count": len(features),
+        "max_loans_per_customer_99th": max_loans,
+        "features": features,
+    }))
+
+    # Current-category strata for slice-level evaluation (order matches
+    # test_dl: shuffle=False preserves instance order)
+    test_strata = np.array([i["current_cat"] for i in test_inst])
+
     # ── Stage: Preprocessing ──────────────────────────────────────────────────
     stage_key = f"fold{fold_id:02d}_preprocessing"
     if ckpt.is_done("preprocessing"):
@@ -219,14 +235,35 @@ def train_single_fold(
         with timed(f"{fold_label}: Aggregated XGBoost baseline", timing):
             baseline = AggregatedXGBoostBaseline()
             baseline.train(train_inst, val_inst)
-            baseline_metrics = baseline.evaluate(test_inst)
+
+            # Calibrate on val (if any), then evaluate under the SAME
+            # decision policy as the DeepSets+XGB model (full_evaluation).
+            bl_calibrator = None
+            if val_inst:
+                val_probs, y_val_bl = baseline.predict_proba(val_inst)
+                bl_calibrator = PerClassIsotonicCalibrator().fit(val_probs, y_val_bl)
+                joblib.dump(bl_calibrator, fold_dir / "baseline_calibrator.pkl")
+
+            test_probs, y_test_bl = baseline.predict_proba(test_inst)
+            baseline_metrics = full_evaluation(
+                y_test_bl, test_probs, strata=test_strata, calibrator=bl_calibrator
+            )
+            baseline_metrics.pop("_cost_preds", None)
+            baseline_metrics.pop("_probs_cal", None)
         ckpt.save("baseline", baseline_metrics)
-        ckpt.mark_done("baseline", baseline_metrics)
+        ckpt.mark_done("baseline", {"macro_f1": baseline_metrics["macro_f1"]})
 
     logger.info(
         f"{fold_label} | Baseline → Macro F1: {baseline_metrics['macro_f1']:.4f}, "
         f"QWK: {baseline_metrics['qwk']:.4f}"
     )
+    if "cost_rule" in baseline_metrics:
+        logger.info(
+            f"{fold_label} | Baseline (cost rule) → "
+            f"Macro F1: {baseline_metrics['cost_rule']['macro_f1']:.4f}, "
+            f"Cat-2 Recall: {baseline_metrics['cost_rule']['recall_class_2']:.4f}, "
+            f"Avg Cost: {baseline_metrics['cost_rule']['avg_cost']:.4f}"
+        )
 
     # ── Stage: DataLoaders ────────────────────────────────────────────────────
     with timed(f"{fold_label}: Build DataLoaders", timing):
@@ -325,10 +362,25 @@ def train_single_fold(
         final_metrics = ckpt.load("evaluation")
     else:
         with timed(f"{fold_label}: Final evaluation", timing):
-            final_metrics, X_test_emb, y_test, y_prob = meta_learner.evaluate(test_dl)
-            y_pred = meta_learner.xgb_model.predict(X_test_emb)
+            # Fit the probability calibrator on the (customer-disjoint) val
+            # set — data the final XGBoost never trained on.
+            calibrator = None
+            if val_inst:
+                _, _, y_val_m, val_probs_m = meta_learner.evaluate(val_dl)
+                calibrator = PerClassIsotonicCalibrator().fit(val_probs_m, y_val_m)
+                joblib.dump(calibrator, fold_dir / "calibrator.pkl")
+                logger.info(f"{fold_label} | Calibrator fitted on val and saved.")
 
-            ci = bootstrap_confidence_intervals(y_test, y_pred, y_prob, n_iterations=500)
+            _, X_test_emb, y_test, y_prob = meta_learner.evaluate(test_dl)
+            final_metrics = full_evaluation(
+                y_test, y_prob, strata=test_strata, calibrator=calibrator
+            )
+            # Deployed policy = expected-cost decisions on calibrated probs;
+            # plots and CIs reflect it.
+            y_pred     = final_metrics.pop("_cost_preds")
+            y_prob_cal = final_metrics.pop("_probs_cal")
+
+            ci = bootstrap_confidence_intervals(y_test, y_pred, y_prob_cal, n_iterations=500)
             final_metrics["bootstrap_ci"] = ci
 
         logger.info(f"{fold_label} | Test Metrics: {final_metrics}")
@@ -551,6 +603,30 @@ def _run_single_split(instances, features, run_dir, device, timing, ckpt, pipeli
     logger.info(f"  Baseline  Macro F1: {bm['macro_f1']:.4f}")
     logger.info(f"  DeepSets+XGB Macro F1: {fm['macro_f1']:.4f}")
     logger.info(f"  Cat-2 Recall: {fm.get('recall_class_2', '?'):.4f}")
+    _log_policy_comparison(bm, fm)
+
+
+def _log_policy_comparison(bm: dict, fm: dict):
+    """Same-decision-policy comparison + per-current-category slices."""
+    if "cost_rule" in bm and "cost_rule" in fm:
+        b, f = bm["cost_rule"], fm["cost_rule"]
+        logger.info("  ── Cost-rule (deployed policy) comparison ──")
+        logger.info(
+            f"  Baseline     | F1: {b['macro_f1']:.4f}  "
+            f"Cat-2 Rec: {b['recall_class_2']:.4f}  Cost: {b['avg_cost']:.4f}"
+        )
+        logger.info(
+            f"  DeepSets+XGB | F1: {f['macro_f1']:.4f}  "
+            f"Cat-2 Rec: {f['recall_class_2']:.4f}  Cost: {f['avg_cost']:.4f}"
+        )
+    for name, m in [("Baseline", bm), ("DeepSets+XGB", fm)]:
+        for slice_name, sm in m.get("by_current_cat", {}).items():
+            logger.info(
+                f"  {name} [{slice_name}, n={sm['n']:,}] | "
+                f"F1: {sm['macro_f1']:.4f}  "
+                f"Cat-2 Rec: {sm.get('recall_class_2', float('nan')):.4f}  "
+                f"Cost: {sm['avg_cost']:.4f}"
+            )
 
 
 def _to_json_safe(obj):

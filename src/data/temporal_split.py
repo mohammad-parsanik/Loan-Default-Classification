@@ -22,6 +22,7 @@ Walk-Forward (Rolling Window) Validation:
   period as a test set at least once.
 """
 
+import hashlib
 import logging
 from collections import namedtuple
 from datetime import date, datetime
@@ -140,7 +141,10 @@ def split_by_time(instances: List[Dict]) -> tuple:
         test_raw  = usable_raw[-1]
         test_date = usable_dates[-1]
 
-        if getattr(config, "OPTIMIZE_ON_VALIDATION", True):
+        optimize  = getattr(config, "OPTIMIZE_ON_VALIDATION", True)
+        val_mode  = getattr(config, "VAL_SPLIT_MODE", "temporal")
+
+        if optimize and val_mode == "temporal":
             val_raw   = usable_raw[-2]
             val_date  = usable_dates[-2]
             
@@ -205,6 +209,18 @@ def split_by_time(instances: List[Dict]) -> tuple:
     val_inst   = [i for i in instances if i["snapshot_date"] in val_snaps]
     test_inst  = [i for i in instances if i["snapshot_date"] in test_snaps]
 
+    # ── 5. Customer-disjoint in-time validation (leakage-free tuning) ─────────
+    # Val labels come from the training era (>= horizon before test), so early
+    # stopping / Optuna never see anything overlapping the test label window.
+    if (
+        getattr(config, "OPTIMIZE_ON_VALIDATION", True)
+        and getattr(config, "VAL_SPLIT_MODE", "temporal") == "customer"
+        and train_inst
+    ):
+        train_inst, val_inst = split_train_by_customer(
+            train_inst, getattr(config, "CUSTOMER_VAL_FRACTION", 0.2)
+        )
+
     logger.info("Temporal Split Configuration:")
     logger.info(f"  Train snapshots : {sorted(list(train_snaps))}")
     logger.info(f"  Val   snapshots : {sorted(list(val_snaps))}")
@@ -215,6 +231,42 @@ def split_by_time(instances: List[Dict]) -> tuple:
     )
 
     return train_inst, val_inst, test_inst
+
+
+# ── Customer-disjoint split ───────────────────────────────────────────────────
+
+def _customer_bucket(national_code, seed: int) -> float:
+    """Stable [0, 1) bucket for a customer — md5, not hash() (seed-stable)."""
+    digest = hashlib.md5(f"{seed}:{national_code}".encode()).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def split_train_by_customer(
+    train_inst: List[Dict],
+    val_fraction: float,
+    seed: Optional[int] = None,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Partition training instances into (train, val) with DISJOINT customers:
+    every snapshot-instance of a given NATIONAL_CODE lands on the same side,
+    so the model is validated on customers it never saw.
+    """
+    if seed is None:
+        seed = config.RANDOM_SEED
+
+    train_out, val_out = [], []
+    for inst in train_inst:
+        if _customer_bucket(inst["national_code"], seed) < val_fraction:
+            val_out.append(inst)
+        else:
+            train_out.append(inst)
+
+    logger.info(
+        f"Customer-disjoint validation split: {len(train_out):,} train / "
+        f"{len(val_out):,} val instances "
+        f"(target val fraction {val_fraction:.0%})"
+    )
+    return train_out, val_out
 
 
 # ── Walk-Forward fold generation ──────────────────────────────────────────────

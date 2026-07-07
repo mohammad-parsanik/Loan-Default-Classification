@@ -94,6 +94,37 @@ def build_portfolio_means(features_flat: np.ndarray, offsets: np.ndarray) -> np.
 
 # ── WoE / IV calculation ──────────────────────────────────────────────────────
 
+def _make_bins(feat_valid: np.ndarray, n_bins: int):
+    """
+    Bin ids for IV computation, robust to skewed features.
+
+    The original quantile-only binning collapsed to a SINGLE bin for any
+    feature with >~(1 - 1/n_bins) of its mass on one value (all binary flags,
+    rare-event counts, closed-loan DPDs), silently forcing IV = 0 regardless
+    of predictive power. Fallbacks:
+      - < 2 distinct values      → None (truly constant, IV 0 is correct)
+      - <= n_bins distinct values → one bin per distinct value
+      - quantile edges collapsed  → mode gets its own bin, rest quantile-binned
+    """
+    uniq = np.unique(feat_valid)
+    if len(uniq) < 2:
+        return None
+    if len(uniq) <= n_bins:
+        return np.searchsorted(uniq, feat_valid)
+
+    quantiles = np.linspace(0, 100, n_bins + 1)
+    edges = np.unique(np.percentile(feat_valid, quantiles))
+    if len(edges) >= 3:
+        return np.digitize(feat_valid, edges[1:-1])
+
+    # Mode-dominated: >=~80% of mass on one value ⇒ that value is the median.
+    mode = np.median(feat_valid)
+    rest = feat_valid[feat_valid != mode]
+    sub_edges = np.unique(np.percentile(rest, quantiles))
+    sub_ids = np.digitize(feat_valid, sub_edges[1:-1])
+    return np.where(feat_valid == mode, 0, sub_ids + 1)
+
+
 def compute_woe_iv_binary(
     feature: np.ndarray,
     binary_target: np.ndarray,
@@ -118,13 +149,8 @@ def compute_woe_iv_binary(
     feat_valid   = feature[valid_mask]
     target_valid = binary_target[valid_mask]
 
-    try:
-        quantiles = np.linspace(0, 100, n_bins + 1)
-        edges = np.unique(np.percentile(feat_valid, quantiles))
-        if len(edges) < 2:
-            return pd.DataFrame(), 0.0
-        bin_ids = np.digitize(feat_valid, edges[1:-1])
-    except Exception:
+    bin_ids = _make_bins(feat_valid, n_bins)
+    if bin_ids is None:
         return pd.DataFrame(), 0.0
 
     total_events     = max(int(target_valid.sum()), 1)

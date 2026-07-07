@@ -1,13 +1,15 @@
 import numpy as np
 from sklearn.metrics import (
-    f1_score, 
-    cohen_kappa_score, 
-    brier_score_loss, 
-    recall_score, 
+    f1_score,
+    cohen_kappa_score,
+    brier_score_loss,
+    recall_score,
     accuracy_score,
     confusion_matrix
 )
 from sklearn.utils import resample
+
+import project_config as config
 
 def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     """
@@ -20,8 +22,10 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     metrics['qwk'] = float(cohen_kappa_score(y_true, y_pred, weights='quadratic'))
     metrics['accuracy'] = float(accuracy_score(y_true, y_pred))
     
-    # Per-class recall
-    recalls = recall_score(y_true, y_pred, average=None)
+    # Per-class recall (explicit labels: keeps indices right on strata where
+    # a class is absent, e.g. current-cat slices)
+    recalls = recall_score(y_true, y_pred, average=None,
+                           labels=list(range(3)), zero_division=0)
     for i, r in enumerate(recalls):
         metrics[f'recall_class_{i}'] = float(r)
         
@@ -32,17 +36,65 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
         brier = np.mean([brier_score_loss(y_true_oh[:, c], y_prob[:, c]) for c in range(3)])
         metrics['brier_score'] = float(brier)
         
-    # Cost-weighted accuracy
-    cost_matrix = np.array([
-        [0.0, 0.5, 1.0],
-        [1.5, 0.0, 0.5],
-        [4.0, 2.0, 0.0]
-    ])
-    
-    costs = np.array([cost_matrix[t, p] for t, p in zip(y_true, y_pred)])
-    metrics['avg_cost'] = float(np.mean(costs))
-    
+    # Cost-weighted accuracy (single source of truth: project_config.COST_MATRIX)
+    cost_matrix = np.asarray(config.COST_MATRIX)
+    metrics['avg_cost'] = float(cost_matrix[np.asarray(y_true), np.asarray(y_pred)].mean())
+
     return metrics
+
+
+def full_evaluation(y_true, probs, strata=None, calibrator=None) -> dict:
+    """
+    Single evaluation path shared by the baseline and the DeepSets+XGB model,
+    so the two are compared under the SAME decision policy.
+
+    Top-level metrics: raw-prob argmax (backwards-compatible with earlier runs).
+    "cost_rule":       expected-cost decisions on calibrated probs — the
+                       deployed policy.
+    "by_current_cat":  cost-rule metrics per current-category slice.
+    Also returns the cost-rule predictions under "_cost_preds" for plots/CIs.
+    """
+    from src.evaluation.decision import cost_decisions  # local: avoid cycles
+
+    y_true = np.asarray(y_true)
+    probs_cal = calibrator.transform(probs) if calibrator is not None else probs
+    cost_preds = cost_decisions(probs_cal)
+
+    out = compute_metrics(y_true, probs.argmax(axis=1), probs)
+    out["cost_rule"] = compute_metrics(y_true, cost_preds, probs_cal)
+    if strata is not None:
+        out["by_current_cat"] = stratified_metrics(y_true, cost_preds, strata, probs_cal)
+    out["_cost_preds"] = cost_preds
+    out["_probs_cal"] = probs_cal
+    return out
+
+
+def stratified_metrics(y_true, y_pred, strata, y_prob=None) -> dict:
+    """
+    Metrics per stratum (e.g. customer's CURRENT worst category).
+
+    The aggregate score blends the easy segment (already-delinquent customers,
+    whose future label is largely mechanical DPD accrual) with the hard one
+    (currently-clean customers — the actual early-warning task). Reporting per
+    current-category slices keeps those separate.
+
+    Returns {"current_cat_0": {...}, "current_cat_1": {...}, ...} with an
+    "n" count added per slice.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    strata = np.asarray(strata)
+
+    out = {}
+    for s in np.unique(strata):
+        mask = strata == s
+        m = compute_metrics(
+            y_true[mask], y_pred[mask],
+            y_prob[mask] if y_prob is not None else None,
+        )
+        m["n"] = int(mask.sum())
+        out[f"current_cat_{int(s)}"] = m
+    return out
 
 def bootstrap_confidence_intervals(y_true, y_pred, y_prob=None, n_iterations=1000, alpha=0.05):
     """Computes 95% CI for metrics using bootstrapping on the test set."""

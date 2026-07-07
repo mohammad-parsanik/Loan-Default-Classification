@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 import xgboost as xgb
 
+import project_config as config
 from src.evaluation.metrics import compute_metrics
 
 logger = logging.getLogger(__name__)
@@ -48,8 +49,18 @@ class AggregatedXGBoostBaseline:
 
     @staticmethod
     def _sample_weights(y: np.ndarray) -> np.ndarray:
+        """
+        Inverse class-frequency weights, optionally scaled by the cost-matrix
+        row sum per true class (BASELINE_COST_WEIGHTS) so training attention
+        follows the business cost of misclassifying that class — same nudge
+        the DeepSets model gets from its cost-sensitive loss.
+        """
         classes, counts = np.unique(y, return_counts=True)
         w = {c: len(y) / (len(classes) * cnt) for c, cnt in zip(classes, counts)}
+        if getattr(config, "BASELINE_COST_WEIGHTS", False):
+            row_cost = np.asarray(config.COST_MATRIX).sum(axis=1)
+            for c in classes:
+                w[c] *= row_cost[c]
         return np.array([w[yi] for yi in y])
 
     def train(self, train_inst: list[dict], val_inst: Optional[list[dict]] = None) -> None:
@@ -82,10 +93,14 @@ class AggregatedXGBoostBaseline:
         )
         logger.info("Baseline training complete.")
 
+    def predict_proba(self, instances: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (probs, y_true) for a list of instances."""
+        X, y = self._aggregate(instances)
+        return self.model.predict_proba(X), y
+
     def evaluate(self, test_inst: list[dict]) -> dict:
-        X_test, y_test = self._aggregate(test_inst)
-        probs = self.model.predict_proba(X_test)
-        preds = self.model.predict(X_test)
+        probs, y_test = self.predict_proba(test_inst)
+        preds = probs.argmax(axis=1)
         metrics = compute_metrics(y_test, preds, probs)
         logger.info(
             f"Baseline → Macro F1={metrics['macro_f1']:.4f}, "

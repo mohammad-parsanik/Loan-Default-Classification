@@ -21,7 +21,11 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.db.mssql_connection import MSSQLConnector
+
+try:
+    from src.db.mssql_connection import MSSQLConnector
+except ImportError:          # pyodbc absent on dev machines without DB access
+    MSSQLConnector = None    # cache-only workflows still function
 
 logger = logging.getLogger(__name__)
 
@@ -114,15 +118,23 @@ class DataLoader:
 
         feature_cols = self.get_feature_columns(df)
 
-        # Sort: primary by group keys, secondary by DPD descending (for truncation)
+        # Sort: primary by group keys, secondary by *current* DPD descending so
+        # truncation keeps the currently-worst loans. Must NOT use a label
+        # column (WORST_FUTURE_DPD): that leaks the future into loan selection
+        # and does not exist in the prediction table.
         df = df.sort_values(
-            [config.CUSTOMER_COL, config.SNAPSHOT_COL, "WORST_FUTURE_DPD"],
+            [config.CUSTOMER_COL, config.SNAPSHOT_COL, "DPD_DAYS"],
             ascending=[True, True, False],
         ).reset_index(drop=True)
 
         # Pre-extract numpy arrays (avoids per-group pandas overhead)
         X_all        = df[feature_cols].values.astype(np.float32)   # (N, F)
-        y_all        = df[config.TARGET_COL].values                  # (N,)
+        # Prediction table has no label column — instances get label = -1
+        has_target   = config.TARGET_COL in df.columns
+        y_all        = df[config.TARGET_COL].values if has_target else None  # (N,)
+        # Current worst category across the FULL portfolio (pre-truncation),
+        # capped like the label; used for stratified evaluation.
+        cat_all      = df["LOAN_CATEGORY"].values                    # (N,)
         customers    = df[config.CUSTOMER_COL].to_numpy(dtype=object)                # (N,)
         snapshots    = df[config.SNAPSHOT_COL].to_numpy(dtype=object)                # (N,)
 
@@ -150,7 +162,11 @@ class DataLoader:
             keep = min(size, max_loans) if max_loans else size
 
             feature_matrix = X_all[start : start + keep]          # (keep, F)
-            label = int(min(int(y_all[start:end].max()), config.NUM_CLASSES - 1))
+            label = (
+                int(min(int(y_all[start:end].max()), config.NUM_CLASSES - 1))
+                if has_target else -1
+            )
+            current_cat = int(min(int(cat_all[start:end].max()), config.NUM_CLASSES - 1))
 
             instances.append(
                 {
@@ -159,6 +175,7 @@ class DataLoader:
                     "n_loans":        int(size),
                     "features":       feature_matrix,
                     "label":          label,
+                    "current_cat":    current_cat,
                 }
             )
 
@@ -192,6 +209,7 @@ class DataLoader:
         sizes = np.array([inst["features"].shape[0] for inst in instances], dtype=np.int32)
         offsets = np.concatenate([[0], np.cumsum(sizes)])
         labels  = np.array([inst["label"] for inst in instances], dtype=np.int32)
+        current_cats = np.array([inst["current_cat"] for inst in instances], dtype=np.int32)
         n_loans = np.array([inst["n_loans"] for inst in instances], dtype=np.int32)
         national_codes = np.array([inst["national_code"] for inst in instances])
         snapshot_dates = np.array([inst["snapshot_date"] for inst in instances])
@@ -201,6 +219,7 @@ class DataLoader:
             features_flat=features_flat,
             offsets=offsets,
             labels=labels,
+            current_cats=current_cats,
             n_loans=n_loans,
             national_codes=national_codes,
             snapshot_dates=snapshot_dates,
@@ -220,6 +239,7 @@ class DataLoader:
             features_flat  = npz["features_flat"]
             offsets        = npz["offsets"]
             labels         = npz["labels"]
+            current_cats   = npz["current_cats"]
             n_loans        = npz["n_loans"]
             national_codes = npz["national_codes"]
             snapshot_dates = npz["snapshot_dates"]
@@ -235,6 +255,7 @@ class DataLoader:
                 "n_loans":       int(n_loans[i]),
                 "features":      features_flat[offsets[i] : offsets[i + 1]],
                 "label":         int(labels[i]),
+                "current_cat":   int(current_cats[i]),
             }
             for i in range(len(labels))
         ]
@@ -309,7 +330,13 @@ class DataLoader:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _get_conn(self) -> tuple[MSSQLConnector, bool]:
+    def _get_conn(self):
         if self.conn is not None:
             return self.conn, False
+        if MSSQLConnector is None:
+            raise RuntimeError(
+                "pyodbc/MSSQL is unavailable on this machine and no valid "
+                "NPZ cache was found. Run on the training server, or copy "
+                "data/train_portfolios_cache.npz (+ manifest) here."
+            )
         return MSSQLConnector(), True

@@ -38,20 +38,21 @@ pytest tests/test_dataset.py -k <name>       # single test
 Load (NPZ cache) → temporal split (or walk-forward folds) → per fold: preprocessing (fit on train only: impute → clip [1,99]pct → RobustScaler) → **Aggregated XGBoost baseline** (min/max/mean/std per feature + loan count = 257 features) → **DeepSets** (phi/pool/rho, 42K params, `CostSensitiveFocalLoss`) → **XGBoost meta-learner** on frozen 64-d embeddings → evaluation (macro F1, QWK, Brier, avg_cost, bootstrap CIs, plots).
 
 Key behavioral toggles in `project_config.py`:
-- `OPTIMIZE_ON_VALIDATION` — `True`: val set + early stopping + Optuna (biased test metrics, because val and test label windows overlap by 5 months). `False`: no val set, `FIXED_EPOCHS` + fixed XGB params (unbiased metrics). This trade-off is the central methodological issue of the project.
+- `OPTIMIZE_ON_VALIDATION` + `VAL_SPLIT_MODE` — current default is `True` + `"customer"`: an in-time, customer-disjoint 20% holdout (stable md5 of `NATIONAL_CODE`) drives early stopping + Optuna without touching the test label window, and is then reused to fit the probability calibrator (final XGB trains on the 80% only). `VAL_SPLIT_MODE="temporal"` is the legacy leaky mode (val/test label windows overlap 5 months — Run 2). `OPTIMIZE_ON_VALIDATION=False` = no val set, `FIXED_EPOCHS` + fixed XGB params (Run 3 mode).
+- `COST_MATRIX` — single source of truth for costs (DeepSets loss, expected-cost decision rule in `src/evaluation/decision.py`, `avg_cost` metric). Decisions and the top-K ranking use `argmin(probs @ COST_MATRIX)` on calibrated probs, never plain argmax.
 - `WALK_FORWARD_ENABLED` — currently `False`; walk-forward finds 0 valid folds because two 6-month gaps don't fit in the 13-month data span.
 
-Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickle. `--resume` skips completed stages. **Careful:** resuming after a config change silently reuses artifacts produced under the old config (this affected Run 3, which reused Run 2's DeepSets checkpoint).
+Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickle. `--resume` skips completed stages. **Careful:** resuming after a config change silently reuses artifacts produced under the old config. Run dirs from before July 2026 (DATA_VERSION v1.0) are not resumable — instance dicts lack `current_cat`.
 
 ## Gotchas that matter
 
 - **Active model is `src/model/deep_sets.py`.** `src/model/set_transformer.py` is dead code (never imported by run.py). Trainer class is named `TransformerTrainer` but trains DeepSets.
 - `MAX_LOANS_PER_CUSTOMER` resolves at runtime to **2** (99th percentile). Most customers have 1 loan — this is why DeepSets ≈ baseline and why attention was abandoned.
-- **Label-informed truncation:** `data_loader.process_raw_data` sorts loans by `WORST_FUTURE_DPD` (a label) descending before truncation to MAX_LOANS, and the label is `max` over ALL loans while features keep only the first MAX_LOANS. Also, the prediction table has no `WORST_FUTURE_*` columns, so the predict path (`load_pred_portfolios` → `sort_values`) will fail on it. Known issue — see AGENT_HANDOFF.md §What's Next.
+- Truncation to MAX_LOANS sorts by `DPD_DAYS` desc (a prediction-time feature). It previously sorted by the label `WORST_FUTURE_DPD` — fixed July 2026; do not reintroduce label columns into `process_raw_data` sorting. The label is `max` over ALL loans while features keep only the first MAX_LOANS; each instance also carries `current_cat` (current worst category, drives stratified evaluation).
 - Temporal split usability is computed against `date.today()` (`temporal_split._get_usable_snapshots`) — the same code produces different splits as calendar time passes. Snapshot dates are floats like `20241021.0`.
-- Labels: features keep 5-category granularity; the target is capped at 3 classes (`min(max(cat), 2)`).
-- 10 features are constant/zero-IV in the current data (all 7 binary flags, `COUNT_90PLUS_DPD_LAST_3M`, `WORST_CLOSED_LOAN_DPD`, `AVERAGE_CLOSE_LOAN_DPD`) — suspected upstream ETL bugs, kept in the schema.
-- The inference deliverable is a **ranked top-K list** (external API budget limits how many customers can be enriched), not just class predictions. `Predictor` outputs `RISK_SCORE = 2·P(cat2) + P(cat1)` sorted descending.
+- Labels: features keep 5-category granularity; the target is capped at 3 classes (`min(max(cat), 2)`). For already-delinquent customers the label is largely mechanical DPD accrual — judge models on the `current_cat_0` slice (`by_current_cat` metrics), not aggregate F1.
+- `explore_output/iv_report.csv` is **stale**: the old IV binning forced IV=0.0 for ~10 skewed/binary features (they are NOT constant — DB-verified). Re-run `explore_iv_woe.py` after the v1.1 cache rebuild.
+- The inference deliverable is a **ranked top-K list** (external API budget limits how many customers can be enriched), not just class predictions. `Predictor` ranks by `RISK_SCORE` = expected cost of predicting class 0 (`probs @ COST_MATRIX[:,0]`) on calibrated probabilities.
 
 ## Code style
 

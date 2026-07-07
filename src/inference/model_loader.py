@@ -24,7 +24,8 @@ class ModelLoader:
     def load_pipeline(self):
         """
         Returns:
-            (scaler, deep_sets_model, xgb_model, max_loans, feature_names)
+            (scaler, deep_sets_model, xgb_model, calibrator, max_loans, feature_names)
+            calibrator is None when no calibrator.pkl exists in the artifact dir.
         """
         logger.info(f"Loading pipeline from {self.artifact_dir}…")
 
@@ -59,4 +60,16 @@ class ModelLoader:
         xgb_model.load_model(self.artifact_dir / "xgboost_model.json")
         logger.info("Loaded XGBoost meta-learner.")
 
-        return scaler, model, xgb_model, max_loans, features
+        # Probability calibrator (optional — absent on runs without a val set)
+        cal_path = self.artifact_dir / "calibrator.pkl"
+        calibrator = None
+        if cal_path.exists():
+            calibrator = joblib.load(cal_path)
+            logger.info("Loaded probability calibrator.")
+        else:
+            logger.warning(
+                "No calibrator.pkl found — probabilities will be used raw "
+                "(cost-rule decisions may be miscalibrated)."
+            )
+
+        return scaler, model, xgb_model, calibrator, max_loans, features

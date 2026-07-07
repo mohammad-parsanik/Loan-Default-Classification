@@ -23,6 +23,18 @@ META_COLS = [ID_COL, CONTRACT_COL, CUSTOMER_COL,
 
 NUM_CLASSES = 3  # {0: No Delay, 1: Current, 2: Past Due+}
 
+# ── Cost matrix (single source of truth) ─────────────────
+# COST_MATRIX[true][predicted]. Used by:
+#   - losses.CostSensitiveFocalLoss (training-time nudge, DeepSets)
+#   - evaluation/decision.py (expected-cost decision rule at prediction time)
+#   - metrics.avg_cost
+# Business anchor: missing a Cat-2 costs 4x a false alarm.
+COST_MATRIX = [
+    [0.0, 0.5, 1.0],  # True 0
+    [1.5, 0.0, 0.5],  # True 1
+    [4.0, 2.0, 0.0],  # True 2
+]
+
 # ── Feature typing ───────────────────────────────────────
 # No categorical features — Collateral_type removed from dataset
 BINARY_FEATURES = [
@@ -50,14 +62,32 @@ MIN_TRAIN_SNAPSHOTS   = 1
 
 # Set OPTIMIZE_ON_VALIDATION = True to use a validation set for early
 # stopping and Optuna hyperparameter tuning. Set to False to train on
-# more data and test directly without validation leakage.
-OPTIMIZE_ON_VALIDATION = False
+# more data and test directly without any validation set.
+OPTIMIZE_ON_VALIDATION = True
+
+# How the validation set is built when OPTIMIZE_ON_VALIDATION = True:
+#   "customer" — in-time, customer-disjoint holdout carved from the train
+#                snapshots. Val labels never overlap the test label window,
+#                so tuning/early-stopping cause no test leakage.
+#   "temporal" — legacy behaviour: val = second-newest usable snapshot.
+#                LEAKY when val and test label windows overlap (Run 2).
+VAL_SPLIT_MODE        = "customer"
+CUSTOMER_VAL_FRACTION = 0.20   # share of customers held out for validation
+
+# Train the aggregated-XGBoost baseline with cost-informed sample weights
+# (inverse class frequency x cost-matrix row sum) instead of frequency only.
+BASELINE_COST_WEIGHTS = True
+
+# At predict time, refresh the probability calibrator on the most recent
+# snapshot whose labels have matured (requires train-table/cache access).
+RECALIBRATE_ON_PREDICT = True
 
 
 # ── Cache ────────────────────────────────────────────────
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)
 # to force cache invalidation without touching any code logic.
-DATA_VERSION = "v1.0"
+# v1.1: truncation sort key WORST_FUTURE_DPD -> DPD_DAYS; cache adds current_cats.
+DATA_VERSION = "v1.1"
 
 # ── Model — DeepSets (CPU-optimized) ────────────────────
 MAX_LOANS_PER_CUSTOMER = None  # Computed from data (99th percentile)

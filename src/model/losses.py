@@ -2,17 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import project_config as config
+
 
 class CostSensitiveFocalLoss(nn.Module):
     """
     Combines Focal Loss (gamma=2.0) with a cost matrix to heavily penalise
     missing high-risk customers (Cat 2).
 
-    Cost Matrix (True × Predicted):
-                   Pred 0   Pred 1   Pred 2
-        True 0  [  0.0,    0.5,    1.0  ]
-        True 1  [  1.5,    0.0,    0.5  ]
-        True 2  [  4.0,    2.0,    0.0  ]
+    Cost matrix comes from project_config.COST_MATRIX (single source of
+    truth, shared with the expected-cost decision rule and avg_cost metric).
 
     Using register_buffer so .to(device) moves the matrix automatically.
     """
@@ -22,14 +21,7 @@ class CostSensitiveFocalLoss(nn.Module):
         self.gamma = gamma
         self.num_classes = num_classes
 
-        cost_matrix = torch.tensor(
-            [
-                [0.0, 0.5, 1.0],  # True 0
-                [1.5, 0.0, 0.5],  # True 1
-                [4.0, 2.0, 0.0],  # True 2
-            ],
-            dtype=torch.float32,
-        )
+        cost_matrix = torch.tensor(config.COST_MATRIX, dtype=torch.float32)
         # Registered buffers are moved automatically with .to(device)
         self.register_buffer("cost_matrix", cost_matrix)
 
