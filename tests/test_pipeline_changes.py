@@ -205,3 +205,70 @@ def test_iv_script_drops_immature_snapshot_instances():
     X_out, y_out = filter_matured_instances(X, labels, snapshot_dates)
     assert len(y_out) == 2
     assert y_out.tolist() == [0, 1]
+
+
+# ── prediction path: unified onto TRAIN_TABLE ──────────────────────────────────
+
+class _FakeConnector:
+    """Duck-types the MSSQLConnector methods DataLoader needs for predict."""
+
+    def __init__(self, available=None, pred_df=None):
+        self._available = available or []
+        self._pred_df = pred_df
+
+    def get_available_snapshots(self):
+        return self._available
+
+    def load_prediction_data(self, snapshot_date=None, table=None):
+        return self._pred_df
+
+
+def test_load_pred_portfolios_drops_degenerate_label_columns():
+    # On TRAIN_TABLE, an immature snapshot's WORST_FUTURE_* columns hold a
+    # degenerate value (worst-so-far, not the real future outcome) rather
+    # than being absent — must not leak in as a label.
+    fake = _FakeConnector(pred_df=_make_df(with_target=True))
+    instances, feature_cols = DataLoader(mssql_connector=fake).load_pred_portfolios(
+        20250101, max_loans=2, use_cache=False
+    )
+    assert len(instances) == 1
+    assert instances[0]["label"] == -1
+    assert "WORST_FUTURE_DPD" not in feature_cols
+    assert "WORST_FUTURE_CAT" not in feature_cols
+
+
+def test_resolve_pred_snapshots_requested_found():
+    fake = _FakeConnector(available=[20250101, 20250201, 20250301])
+    resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots([20250201])
+    assert resolved == [20250201]
+
+
+def test_resolve_pred_snapshots_requested_missing_falls_back_to_immature():
+    horizon = config.LABEL_HORIZON_MONTHS
+    mature_snap   = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2))))
+    immature_snap = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3))))
+    fake = _FakeConnector(available=[mature_snap, immature_snap])
+
+    resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots([99999999])
+    assert resolved == [immature_snap]
+
+
+def test_resolve_pred_snapshots_none_requested_selects_all_immature():
+    horizon = config.LABEL_HORIZON_MONTHS
+    mature_snap    = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2))))
+    immature_snap1 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3))))
+    immature_snap2 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon - 1))))
+    fake = _FakeConnector(available=[mature_snap, immature_snap1, immature_snap2])
+
+    resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots(None)
+    assert resolved == sorted([immature_snap1, immature_snap2])
+
+
+def test_resolve_pred_snapshots_no_immature_falls_back_to_latest():
+    horizon = config.LABEL_HORIZON_MONTHS
+    mature_snap1 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 5))))
+    mature_snap2 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2))))
+    fake = _FakeConnector(available=[mature_snap1, mature_snap2])
+
+    resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots(None)
+    assert resolved == [mature_snap2]

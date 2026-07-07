@@ -10,6 +10,7 @@ thresholds in the downstream rule system track base-rate drift.
 
 import logging
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -100,15 +101,34 @@ class Predictor:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def predict(self, snapshot_date: int, output_path=None) -> pd.DataFrame:
-        logger.info(f"Starting inference for snapshot {snapshot_date}")
+    @staticmethod
+    def _normalize_snapshot_arg(snapshot_date) -> Optional[list]:
+        """None/int/list -> list, falling back to config.PRED_SNAPSHOT_DATES."""
+        if snapshot_date is None:
+            snapshot_date = getattr(config, "PRED_SNAPSHOT_DATES", None)
+        if snapshot_date is None:
+            return None
+        if isinstance(snapshot_date, (list, tuple)):
+            return [int(s) for s in snapshot_date] or None
+        return [int(snapshot_date)]
+
+    def _default_output_path(self, resolved: list) -> Path:
+        tag = str(resolved[0]) if len(resolved) == 1 else f"{min(resolved)}_{max(resolved)}"
+        return Path(self.loader.artifact_dir) / "predictions" / f"predictions_{tag}.csv"
+
+    def predict(self, snapshot_date=None, output_path=None) -> pd.DataFrame:
+        requested = self._normalize_snapshot_arg(snapshot_date)
+        resolved  = self.data_loader.resolve_pred_snapshots(requested)
+        logger.info(f"Starting inference for snapshot(s) {resolved}")
 
         if getattr(config, "RECALIBRATE_ON_PREDICT", False):
             self._refresh_calibrator()
 
-        instances, _ = self.data_loader.load_pred_portfolios(
-            snapshot_date, self.max_loans
-        )
+        instances: list[dict] = []
+        for snap in resolved:
+            snap_instances, _ = self.data_loader.load_pred_portfolios(snap, self.max_loans)
+            instances.extend(snap_instances)
+
         if not instances:
             logger.warning("No data found to predict.")
             return pd.DataFrame()
@@ -118,9 +138,10 @@ class Predictor:
                  if self.calibrator is not None else probs_raw)
 
         results = pd.DataFrame({
-            "NATIONAL_CODE":        [i["national_code"] for i in instances],
-            "N_LOANS_IN_PORTFOLIO": [i["n_loans"]       for i in instances],
-            "CURRENT_CAT":          [i["current_cat"]   for i in instances],
+            "SNAPSHOT_DATE":        [i["snapshot_date"]  for i in instances],
+            "NATIONAL_CODE":        [i["national_code"]  for i in instances],
+            "N_LOANS_IN_PORTFOLIO": [i["n_loans"]        for i in instances],
+            "CURRENT_CAT":          [i["current_cat"]    for i in instances],
             "P_NO_DELAY":           probs[:, 0],
             "P_CURRENT":            probs[:, 1],
             "P_PAST_DUE":           probs[:, 2],
@@ -132,8 +153,11 @@ class Predictor:
 
         results = results.sort_values("RISK_SCORE", ascending=False).reset_index(drop=True)
 
-        if output_path:
-            results.to_csv(output_path, index=False)
-            logger.info(f"Saved {len(results):,} predictions to {output_path}")
+        if output_path is None:
+            output_path = self._default_output_path(resolved)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        results.to_csv(output_path, index=False)
+        logger.info(f"Saved {len(results):,} predictions to {output_path}")
 
         return results

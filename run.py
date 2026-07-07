@@ -6,8 +6,11 @@ Usage:
     python run.py train                            # full training run
     python run.py train --resume <run_dir>         # resume a crashed run
     python run.py predict --artifact_dir <dir> \\
-                          --snapshot_date <int> \\
-                          --output <path.csv>
+                          [--snapshot_date <int> [<int> ...]] \\
+                          [--output <path.csv>]
+                          # snapshot_date defaults to project_config.PRED_SNAPSHOT_DATES,
+                          # or every currently-immature snapshot if that's unset too.
+                          # output defaults to <artifact_dir>/predictions/predictions_<tag>.csv
 
 Stage checkpointing:
     Each major stage writes a sentinel file to <run_dir>/stages/<stage>.done
@@ -644,9 +647,9 @@ def _to_json_safe(obj):
 
 # ── Predict pipeline ──────────────────────────────────────────────────────────
 
-def predict_pipeline(artifact_dir: str, snapshot_date: int, output_path: str):
+def predict_pipeline(artifact_dir: str, snapshot_date=None, output_path: str = None):
     predictor = Predictor(Path(artifact_dir))
-    predictor.predict(int(snapshot_date), output_path)
+    predictor.predict(snapshot_date, output_path)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -662,8 +665,16 @@ if __name__ == "__main__":
         help="Path to a previous run directory to resume from.",
     )
     parser.add_argument("--artifact_dir",  type=str)
-    parser.add_argument("--snapshot_date", type=int)
-    parser.add_argument("--output",        type=str)
+    parser.add_argument(
+        "--snapshot_date", type=int, nargs="*", default=None,
+        help="Snapshot date(s) (YYYYMMDD) to score. Omit to use "
+             "project_config.PRED_SNAPSHOT_DATES, or auto-select every "
+             "currently-immature snapshot if that's unset too.",
+    )
+    parser.add_argument(
+        "--output", type=str, default=None,
+        help="Output CSV path. Omit to auto-name under <artifact_dir>/predictions/.",
+    )
 
     args = parser.parse_args()
 
@@ -673,7 +684,7 @@ if __name__ == "__main__":
         resume = Path(args.resume) if args.resume else None
         train_pipeline(resume_dir=resume)
     elif args.action == "predict":
-        if not (args.artifact_dir and args.snapshot_date and args.output):
-            logger.error("predict requires --artifact_dir, --snapshot_date, and --output")
+        if not args.artifact_dir:
+            logger.error("predict requires --artifact_dir")
             sys.exit(1)
         predict_pipeline(args.artifact_dir, args.snapshot_date, args.output)

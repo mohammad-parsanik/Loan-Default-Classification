@@ -8,8 +8,10 @@ MSSQL_USER = os.getenv("MSSQL_USER", "sa")
 MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "password")
 
 # ── Tables & Columns ────────────────────────────────────
+# Single live table: contains matured snapshots (for training) plus the
+# newest, not-yet-matured snapshot(s) (for prediction). No separate pred
+# table — predict reads TRAIN_TABLE too, see PRED_SNAPSHOT_DATES below.
 TRAIN_TABLE = "EDP_Feature_Train"
-PRED_TABLE  = "EDP_Feature_pred"
 
 ID_COL       = "LOAN_ID"
 CONTRACT_COL = "CONTRACT_NUMBER"
@@ -81,6 +83,13 @@ BASELINE_COST_WEIGHTS = True
 # At predict time, refresh the probability calibrator on the most recent
 # snapshot whose labels have matured (requires train-table/cache access).
 RECALIBRATE_ON_PREDICT = True
+
+# Snapshot(s) to score at predict time (YYYYMMDD int or list[int]).
+# None (default) = auto-select every currently-immature snapshot in
+# TRAIN_TABLE (the standard early-warning use case). A --snapshot_date CLI
+# value always overrides this. Any requested date not found in the table is
+# dropped (with a warning) and falls back the same way as an unset value.
+PRED_SNAPSHOT_DATES = None
 
 
 # ── Cache ────────────────────────────────────────────────

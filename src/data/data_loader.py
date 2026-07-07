@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
+from src.data.temporal_split import filter_mature_snapshots
 
 try:
     from src.db.mssql_connection import MSSQLConnector
@@ -320,6 +321,12 @@ class DataLoader:
         conn, close_conn = self._get_conn()
         try:
             df = conn.load_prediction_data(snapshot_date=snapshot_date)
+            # TRAIN_TABLE carries WORST_FUTURE_CAT/DPD for every row, but on
+            # an immature snapshot those values are degenerate ("worst
+            # category observed so far", not the true future outcome) —
+            # never real labels. Drop them so process_raw_data's normal
+            # "column absent -> label = -1" path applies here too.
+            df = df.drop(columns=[config.TARGET_COL, "WORST_FUTURE_DPD"], errors="ignore")
             instances, feature_cols = self.process_raw_data(df, max_loans)
             if use_cache:
                 self._save_cache(cache_path, instances, feature_cols, max_loans or 99, key)
@@ -327,6 +334,44 @@ class DataLoader:
         finally:
             if close_conn:
                 conn.close()
+
+    def resolve_pred_snapshots(self, requested: Optional[list] = None) -> list:
+        """
+        Decide which snapshot(s) to score.
+
+          - `requested` given: keep only dates present in TRAIN_TABLE (warn on
+            misses). If any survive, return them.
+          - Otherwise (nothing requested, or none of it found): auto-select
+            every currently-immature snapshot (labels not yet matured).
+          - If that's empty too: fall back to the single latest snapshot.
+        """
+        conn, close_conn = self._get_conn()
+        try:
+            available = conn.get_available_snapshots()
+        finally:
+            if close_conn:
+                conn.close()
+
+        if not available:
+            raise RuntimeError(f"No snapshots found in {config.TRAIN_TABLE}.")
+        available = sorted(int(s) for s in available)
+
+        if requested:
+            requested = [int(s) for s in requested]
+            found   = [s for s in requested if s in available]
+            missing = [s for s in requested if s not in available]
+            if missing:
+                logger.warning(f"Requested snapshot(s) not found in {config.TRAIN_TABLE}: {missing}")
+            if found:
+                return sorted(found)
+            logger.warning("None of the requested snapshots were found — falling back to auto-selection.")
+
+        immature = sorted(set(available) - set(filter_mature_snapshots(available)))
+        if immature:
+            return immature
+
+        logger.warning("No immature snapshot found — falling back to the single latest snapshot.")
+        return [available[-1]]
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

@@ -21,7 +21,9 @@ A bank early-warning system that predicts the **worst delinquency class of a cus
 ```bash
 python run.py train                          # full pipeline
 python run.py train --resume <run_dir>       # resume; completed stages are skipped
-python run.py predict --artifact_dir <dir> --snapshot_date <YYYYMMDD> --output <csv>
+python run.py predict --artifact_dir <dir> [--snapshot_date <YYYYMMDD> ...] [--output <csv>]
+# snapshot_date defaults to PRED_SNAPSHOT_DATES, else every currently-immature snapshot
+# output defaults to <artifact_dir>/predictions/predictions_<tag>.csv
 python run.py explore                        # one-shot data profiling
 
 # Standalone diagnostics (read NPZ cache, no DB needed):
@@ -41,6 +43,7 @@ Key behavioral toggles in `project_config.py`:
 - `OPTIMIZE_ON_VALIDATION` + `VAL_SPLIT_MODE` — current default is `True` + `"customer"`: an in-time, customer-disjoint 20% holdout (stable md5 of `NATIONAL_CODE`) drives early stopping + Optuna without touching the test label window, and is then reused to fit the probability calibrator (final XGB trains on the 80% only). `VAL_SPLIT_MODE="temporal"` is the legacy leaky mode (val/test label windows overlap 5 months — Run 2). `OPTIMIZE_ON_VALIDATION=False` = no val set, `FIXED_EPOCHS` + fixed XGB params (Run 3 mode).
 - `COST_MATRIX` — single source of truth for costs (DeepSets loss, expected-cost decision rule in `src/evaluation/decision.py`, `avg_cost` metric). Decisions and the top-K ranking use `argmin(probs @ COST_MATRIX)` on calibrated probs, never plain argmax.
 - `WALK_FORWARD_ENABLED` — currently `False`; walk-forward finds 0 valid folds because two 6-month gaps don't fit in the 13-month data span.
+- `PRED_SNAPSHOT_DATES` — snapshot(s) `predict` scores (int or list[int], overridden by `--snapshot_date`). `None` (default) auto-selects every currently-immature snapshot in `TRAIN_TABLE`; a requested date absent from the table is dropped (warn) and falls back the same way. There is no separate prediction table — `TRAIN_TABLE` holds both matured and not-yet-matured snapshots, and `Predictor` strips `WORST_FUTURE_CAT`/`WORST_FUTURE_DPD` before scoring since those columns hold a degenerate (not real) value on immature rows.
 
 Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickle. `--resume` skips completed stages. **Careful:** resuming after a config change silently reuses artifacts produced under the old config. Run dirs from before July 2026 (DATA_VERSION v1.0) are not resumable — instance dicts lack `current_cat`.
 

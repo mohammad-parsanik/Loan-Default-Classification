@@ -339,6 +339,7 @@ Loan Default Classification/
 5. **The baseline consistently matches or beats DeepSets+XGB on Macro F1.** This is expected with MAX_LOANS=2. The DeepSets model's Cat-2 recall advantage (87% vs 76-78% in Runs 2-3) was **confounded**: the DeepSets had a cost-sensitive loss while the baseline used plain argmax. Since July 7, 2026 both systems are evaluated under the same expected-cost decision rule (`cost_rule` metrics) — use those for architecture comparisons.
 6. **`torch.compile` is disabled on the Windows training server** (inductor requires MSVC). The model runs in eager mode.
 7. **Label-informed truncation bug (FIXED July 7, 2026):** `process_raw_data` used to sort each customer's loans by `WORST_FUTURE_DPD` (a label) before `MAX_LOANS` truncation — the label selected which loans the model saw, and the predict path crashed because `EDP_Feature_pred` has no `WORST_FUTURE_*` columns. Now sorts by `DPD_DAYS` desc in both paths; unlabelled tables get `label = -1`. Requires cache rebuild (`DATA_VERSION` v1.1).
+8. **`EDP_Feature_pred` never existed as a separate table (FIXED July 7, 2026):** the live DB has one table (`TRAIN_TABLE`) holding matured snapshots plus the newest not-yet-matured one(s). `PRED_TABLE` is gone; `Predictor` now reads `TRAIN_TABLE` for prediction too. Because that table carries `WORST_FUTURE_CAT`/`WORST_FUTURE_DPD` for every row, an immature snapshot's label columns hold a **degenerate** value ("worst category observed so far", not the real future outcome) rather than being absent/NULL — `DataLoader.load_pred_portfolios` now drops those columns before `process_raw_data` so they can't masquerade as real labels.
 
 ---
 
@@ -354,6 +355,7 @@ All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB
 6. **`metadata.json` now written per fold** — `ModelLoader` always required it but nothing produced it (inference would have failed).
 7. **IV binning fixed** in `explore_iv_woe.py` (see §7 correction). `explore_output/iv_report.csv` is stale until re-run.
 8. Cost matrix consolidated into `project_config.COST_MATRIX` (was duplicated in `losses.py` and `metrics.py`).
+9. **Prediction unified onto `TRAIN_TABLE`, multi-snapshot + auto-selection** (`project_config.PRED_SNAPSHOT_DATES`, `MSSQLConnector.get_available_snapshots`, `DataLoader.resolve_pred_snapshots`, `Predictor.predict`): `PRED_TABLE`/`EDP_Feature_pred` removed. `--snapshot_date` (CLI, now `nargs="*"`) or `PRED_SNAPSHOT_DATES` (config) pick the snapshot(s) to score; unset or not-found dates fall back to every currently-immature snapshot, then to the single latest snapshot if even that's empty. `--output` is optional, defaulting to `<artifact_dir>/predictions/predictions_<tag>.csv`. See Gotcha 8 for the accompanying degenerate-label fix.
 
 ## 12. What's Next (Prioritized)
 
@@ -362,4 +364,4 @@ All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB
 3. **Architecture decision:** if baseline ≈ DeepSets+XGB on the `cost_rule` and `current_cat_0` metrics in Run 4, retire the DeepSets stage — single XGBoost on named aggregated features is simpler, faster, and SHAP-explainable to auditors.
 4. **Wait for more data:** 2-3 more monthly snapshots enable strict walk-forward validation.
 5. **Reduce horizon (if business allows):** 6 → 3 months halves the gap requirements.
-6. **Production deployment:** predict path is now unit-tested but still needs one end-to-end run against `EDP_Feature_pred` on the server.
+6. **Production deployment:** predict path is now unit-tested but still needs one end-to-end run against `TRAIN_TABLE`'s immature snapshot(s) on the server.

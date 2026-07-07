@@ -61,17 +61,23 @@ class MSSQLConnector:
             
         return self.read_sql(query, params)
     
-    def load_prediction_data(self, table: str = config.PRED_TABLE, snapshot_date: int = None) -> pd.DataFrame:
+    def load_prediction_data(self, table: str = config.TRAIN_TABLE, snapshot_date: int = None) -> pd.DataFrame:
         logger.info(f"Loading prediction data from {table} for snapshot {snapshot_date}")
         query = f"SELECT * FROM {table}"
         params = None
-        
+
         if snapshot_date:
             query += " WHERE SNAPSHOT_DATE = ?"
             params = (int(snapshot_date),)
-            
+
         return self.read_sql(query, params)
-    
+
+    def get_available_snapshots(self, table: str = None) -> list:
+        table = table or config.TRAIN_TABLE
+        query = f"SELECT DISTINCT {config.SNAPSHOT_COL} FROM {table} ORDER BY {config.SNAPSHOT_COL}"
+        df = self.read_sql(query)
+        return df[config.SNAPSHOT_COL].tolist()
+
     def close(self):
         if hasattr(self, 'conn') and self.conn is not None:
             self.conn.close()
