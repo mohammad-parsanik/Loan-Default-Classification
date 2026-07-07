@@ -52,35 +52,42 @@ def _months_apart(earlier: date, later: date) -> float:
     return (later - earlier).days / 30.4375   # average days per month
 
 
-def _get_usable_snapshots(instances: List[Dict]) -> Tuple[list, list]:
+def filter_mature_snapshots(raw_snaps) -> list:
     """
-    From a list of instances, return (usable_raw, usable_dates) —
-    snapshots that are mature (>= horizon months old).
+    Given raw YYYYMMDD snapshot values, return only those whose
+    WORST_FUTURE_* label has had time to materialise (>= LABEL_HORIZON_MONTHS
+    old). Any script that reads WORST_FUTURE_CAT/DPD — training split,
+    IV/UMAP diagnostics, data profiling — must filter through this before
+    trusting that column, or immature rows (whose label is really just
+    "worst category observed so far") silently masquerade as real labels.
     """
     horizon = config.LABEL_HORIZON_MONTHS
     today   = date.today()
 
-    raw_snaps  = sorted(set(inst["snapshot_date"] for inst in instances))
+    raw_snaps  = sorted(set(raw_snaps))
     snap_dates = [_snap_to_date(s) for s in raw_snaps]
 
-    logger.info(f"All snapshot dates found: {raw_snaps}")
-
-    usable = [
-        (raw, d)
-        for raw, d in zip(raw_snaps, snap_dates)
-        if _months_apart(d, today) >= horizon
-    ]
-    dropped = [r for r, d in zip(raw_snaps, snap_dates)
-               if _months_apart(d, today) < horizon]
+    mature  = [r for r, d in zip(raw_snaps, snap_dates) if _months_apart(d, today) >= horizon]
+    dropped = [r for r, d in zip(raw_snaps, snap_dates) if _months_apart(d, today) < horizon]
 
     if dropped:
         logger.warning(
             f"Dropping {len(dropped)} snapshot(s) whose labels are not yet "
             f"mature (< {horizon} months old): {dropped}"
         )
+    return mature
 
-    usable_raw   = [p[0] for p in usable]
-    usable_dates = [p[1] for p in usable]
+
+def _get_usable_snapshots(instances: List[Dict]) -> Tuple[list, list]:
+    """
+    From a list of instances, return (usable_raw, usable_dates) —
+    snapshots that are mature (>= horizon months old).
+    """
+    raw_snaps = sorted(set(inst["snapshot_date"] for inst in instances))
+    logger.info(f"All snapshot dates found: {raw_snaps}")
+
+    usable_raw   = filter_mature_snapshots(raw_snaps)
+    usable_dates = [_snap_to_date(s) for s in usable_raw]
     logger.info(f"Usable snapshots ({len(usable_raw)}): {usable_raw}")
 
     return usable_raw, usable_dates

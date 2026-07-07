@@ -10,7 +10,12 @@ import seaborn as sns
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.db.mssql_connection import MSSQLConnector
+from src.data.temporal_split import filter_mature_snapshots
+
+try:
+    from src.db.mssql_connection import MSSQLConnector
+except ImportError:          # pyodbc absent on dev machines without DB access
+    MSSQLConnector = None    # falls through to the dummy-data path below
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,12 +38,34 @@ def explore_data(sample_size=1000):
             return
             
         snapshots = snapshot_df[config.SNAPSHOT_COL].tolist()
-        
-        # Load a sample for feature analysis (just the latest snapshot)
+
+        # Load a sample for feature analysis (just the latest snapshot).
+        # Features (incl. current LOAN_CATEGORY) are point-in-time — valid
+        # on the latest snapshot regardless of label maturity.
         latest_snap = snapshots[-1]
         logger.info(f"Loading data for the latest snapshot ({latest_snap}) for feature profiling...")
-        
+
         df = conn.load_training_data(snapshot_dates=[latest_snap])
+
+        # WORST_FUTURE_CAT is a forward-looking label: on an immature
+        # snapshot it degenerates to "worst category observed so far" and
+        # is not representative of the real training target distribution.
+        # Use the newest MATURED snapshot for that number instead.
+        mature_snaps = filter_mature_snapshots(snapshots)
+        label_snap   = mature_snaps[-1] if mature_snaps else None
+
+        if label_snap is None:
+            logger.warning(
+                "No snapshot has a matured label window yet — "
+                "target class distribution cannot be computed."
+            )
+            df_label = None
+        elif label_snap == latest_snap:
+            df_label = df
+        else:
+            logger.info(f"Loading matured snapshot ({label_snap}) for target label distribution...")
+            df_label = conn.load_training_data(snapshot_dates=[label_snap])
+
         conn.close()
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
@@ -82,6 +109,8 @@ def explore_data(sample_size=1000):
                 data[f] = np.random.randint(0, 100, n_samples)
                 
         df = pd.DataFrame(data)
+        latest_snap = snapshots[-1]
+        label_snap, df_label = snapshots[-1], df   # dummy data is self-consistent
 
     logger.info(f"Loaded {len(df)} rows.")
 
@@ -89,19 +118,31 @@ def explore_data(sample_size=1000):
     loans_per_cust = df.groupby(config.CUSTOMER_COL).size()
     max_loans_99 = int(np.percentile(loans_per_cust, 99))
     max_loans_max = int(loans_per_cust.max())
-    
+
     logger.info(f"Loans per customer - Max: {max_loans_max}, 99th Percentile: {max_loans_99}")
-    
-    # 2. Class Distribution
-    raw_class_dist = df[config.TARGET_COL].value_counts().to_dict()
-    
-    # Capped target
-    capped_target = df[config.TARGET_COL].clip(upper=2)
-    capped_class_dist = capped_target.value_counts().to_dict()
-    
-    logger.info(f"Raw class distribution: {raw_class_dist}")
-    logger.info(f"Capped class distribution: {capped_class_dist}")
-    
+
+    # 2a. Current-state distribution: LOAN_CATEGORY is a feature (point-in-
+    # time), valid on the latest snapshot regardless of label maturity.
+    current_cat_capped     = df["LOAN_CATEGORY"].clip(upper=config.NUM_CLASSES - 1)
+    current_cat_dist_raw    = df["LOAN_CATEGORY"].value_counts().to_dict()
+    current_cat_dist_capped = current_cat_capped.value_counts().to_dict()
+    logger.info(f"Current LOAN_CATEGORY distribution (snapshot {latest_snap}, raw): {current_cat_dist_raw}")
+    logger.info(f"Current LOAN_CATEGORY distribution (capped): {current_cat_dist_capped}")
+
+    # 2b. Forward-label distribution: WORST_FUTURE_CAT only means "future
+    # worst state" on a MATURED snapshot. On an immature one it collapses
+    # toward current state and understates deterioration — do not compute
+    # it from `df`/latest_snap when they are immature.
+    if df_label is not None:
+        raw_class_dist    = df_label[config.TARGET_COL].value_counts().to_dict()
+        capped_target     = df_label[config.TARGET_COL].clip(upper=config.NUM_CLASSES - 1)
+        capped_class_dist = capped_target.value_counts().to_dict()
+        logger.info(f"Target WORST_FUTURE_CAT distribution (snapshot {label_snap}, raw): {raw_class_dist}")
+        logger.info(f"Target WORST_FUTURE_CAT distribution (capped): {capped_class_dist}")
+    else:
+        capped_target = None
+        raw_class_dist, capped_class_dist = {}, {}
+
     # 3. Missingness
     missing_pct = (df.isnull().sum() / len(df) * 100).round(2)
     missing_features = missing_pct[missing_pct > 0].to_dict()
@@ -113,11 +154,19 @@ def explore_data(sample_size=1000):
     
     # Compile report
     report = {
-        "snapshots": snapshots,
+        "snapshots": [float(s) for s in snapshots],
+        "latest_snapshot": float(latest_snap),
         "max_loans_per_customer_99th": max_loans_99,
         "max_loans_per_customer_max": max_loans_max,
-        "class_distribution_raw": {str(k): int(v) for k, v in raw_class_dist.items()},
-        "class_distribution_capped": {str(k): int(v) for k, v in capped_class_dist.items()},
+        # Current delinquency state on the latest snapshot (feature, always valid)
+        "current_cat_distribution_raw":    {str(k): int(v) for k, v in current_cat_dist_raw.items()},
+        "current_cat_distribution_capped": {str(k): int(v) for k, v in current_cat_dist_capped.items()},
+        # Forward WORST_FUTURE_CAT label distribution — only from a matured
+        # snapshot; None if none is mature yet. NOT the same population as
+        # current_cat_distribution above (do not compare them directly).
+        "label_snapshot_used": float(label_snap) if label_snap is not None else None,
+        "target_class_distribution_raw":    {str(k): int(v) for k, v in raw_class_dist.items()},
+        "target_class_distribution_capped": {str(k): int(v) for k, v in capped_class_dist.items()},
         "feature_count": len(feature_cols),
         "features": feature_cols,
         "missing_features": missing_features
@@ -141,13 +190,16 @@ def explore_data(sample_size=1000):
         plt.savefig(config.ARTIFACT_DIR / "loans_per_customer.png")
         plt.close()
         
-        plt.figure(figsize=(10, 5))
-        capped_target.value_counts().sort_index().plot(kind='bar')
-        plt.title('Capped Target Class Distribution')
-        plt.xlabel('Class (0=No Delay, 1=Current, 2=Past Due+)')
-        plt.ylabel('Count')
-        plt.savefig(config.ARTIFACT_DIR / "class_distribution.png")
-        plt.close()
+        if capped_target is not None:
+            plt.figure(figsize=(10, 5))
+            capped_target.value_counts().sort_index().plot(kind='bar')
+            plt.title(f'Capped Target Class Distribution (snapshot {label_snap})')
+            plt.xlabel('Class (0=No Delay, 1=Current, 2=Past Due+)')
+            plt.ylabel('Count')
+            plt.savefig(config.ARTIFACT_DIR / "class_distribution.png")
+            plt.close()
+        else:
+            logger.warning("Skipping class_distribution.png — no matured snapshot available.")
         logger.info("Plots saved to artifacts directory.")
     except Exception as e:
         logger.error(f"Failed to generate plots: {e}")

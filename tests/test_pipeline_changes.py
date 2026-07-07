@@ -7,14 +7,17 @@ Tests for the leakage/evaluation changes (July 2026):
   - expected-cost decision rule
   - per-class isotonic calibration
   - IV binning no longer zeroes out skewed/binary features
+  - immature-snapshot rows excluded from label-derived diagnostics
 """
+
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 
 import project_config as config
 from src.data.data_loader import DataLoader
-from src.data.temporal_split import split_train_by_customer
+from src.data.temporal_split import filter_mature_snapshots, split_train_by_customer
 from src.evaluation.calibration import PerClassIsotonicCalibrator
 from src.evaluation.decision import cost_decisions, expected_costs, risk_scores
 from src.evaluation.metrics import compute_metrics, stratified_metrics
@@ -171,3 +174,34 @@ def test_iv_binning_handles_skewed_features():
     # Truly constant feature → IV exactly 0 (correct behaviour preserved)
     _, iv3 = compute_woe_iv_binary(np.zeros(n), target.astype(int), n_bins=10)
     assert iv3 == 0.0
+
+
+# ── snapshot maturity filtering ────────────────────────────────────────────────
+
+def _yyyymmdd(d: date) -> float:
+    return float(d.strftime("%Y%m%d"))
+
+
+def test_filter_mature_snapshots_drops_only_immature():
+    horizon = config.LABEL_HORIZON_MONTHS
+    mature_snap   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2)))
+    immature_snap = _yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3)))
+
+    result = filter_mature_snapshots([mature_snap, immature_snap])
+    assert result == [mature_snap]
+
+
+def test_iv_script_drops_immature_snapshot_instances():
+    from explore_iv_woe import filter_matured_instances
+
+    horizon = config.LABEL_HORIZON_MONTHS
+    mature_snap   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2)))
+    immature_snap = _yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3)))
+
+    X = np.zeros((4, 3))
+    labels = np.array([0, 1, 2, 0])
+    snapshot_dates = np.array([mature_snap, mature_snap, immature_snap, immature_snap])
+
+    X_out, y_out = filter_matured_instances(X, labels, snapshot_dates)
+    assert len(y_out) == 2
+    assert y_out.tolist() == [0, 1]

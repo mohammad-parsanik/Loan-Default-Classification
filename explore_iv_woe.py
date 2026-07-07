@@ -32,6 +32,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+sys.path.append(str(Path(__file__).resolve().parent))
+from src.data.temporal_split import filter_mature_snapshots
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
@@ -48,10 +51,11 @@ CLASS_NAMES = {0: "No Delay", 1: "Current", 2: "Past Due+"}
 def load_cache(data_dir: Path):
     """
     Returns:
-        features_flat : (N_total_loans, F)  float32
-        offsets       : (N_instances+1,)    int32
-        labels        : (N_instances,)      int32
-        feat_cols     : list[str]
+        features_flat  : (N_total_loans, F)  float32
+        offsets        : (N_instances+1,)    int32
+        labels         : (N_instances,)      int32
+        snapshot_dates : (N_instances,)      object
+        feat_cols      : list[str]
     """
     cache_path    = data_dir / "train_portfolios_cache.npz"
     manifest_path = data_dir / "train_portfolios_cache.manifest.json"
@@ -63,9 +67,10 @@ def load_cache(data_dir: Path):
 
     log.info(f"Loading cache from {cache_path} ...")
     with np.load(cache_path, allow_pickle=True) as npz:
-        features_flat = npz["features_flat"]
-        offsets       = npz["offsets"]
-        labels        = npz["labels"]
+        features_flat  = npz["features_flat"]
+        offsets        = npz["offsets"]
+        labels         = npz["labels"]
+        snapshot_dates = npz["snapshot_dates"]
 
     with open(manifest_path) as f:
         manifest = json.load(f)
@@ -75,7 +80,7 @@ def load_cache(data_dir: Path):
         f"Loaded {len(labels):,} portfolio instances, "
         f"{features_flat.shape[0]:,} loans, {len(feat_cols)} features."
     )
-    return features_flat, offsets, labels, feat_cols
+    return features_flat, offsets, labels, snapshot_dates, feat_cols
 
 
 def build_portfolio_means(features_flat: np.ndarray, offsets: np.ndarray) -> np.ndarray:
@@ -90,6 +95,26 @@ def build_portfolio_means(features_flat: np.ndarray, offsets: np.ndarray) -> np.
     for i in range(n_instances):
         X_mean[i] = features_flat[offsets[i] : offsets[i + 1]].mean(axis=0)
     return X_mean
+
+
+def filter_matured_instances(
+    X_mean: np.ndarray, labels: np.ndarray, snapshot_dates: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Drop instances from snapshots whose WORST_FUTURE_CAT label hasn't
+    matured yet. On an immature snapshot the label degenerates to "worst
+    category observed so far" — mixing those rows in silently mislabels
+    part of the IV computation (independent of the quantile-binning fix).
+    """
+    mature = set(filter_mature_snapshots(np.unique(snapshot_dates)))
+    mask = np.array([s in mature for s in snapshot_dates])
+    n_dropped = len(mask) - mask.sum()
+    if n_dropped:
+        log.warning(
+            f"Dropping {n_dropped:,} instance(s) from immature snapshot(s) "
+            f"before IV computation."
+        )
+    return X_mean[mask], labels[mask]
 
 
 # ── WoE / IV calculation ──────────────────────────────────────────────────────
@@ -327,8 +352,9 @@ def main():
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    features_flat, offsets, labels, feat_cols = load_cache(args.data_dir)
+    features_flat, offsets, labels, snapshot_dates, feat_cols = load_cache(args.data_dir)
     X_mean = build_portfolio_means(features_flat, offsets)
+    X_mean, labels = filter_matured_instances(X_mean, labels, snapshot_dates)
 
     df_iv = compute_all_ivs(X_mean, labels, feat_cols, n_bins=args.n_bins)
 
