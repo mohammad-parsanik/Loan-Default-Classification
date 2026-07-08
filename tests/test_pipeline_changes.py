@@ -8,6 +8,8 @@ Tests for the leakage/evaluation changes (July 2026):
   - per-class isotonic calibration
   - IV binning no longer zeroes out skewed/binary features
   - immature-snapshot rows excluded from label-derived diagnostics
+  - NUM_CLASSES 3 -> 4 (raw cats 3-4 collapse into a new worst class)
+  - single-file model_bundle.pkl deployment artifact round-trips correctly
 """
 
 from datetime import date, timedelta
@@ -55,11 +57,35 @@ def test_truncation_keeps_currently_worst_loans_not_future_worst():
     # loan (DPD 0, WORST_FUTURE_DPD 200) the old label-sort would have kept.
     assert kept_dpds == [90.0, 30.0]
 
-    # Label still computed over ALL loans (max future cat 4 → capped to 2)
+    # Label still computed over ALL loans (max future cat 4 → capped to worst class)
     assert inst["label"] == config.NUM_CLASSES - 1
     # Current stratum: worst current LOAN_CATEGORY = 2
     assert inst["current_cat"] == 2
     assert inst["n_loans"] == 3
+
+
+def test_4class_capping_collapses_only_3_and_4():
+    # Raw cats 0/1/2 must map 1:1; only 3 and 4 collapse into the new worst
+    # class (config.NUM_CLASSES - 1 == 3).
+    base = {
+        "CONTRACT_NUMBER": "c1",
+        "DPD_DAYS": 0.0,
+        "LOAN_CATEGORY": 0.0,
+        "OTHER_FEAT": 1.0,
+    }
+    for raw_cat, expected_label in [(0, 0), (1, 1), (2, 2), (3, 3), (4, 3)]:
+        df = pd.DataFrame([{
+            **base,
+            "LOAN_ID": raw_cat,
+            "NATIONAL_CODE": f"cust_{raw_cat}",
+            "SNAPSHOT_DATE": 20250101.0,
+            "WORST_FUTURE_DPD": 0.0,
+            "WORST_FUTURE_CAT": float(raw_cat),
+        }])
+        instances, _ = DataLoader().process_raw_data(df, max_loans=1)
+        assert instances[0]["label"] == expected_label, (
+            f"raw cat {raw_cat} should map to label {expected_label}"
+        )
 
 
 def test_prediction_table_without_labels_is_processed():
@@ -81,7 +107,7 @@ def test_customer_split_is_disjoint_and_stable():
     codes = [f"cust_{i}" for i in range(2000)]
     # Each customer appears in 3 "snapshots"
     instances = [
-        {"national_code": c, "snapshot_date": s, "label": int(rng.integers(3))}
+        {"national_code": c, "snapshot_date": s, "label": int(rng.integers(config.NUM_CLASSES))}
         for c in codes for s in (1.0, 2.0, 3.0)
     ]
 
@@ -101,12 +127,12 @@ def test_customer_split_is_disjoint_and_stable():
 
 def test_cost_decisions_flag_risky_non_modal_customers():
     probs = np.array([
-        [0.45, 0.20, 0.35],   # argmax says 0, expected cost says 2
-        [0.90, 0.08, 0.02],   # safely 0 either way
-        [0.05, 0.15, 0.80],   # clearly 2
+        [0.45, 0.20, 0.30, 0.05],   # argmax says 0, expected cost says 2
+        [0.90, 0.06, 0.03, 0.01],   # safely 0 either way
+        [0.03, 0.05, 0.12, 0.80],   # clearly the worst class
     ])
-    assert probs.argmax(axis=1).tolist() == [0, 0, 2]
-    assert cost_decisions(probs).tolist() == [2, 0, 2]
+    assert probs.argmax(axis=1).tolist() == [0, 0, 3]
+    assert cost_decisions(probs).tolist() == [2, 0, 3]
 
     C = np.asarray(config.COST_MATRIX)
     assert np.allclose(expected_costs(probs), probs @ C)
@@ -119,11 +145,12 @@ def test_cost_decisions_flag_risky_non_modal_customers():
 def test_calibrator_outputs_distributions_and_fixes_overconfidence():
     rng = np.random.default_rng(0)
     n = 20_000
-    y = rng.integers(0, 3, n)
-    probs = np.full((n, 3), 0.1)
+    y = rng.integers(0, config.NUM_CLASSES, n)
+    off_mass = (1.0 - 0.8) / (config.NUM_CLASSES - 1)
+    probs = np.full((n, config.NUM_CLASSES), off_mass)
     probs[np.arange(n), y] = 0.8
     flip = rng.random(n) < 0.3
-    y_obs = np.where(flip, (y + 1) % 3, y)
+    y_obs = np.where(flip, (y + 1) % config.NUM_CLASSES, y)
 
     cal = PerClassIsotonicCalibrator().fit(probs, y_obs)
     out = cal.transform(probs)
@@ -272,3 +299,130 @@ def test_resolve_pred_snapshots_no_immature_falls_back_to_latest():
 
     resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots(None)
     assert resolved == [mature_snap2]
+
+
+# ── 4-class support: model / loss / cost matrix ────────────────────────────────
+
+def test_deep_sets_and_loss_support_num_classes():
+    import torch
+    from src.model.deep_sets import DeepSets
+    from src.model.losses import CostSensitiveFocalLoss
+
+    torch.manual_seed(0)
+    model = DeepSets(n_features=5, hidden_dim=8, embedding_dim=4, num_classes=config.NUM_CLASSES)
+    features = torch.randn(6, 3, 5)
+    mask = torch.zeros(6, 3, dtype=torch.bool)
+    logits, embedding = model(features, mask)
+    assert logits.shape == (6, config.NUM_CLASSES)
+    assert embedding.shape == (6, 4)
+
+    criterion = CostSensitiveFocalLoss(num_classes=config.NUM_CLASSES)
+    targets = torch.randint(0, config.NUM_CLASSES, (6,))
+    loss = criterion(logits, targets)
+    assert torch.isfinite(loss)
+    assert loss.dim() == 0
+
+
+def test_cost_matrix_is_4x4_and_preserves_old_subblock():
+    C = np.asarray(config.COST_MATRIX)
+    assert C.shape == (4, 4)
+    old = np.array([
+        [0.0, 0.5, 1.0],
+        [1.5, 0.0, 0.5],
+        [4.0, 2.0, 0.0],
+    ])
+    assert np.allclose(C[:3, :3], old)
+
+
+def test_compute_metrics_reports_worst_class_recall():
+    y_true = np.array([0, 1, 2, 3, 3, 2])
+    y_pred = np.array([0, 1, 2, 3, 2, 2])
+    m = compute_metrics(y_true, y_pred)
+    assert f"recall_class_{config.NUM_CLASSES - 1}" in m
+    assert m[f"recall_class_{config.NUM_CLASSES - 1}"] == 0.5  # 1 of 2 true-3 recovered
+
+
+# ── deployment bundle round-trip ───────────────────────────────────────────────
+
+def test_bundle_round_trip(tmp_path):
+    import joblib
+    import torch
+    import xgboost as xgb
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    from src.inference.model_loader import load_bundle
+    from src.model.deep_sets import DeepSets
+
+    rng = np.random.default_rng(0)
+    n_features = 5
+
+    torch.manual_seed(0)
+    model = DeepSets(n_features=n_features, hidden_dim=8, embedding_dim=4,
+                      num_classes=config.NUM_CLASSES)
+    model.eval()
+    state_dict = model.state_dict()
+
+    X = rng.normal(size=(50, n_features)).astype(np.float32)
+    y = rng.integers(0, config.NUM_CLASSES, 50)
+
+    scaler = Pipeline([("scale", StandardScaler())]).fit(X)
+
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=5, max_depth=2, num_class=config.NUM_CLASSES,
+        objective="multi:softprob",
+    )
+    xgb_model.fit(X, y)
+    xgb_raw = xgb_model.get_booster().save_raw(raw_format="json")
+
+    probs = xgb_model.predict_proba(X)
+    calibrator = PerClassIsotonicCalibrator().fit(probs, y)
+
+    bundle = {
+        "metadata": {
+            "feature_count": n_features,
+            "max_loans_per_customer_99th": 2,
+            "features": [f"f{i}" for i in range(n_features)],
+        },
+        "scaler": scaler,
+        "deep_sets_state_dict": state_dict,
+        "deep_sets_hparams": {
+            "n_features": n_features, "hidden_dim": 8, "embedding_dim": 4,
+            "num_classes": config.NUM_CLASSES,
+        },
+        "xgb_model_raw": xgb_raw,
+        "calibrator": calibrator,
+    }
+    bundle_path = tmp_path / "model_bundle.pkl"
+    joblib.dump(bundle, bundle_path)
+
+    (loaded_scaler, loaded_model, loaded_xgb,
+     loaded_cal, max_loans, features) = load_bundle(bundle_path, device="cpu")
+
+    assert max_loans == 2
+    assert features == [f"f{i}" for i in range(n_features)]
+    assert np.allclose(loaded_scaler.transform(X), scaler.transform(X))
+    assert np.allclose(loaded_xgb.predict_proba(X), xgb_model.predict_proba(X))
+    assert np.allclose(loaded_cal.transform(probs), calibrator.transform(probs))
+
+    # DeepSets round-trips: identical output on a fixed input
+    feat_t = torch.from_numpy(rng.normal(size=(3, 2, n_features)).astype(np.float32))
+    mask_t = torch.zeros(3, 2, dtype=torch.bool)
+    with torch.no_grad():
+        orig_emb   = model(feat_t, mask_t)[1]
+        loaded_emb = loaded_model(feat_t, mask_t)[1]
+    assert torch.allclose(orig_emb, loaded_emb)
+
+
+def test_model_loader_dispatches_to_bundle_when_path_is_a_file(tmp_path, monkeypatch):
+    """ModelLoader.load_pipeline() should route to load_bundle() for a file path."""
+    from src.inference import model_loader as model_loader_mod
+
+    sentinel = object()
+    monkeypatch.setattr(model_loader_mod, "load_bundle", lambda path, device=None: sentinel)
+
+    bundle_path = tmp_path / "model_bundle.pkl"
+    bundle_path.write_bytes(b"not a real bundle, dispatch is file-based")
+
+    loader = model_loader_mod.ModelLoader(bundle_path)
+    assert loader.load_pipeline() is sentinel

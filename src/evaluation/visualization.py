@@ -8,9 +8,11 @@ import seaborn as sns
 import umap
 from sklearn.metrics import auc, confusion_matrix, roc_curve
 
+import project_config as config
+
 logger = logging.getLogger(__name__)
 
-CLASS_NAMES = ["No Delay", "Current", "Past Due+"]
+CLASS_NAMES = ["No Delay", "Current", "Past Due+", "Severe Past Due"]
 
 
 def plot_confusion_matrix(y_true, y_pred, save_path: Optional[Path] = None):
@@ -27,10 +29,10 @@ def plot_confusion_matrix(y_true, y_pred, save_path: Optional[Path] = None):
 
 
 def plot_roc_curves(y_true, y_prob, save_path: Optional[Path] = None):
-    y_true_oh = np.zeros((len(y_true), 3))
+    y_true_oh = np.zeros((len(y_true), config.NUM_CLASSES))
     y_true_oh[np.arange(len(y_true)), y_true] = 1
 
-    colors = ["steelblue", "darkorange", "crimson"]
+    colors = ["steelblue", "darkorange", "crimson", "seagreen"]
     plt.figure(figsize=(9, 7))
 
     for i, (name, color) in enumerate(zip(CLASS_NAMES, colors)):
@@ -65,12 +67,12 @@ def plot_embeddings_umap(
     emb_2d  = reducer.fit_transform(embeddings)
 
     plt.figure(figsize=(9, 7))
-    cmap   = plt.cm.get_cmap("viridis", 3)
+    cmap   = plt.cm.get_cmap("viridis", config.NUM_CLASSES)
     scatter = plt.scatter(
         emb_2d[:, 0], emb_2d[:, 1],
-        c=labels, cmap=cmap, alpha=0.6, s=8, vmin=-0.5, vmax=2.5,
+        c=labels, cmap=cmap, alpha=0.6, s=8, vmin=-0.5, vmax=config.NUM_CLASSES - 0.5,
     )
-    cbar = plt.colorbar(scatter, ticks=[0, 1, 2])
+    cbar = plt.colorbar(scatter, ticks=list(range(config.NUM_CLASSES)))
     cbar.ax.set_yticklabels(CLASS_NAMES)
     plt.title("UMAP Projection of Customer Embeddings")
     plt.xlabel("UMAP-1")

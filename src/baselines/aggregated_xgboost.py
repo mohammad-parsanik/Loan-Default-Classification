@@ -76,7 +76,7 @@ class AggregatedXGBoostBaseline:
         logger.info(f"Training XGBoost on {X_train.shape[1]} aggregated features…")
         self.model = xgb.XGBClassifier(
             objective="multi:softprob",
-            num_class=3,
+            num_class=config.NUM_CLASSES,
             n_estimators=200,
             max_depth=5,
             learning_rate=0.05,

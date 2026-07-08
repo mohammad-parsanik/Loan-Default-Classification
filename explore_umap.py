@@ -48,8 +48,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-CLASS_NAMES  = ["No Delay", "Current", "Past Due+"]
-CLASS_COLORS = ["#4C9BE8", "#F0A500", "#E84C4C"]
+CLASS_NAMES  = ["No Delay", "Current", "Past Due+", "Severe Past Due"]
+CLASS_COLORS = ["#4C9BE8", "#F0A500", "#E84C4C", "#4CAF50"]
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────

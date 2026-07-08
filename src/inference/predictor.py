@@ -114,7 +114,9 @@ class Predictor:
 
     def _default_output_path(self, resolved: list) -> Path:
         tag = str(resolved[0]) if len(resolved) == 1 else f"{min(resolved)}_{max(resolved)}"
-        return Path(self.loader.artifact_dir) / "predictions" / f"predictions_{tag}.csv"
+        artifact_path = Path(self.loader.artifact_dir)
+        base_dir = artifact_path if artifact_path.is_dir() else artifact_path.parent
+        return base_dir / "predictions" / f"predictions_{tag}.csv"
 
     def predict(self, snapshot_date=None, output_path=None) -> pd.DataFrame:
         requested = self._normalize_snapshot_arg(snapshot_date)
@@ -145,6 +147,7 @@ class Predictor:
             "P_NO_DELAY":           probs[:, 0],
             "P_CURRENT":            probs[:, 1],
             "P_PAST_DUE":           probs[:, 2],
+            "P_SEVERE_PAST_DUE":    probs[:, 3],
             # Minimum-expected-cost class under the business cost matrix
             "PREDICTED_CLASS":      cost_decisions(probs),
             # Expected cost of taking no action — the top-K ranking score

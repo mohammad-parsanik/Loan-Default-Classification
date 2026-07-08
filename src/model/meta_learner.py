@@ -83,7 +83,7 @@ class XGBoostMetaLearner:
         def objective(trial: optuna.Trial) -> float:
             params = {
                 "objective":        "multi:softprob",
-                "num_class":        3,
+                "num_class":        config.NUM_CLASSES,
                 "eval_metric":      "mlogloss",
                 "n_estimators":     trial.suggest_int("n_estimators", 100, 1000, step=50),
                 "max_depth":        trial.suggest_int("max_depth", 3, 7),
@@ -191,7 +191,7 @@ class XGBoostMetaLearner:
 
             final_params = {
                 "objective":   "multi:softprob",
-                "num_class":   3,
+                "num_class":   config.NUM_CLASSES,
                 "random_state": self.random_state,
                 "n_jobs":      -1,          # use all cores for final model
                 "n_estimators": best_n_est, # use the early-stopping-determined count
@@ -205,7 +205,7 @@ class XGBoostMetaLearner:
             
             final_params = {
                 "objective":   "multi:softprob",
-                "num_class":   3,
+                "num_class":   config.NUM_CLASSES,
                 "random_state": self.random_state,
                 "n_jobs":      -1,
                 "n_estimators": 100,

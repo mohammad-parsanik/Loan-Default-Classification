@@ -16,7 +16,7 @@ class CostSensitiveFocalLoss(nn.Module):
     Using register_buffer so .to(device) moves the matrix automatically.
     """
 
-    def __init__(self, gamma: float = 2.0, num_classes: int = 3):
+    def __init__(self, gamma: float = 2.0, num_classes: int = 4):
         super().__init__()
         self.gamma = gamma
         self.num_classes = num_classes
@@ -29,7 +29,7 @@ class CostSensitiveFocalLoss(nn.Module):
         """
         Args:
             logits:  (B, num_classes)  raw unnormalised scores
-            targets: (B,)              class indices {0, 1, 2}
+            targets: (B,)              class indices {0, ..., num_classes-1}
         Returns:
             scalar loss
         """

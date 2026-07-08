@@ -23,7 +23,7 @@ TARGET_COL   = "WORST_FUTURE_CAT"
 META_COLS = [ID_COL, CONTRACT_COL, CUSTOMER_COL,
              SNAPSHOT_COL, TARGET_COL, "WORST_FUTURE_DPD"]
 
-NUM_CLASSES = 3  # {0: No Delay, 1: Current, 2: Past Due+}
+NUM_CLASSES = 4  # {0: No Delay, 1: Current, 2: Past Due+, 3: Severe Past Due}
 
 # ── Cost matrix (single source of truth) ─────────────────
 # COST_MATRIX[true][predicted]. Used by:
@@ -31,10 +31,16 @@ NUM_CLASSES = 3  # {0: No Delay, 1: Current, 2: Past Due+}
 #   - evaluation/decision.py (expected-cost decision rule at prediction time)
 #   - metrics.avg_cost
 # Business anchor: missing a Cat-2 costs 4x a false alarm.
+# PLACEHOLDER for the new class 3 row/col: derived (not business-tuned) by
+# extrapolating the same per-step-cost formula that produces the original
+# 3x3 block exactly (false-alarm cost = 0.5/step regardless of true class;
+# miss cost from true class t = (1.0 + 0.5*t)/step). Retune once real costs
+# for "Severe Past Due" misses/false-alarms are known.
 COST_MATRIX = [
-    [0.0, 0.5, 1.0],  # True 0
-    [1.5, 0.0, 0.5],  # True 1
-    [4.0, 2.0, 0.0],  # True 2
+    [0.0, 0.5, 1.0, 1.5],  # True 0
+    [1.5, 0.0, 0.5, 1.0],  # True 1
+    [4.0, 2.0, 0.0, 0.5],  # True 2
+    [7.5, 5.0, 2.5, 0.0],  # True 3
 ]
 
 # ── Feature typing ───────────────────────────────────────
@@ -96,7 +102,9 @@ PRED_SNAPSHOT_DATES = None
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)
 # to force cache invalidation without touching any code logic.
 # v1.1: truncation sort key WORST_FUTURE_DPD -> DPD_DAYS; cache adds current_cats.
-DATA_VERSION = "v1.1"
+# v1.2: NUM_CLASSES 3 -> 4 (raw cats 3-4 now collapse into a new class 3
+# instead of into class 2) -- labels baked into the cache change, must rebuild.
+DATA_VERSION = "v1.2"
 
 # ── Model — DeepSets (CPU-optimized) ────────────────────
 MAX_LOANS_PER_CUSTOMER = None  # Computed from data (99th percentile)

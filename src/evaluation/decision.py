@@ -36,8 +36,8 @@ def risk_scores(probs: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     # Self-check: cost rule flags a risky-but-not-modal customer; argmax doesn't.
-    p = np.array([[0.45, 0.20, 0.35], [0.90, 0.08, 0.02]])
+    p = np.array([[0.45, 0.20, 0.30, 0.05], [0.90, 0.06, 0.03, 0.01]])
     assert p.argmax(axis=1).tolist() == [0, 0]
     assert cost_decisions(p).tolist() == [2, 0]
-    assert np.isclose(risk_scores(p)[0], 0.20 * 1.5 + 0.35 * 4.0)
+    assert np.isclose(risk_scores(p)[0], 0.20 * 1.5 + 0.30 * 4.0 + 0.05 * 7.5)
     print("decision.py self-check OK")

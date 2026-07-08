@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A bank early-warning system that predicts the **worst delinquency class of a customer's loan portfolio over the next 6 months** (3 classes: 0 = No Delay, 1 = Current/Minor Delay, 2 = Past Due+). Records are monthly point-in-time snapshots of an upstream ETL table (~64 numeric per-loan features, no categoricals). Prediction is at customer level (`NATIONAL_CODE`), cost-sensitive (missing a Cat-2 costs 4× a false alarm).
+A bank early-warning system that predicts the **worst delinquency class of a customer's loan portfolio over the next 6 months** (4 classes: 0 = No Delay, 1 = Current/Minor Delay, 2 = Past Due+, 3 = Severe Past Due). Records are monthly point-in-time snapshots of an upstream ETL table (~64 numeric per-loan features, no categoricals). Prediction is at customer level (`NATIONAL_CODE`), cost-sensitive (missing a Cat-2 costs 4× a false alarm; the class-3 costs are a derived placeholder pending business tuning, see `project_config.COST_MATRIX`).
 
 **Read `AGENT_HANDOFF.md` first** — it is the authoritative record of decisions, run results, and the leakage analysis. `column_changes.md` is the feature dictionary; `leakage_analysis.md` explains the temporal-split constraints.
 
@@ -53,7 +53,8 @@ Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickl
 - `MAX_LOANS_PER_CUSTOMER` resolves at runtime to **2** (99th percentile). Most customers have 1 loan — this is why DeepSets ≈ baseline and why attention was abandoned.
 - Truncation to MAX_LOANS sorts by `DPD_DAYS` desc (a prediction-time feature). It previously sorted by the label `WORST_FUTURE_DPD` — fixed July 2026; do not reintroduce label columns into `process_raw_data` sorting. The label is `max` over ALL loans while features keep only the first MAX_LOANS; each instance also carries `current_cat` (current worst category, drives stratified evaluation).
 - Temporal split usability is computed against `date.today()` (`temporal_split._get_usable_snapshots`) — the same code produces different splits as calendar time passes. Snapshot dates are floats like `20241021.0`.
-- Labels: features keep 5-category granularity; the target is capped at 3 classes (`min(max(cat), 2)`). For already-delinquent customers the label is largely mechanical DPD accrual — judge models on the `current_cat_0` slice (`by_current_cat` metrics), not aggregate F1.
+- Labels: features keep 5-category granularity; the target is capped at `config.NUM_CLASSES` classes (`min(max(cat), NUM_CLASSES - 1)`, currently 4: raw cats 0/1/2 pass through 1:1, raw cats 3-4 collapse into class 3). For already-delinquent customers the label is largely mechanical DPD accrual — judge models on the `current_cat_0` slice (`by_current_cat` metrics), not aggregate F1.
+- `run.py train` now also writes `<fold_dir>/model_bundle.pkl` — a single-file deployment artifact (fitted scaler + DeepSets state_dict/hparams + XGBoost raw bytes + calibrator) that `ModelLoader`/`Predictor` can load directly by pointing `--artifact_dir` at the `.pkl` file instead of the fold directory. It's a pure export convenience; the existing per-file directory artifacts are unchanged and still used in-pipeline.
 - `explore_output/iv_report.csv` is **stale**: the old IV binning forced IV=0.0 for ~10 skewed/binary features (they are NOT constant — DB-verified). Re-run `explore_iv_woe.py` after the v1.1 cache rebuild.
 - The inference deliverable is a **ranked top-K list** (external API budget limits how many customers can be enriched), not just class predictions. `Predictor` ranks by `RISK_SCORE` = expected cost of predicting class 0 (`probs @ COST_MATRIX[:,0]`) on calibrated probabilities.
 

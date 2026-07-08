@@ -25,15 +25,15 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     # Per-class recall (explicit labels: keeps indices right on strata where
     # a class is absent, e.g. current-cat slices)
     recalls = recall_score(y_true, y_pred, average=None,
-                           labels=list(range(3)), zero_division=0)
+                           labels=list(range(config.NUM_CLASSES)), zero_division=0)
     for i, r in enumerate(recalls):
         metrics[f'recall_class_{i}'] = float(r)
         
     # Brier Score (if probabilities are provided)
     if y_prob is not None:
-        y_true_oh = np.zeros((len(y_true), 3))
+        y_true_oh = np.zeros((len(y_true), config.NUM_CLASSES))
         y_true_oh[np.arange(len(y_true)), y_true] = 1
-        brier = np.mean([brier_score_loss(y_true_oh[:, c], y_prob[:, c]) for c in range(3)])
+        brier = np.mean([brier_score_loss(y_true_oh[:, c], y_prob[:, c]) for c in range(config.NUM_CLASSES)])
         metrics['brier_score'] = float(brier)
         
     # Cost-weighted accuracy (single source of truth: project_config.COST_MATRIX)
@@ -102,25 +102,24 @@ def bootstrap_confidence_intervals(y_true, y_pred, y_prob=None, n_iterations=100
     stats = {
         'macro_f1': [],
         'qwk': [],
-        'recall_class_2': []
+        'recall_class_2': [],
+        'recall_class_3': [],
     }
-    
+
     for _ in range(n_iterations):
         # Prepare indices for sampling
         indices = resample(np.arange(n_size))
         y_t = y_true[indices]
         y_p = y_pred[indices]
-        
+
         # Calculate and store metrics for this sample
         stats['macro_f1'].append(f1_score(y_t, y_p, average='macro'))
         stats['qwk'].append(cohen_kappa_score(y_t, y_p, weights='quadratic'))
-        
+
         recalls = recall_score(y_t, y_p, average=None, zero_division=0)
-        if len(recalls) > 2:
-            stats['recall_class_2'].append(recalls[2])
-        else:
-            # Handle edge case where class 2 is not in the bootstrap sample
-            stats['recall_class_2'].append(0.0)
+        # Handle edge case where a class is not present in the bootstrap sample
+        stats['recall_class_2'].append(recalls[2] if len(recalls) > 2 else 0.0)
+        stats['recall_class_3'].append(recalls[3] if len(recalls) > 3 else 0.0)
             
     # Calculate confidence intervals
     ci = {}

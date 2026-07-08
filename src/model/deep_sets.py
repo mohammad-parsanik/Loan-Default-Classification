@@ -30,7 +30,7 @@ class DeepSets(nn.Module):
         hidden_dim:    width of the phi (per-loan) MLP layers
         embedding_dim: dimension of the customer-level embedding fed to XGBoost
         dropout:       dropout probability in both phi and rho
-        num_classes:   number of output classes (default 3)
+        num_classes:   number of output classes (default 4)
     """
 
     def __init__(
@@ -39,7 +39,7 @@ class DeepSets(nn.Module):
         hidden_dim: int = 128,
         embedding_dim: int = 64,
         dropout: float = 0.15,
-        num_classes: int = 3,
+        num_classes: int = 4,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim

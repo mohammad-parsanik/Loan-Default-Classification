@@ -265,6 +265,7 @@ def train_single_fold(
             f"{fold_label} | Baseline (cost rule) → "
             f"Macro F1: {baseline_metrics['cost_rule']['macro_f1']:.4f}, "
             f"Cat-2 Recall: {baseline_metrics['cost_rule']['recall_class_2']:.4f}, "
+            f"Cat-3 Recall: {baseline_metrics['cost_rule']['recall_class_3']:.4f}, "
             f"Avg Cost: {baseline_metrics['cost_rule']['avg_cost']:.4f}"
         )
 
@@ -287,6 +288,7 @@ def train_single_fold(
             hidden_dim=config.DEEPSETS_HIDDEN_DIM,
             embedding_dim=config.DEEPSETS_EMBED_DIM,
             dropout=config.DROPOUT,
+            num_classes=config.NUM_CLASSES,
         )
         model.load_state_dict(model_state)
     else:
@@ -296,6 +298,7 @@ def train_single_fold(
                 hidden_dim=config.DEEPSETS_HIDDEN_DIM,
                 embedding_dim=config.DEEPSETS_EMBED_DIM,
                 dropout=config.DROPOUT,
+                num_classes=config.NUM_CLASSES,
             )
 
             import sys as _sys
@@ -315,7 +318,7 @@ def train_single_fold(
                     "MSVC cl.exe which was not found). Running in eager mode."
                 )
 
-            criterion = CostSensitiveFocalLoss()
+            criterion = CostSensitiveFocalLoss(num_classes=config.NUM_CLASSES)
             trainer   = TransformerTrainer(
                 model, criterion, config,
                 device=device,
@@ -398,6 +401,40 @@ def train_single_fold(
             plot_confusion_matrix(y_test, y_pred,    save_path=plots_dir / "confusion_matrix.png")
             plot_roc_curves(y_test, y_prob,          save_path=plots_dir / "roc_curves.png")
             plot_embeddings_umap(X_test_emb, y_test, save_path=plots_dir / "embedding_umap.png")
+
+    # ── Single-file deployment bundle ─────────────────────────────────────────
+    # Pure export convenience: packs the same trained artifacts already on
+    # disk into one model_bundle.pkl, loadable standalone via
+    # ModelLoader/Predictor without needing the rest of the fold directory.
+    # Re-derived from `model`/`meta_learner`/`preprocessor` (always in scope
+    # here regardless of whether this fold resumed from a checkpoint), plus
+    # the calibrator re-read from disk since it's only set in-memory on a
+    # fresh (non-resumed) evaluation run.
+    bundle_raw_state = (
+        model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+    )
+    cal_path = fold_dir / "calibrator.pkl"
+    bundle_calibrator = joblib.load(cal_path) if cal_path.exists() else None
+    bundle = {
+        "metadata": {
+            "feature_count": len(features),
+            "max_loans_per_customer_99th": max_loans,
+            "features": features,
+        },
+        "scaler": preprocessor,
+        "deep_sets_state_dict": bundle_raw_state,
+        "deep_sets_hparams": {
+            "n_features": len(features),
+            "hidden_dim": config.DEEPSETS_HIDDEN_DIM,
+            "embedding_dim": config.DEEPSETS_EMBED_DIM,
+            "dropout": config.DROPOUT,
+            "num_classes": config.NUM_CLASSES,
+        },
+        "xgb_model_raw": meta_learner.xgb_model.get_booster().save_raw(raw_format="json"),
+        "calibrator": bundle_calibrator,
+    }
+    joblib.dump(bundle, fold_dir / "model_bundle.pkl")
+    logger.info(f"{fold_label} | Deployment bundle saved to {fold_dir / 'model_bundle.pkl'}")
 
     logger.info(
         f"{fold_label} DONE | "
@@ -605,7 +642,8 @@ def _run_single_split(instances, features, run_dir, device, timing, ckpt, pipeli
     fm = result["final_metrics"]
     logger.info(f"  Baseline  Macro F1: {bm['macro_f1']:.4f}")
     logger.info(f"  DeepSets+XGB Macro F1: {fm['macro_f1']:.4f}")
-    logger.info(f"  Cat-2 Recall: {fm.get('recall_class_2', '?'):.4f}")
+    logger.info(f"  Cat-2 Recall: {fm.get('recall_class_2', float('nan')):.4f}")
+    logger.info(f"  Cat-3 Recall: {fm.get('recall_class_3', float('nan')):.4f}")
     _log_policy_comparison(bm, fm)
 
 
@@ -616,11 +654,13 @@ def _log_policy_comparison(bm: dict, fm: dict):
         logger.info("  ── Cost-rule (deployed policy) comparison ──")
         logger.info(
             f"  Baseline     | F1: {b['macro_f1']:.4f}  "
-            f"Cat-2 Rec: {b['recall_class_2']:.4f}  Cost: {b['avg_cost']:.4f}"
+            f"Cat-2 Rec: {b['recall_class_2']:.4f}  Cat-3 Rec: {b['recall_class_3']:.4f}  "
+            f"Cost: {b['avg_cost']:.4f}"
         )
         logger.info(
             f"  DeepSets+XGB | F1: {f['macro_f1']:.4f}  "
-            f"Cat-2 Rec: {f['recall_class_2']:.4f}  Cost: {f['avg_cost']:.4f}"
+            f"Cat-2 Rec: {f['recall_class_2']:.4f}  Cat-3 Rec: {f['recall_class_3']:.4f}  "
+            f"Cost: {f['avg_cost']:.4f}"
         )
     for name, m in [("Baseline", bm), ("DeepSets+XGB", fm)]:
         for slice_name, sm in m.get("by_current_cat", {}).items():
@@ -628,6 +668,7 @@ def _log_policy_comparison(bm: dict, fm: dict):
                 f"  {name} [{slice_name}, n={sm['n']:,}] | "
                 f"F1: {sm['macro_f1']:.4f}  "
                 f"Cat-2 Rec: {sm.get('recall_class_2', float('nan')):.4f}  "
+                f"Cat-3 Rec: {sm.get('recall_class_3', float('nan')):.4f}  "
                 f"Cost: {sm['avg_cost']:.4f}"
             )
 

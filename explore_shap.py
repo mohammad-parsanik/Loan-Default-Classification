@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-CLASS_NAMES = ["No Delay", "Current", "Past Due+"]
+CLASS_NAMES = ["No Delay", "Current", "Past Due+", "Severe Past Due"]
 
 
 # ── Model + data loading ──────────────────────────────────────────────────────
@@ -140,23 +140,27 @@ def run_shap_analysis(
     log.info(f"SHAP values computed for {n_classes} classes.")
 
     # ── 1. Global summary plot (multi-output beeswarm) ────────────────────────
-    log.info("Generating global SHAP summary plot ...")
-    plt.figure(figsize=(10, 6))
-    # Use class 2 (Past Due+) for the primary summary — most actionable
-    shap.summary_plot(
-        sv_list[2],
-        X_s,
-        feature_names = feature_names,
-        max_display   = max_display,
-        show          = False,
-        plot_type     = "dot",
-    )
-    plt.title("SHAP Summary -- Class 2 (Past Due+ vs Rest)", fontweight="bold", fontsize=12)
-    plt.tight_layout()
-    save_path = output_dir / "shap_summary_class2.png"
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    log.info(f"Saved -> {save_path.name}")
+    # Class 2 (Past Due+) and class 3 (Severe Past Due) are both actionable
+    # tiers of delinquency — plot a summary for each.
+    for cls, name in ((2, "Past Due+"), (3, "Severe Past Due")):
+        if cls >= n_classes:
+            continue
+        log.info(f"Generating global SHAP summary plot for class {cls} ({name}) ...")
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(
+            sv_list[cls],
+            X_s,
+            feature_names = feature_names,
+            max_display   = max_display,
+            show          = False,
+            plot_type     = "dot",
+        )
+        plt.title(f"SHAP Summary -- Class {cls} ({name} vs Rest)", fontweight="bold", fontsize=12)
+        plt.tight_layout()
+        save_path = output_dir / f"shap_summary_class{cls}.png"
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"Saved -> {save_path.name}")
 
     # ── 2. Per-class mean |SHAP| bar charts ──────────────────────────────────
     for cls in range(n_classes):
@@ -209,7 +213,7 @@ def _plot_dependence_grid(
     except ImportError:
         return
 
-    colors = ["#4C9BE8", "#F0A500", "#E84C4C"]
+    colors = ["#4C9BE8", "#F0A500", "#E84C4C", "#4CAF50"]
     for cls, sv in enumerate(sv_list):
         mean_abs = np.abs(sv).mean(axis=0)
         top_feats = np.argsort(mean_abs)[::-1][:n_top]

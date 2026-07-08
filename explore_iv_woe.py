@@ -3,16 +3,17 @@ explore_iv_woe.py
 =================
 Standalone Information Value (IV) & Weight of Evidence (WoE) explorer.
 
-Strategy: One-vs-Rest (OvR) for each of the 3 classes:
-  - OvR-0: "No Delay"  vs  {Current, Past Due+}
-  - OvR-1: "Current"   vs  {No Delay, Past Due+}   <- hardest to separate
-  - OvR-2: "Past Due+" vs  {No Delay, Current}
+Strategy: One-vs-Rest (OvR) for each of the config.NUM_CLASSES classes, e.g.:
+  - OvR-0: "No Delay"          vs  {Current, Past Due+, Severe Past Due}
+  - OvR-1: "Current"           vs  {No Delay, Past Due+, Severe Past Due}   <- hardest to separate
+  - OvR-2: "Past Due+"         vs  {No Delay, Current, Severe Past Due}
+  - OvR-3: "Severe Past Due"   vs  {No Delay, Current, Past Due+}
 
 Inputs (no DB required -- reads from NPZ cache):
   data/train_portfolios_cache.npz  +  data/train_portfolios_cache.manifest.json
 
 Outputs (in --output_dir, default: explore_output/):
-  iv_report.csv            -- IV for every feature across all 3 OvR problems
+  iv_report.csv            -- IV for every feature across all OvR problems
   iv_chart.png             -- horizontal bar chart sorted by max IV across OvRs
   woe_detail_<feature>.png -- per-bin WoE bar charts for top N features
 
@@ -33,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent))
+import project_config as config
 from src.data.temporal_split import filter_mature_snapshots
 
 logging.basicConfig(
@@ -43,7 +45,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Class labels (must match project_config.py NUM_CLASSES order)
-CLASS_NAMES = {0: "No Delay", 1: "Current", 2: "Past Due+"}
+CLASS_NAMES = {0: "No Delay", 1: "Current", 2: "Past Due+", 3: "Severe Past Due"}
 
 
 # ── Cache loading ─────────────────────────────────────────────────────────────
@@ -221,7 +223,7 @@ def compute_all_ivs(
 
     Returns DataFrame: feature, iv_ovr0, iv_ovr1, iv_ovr2, iv_max, iv_mean
     """
-    n_classes = 3
+    n_classes = config.NUM_CLASSES
     records = []
 
     log.info(f"Computing OvR IV for {len(feat_cols)} features x {n_classes} classes ...")
@@ -252,9 +254,10 @@ def plot_woe_detail(
     output_dir: Path,
     n_bins: int = 10,
 ) -> None:
-    """Plot per-class OvR WoE bars for a single feature (3 subplots)."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    colors = ["steelblue", "darkorange", "crimson"]
+    """Plot per-class OvR WoE bars for a single feature (one subplot per class)."""
+    n_classes = config.NUM_CLASSES
+    fig, axes = plt.subplots(1, n_classes, figsize=(5 * n_classes, 4))
+    colors = ["steelblue", "darkorange", "crimson", "seagreen"]
     feat_vals = X[:, feat_idx]
 
     for cls, (ax, color) in enumerate(zip(axes, colors)):
@@ -319,9 +322,10 @@ def print_summary(df_iv: pd.DataFrame) -> None:
     print("\n" + "=" * 70)
     print("  IV DIAGNOSTIC SUMMARY")
     print("=" * 70)
-    print(df_iv[["feature", "iv_ovr0", "iv_ovr1", "iv_ovr2", "iv_max"]].head(25).to_string(index=False))
+    ovr_cols = [f"iv_ovr{c}" for c in range(config.NUM_CLASSES)]
+    print(df_iv[["feature", *ovr_cols, "iv_max"]].head(25).to_string(index=False))
     print("\n--- Per-class coverage ---")
-    for cls in range(3):
+    for cls in range(config.NUM_CLASSES):
         col     = f"iv_ovr{cls}"
         strong  = int((df_iv[col] >= 0.10).sum())
         medium  = int(((df_iv[col] >= 0.02) & (df_iv[col] < 0.10)).sum())

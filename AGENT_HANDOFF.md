@@ -9,12 +9,13 @@
 A bank needs to predict the **worst future delinquency state** of a customer's entire loan portfolio over a **6-month forward horizon**, to prioritize collection actions.
 
 - **Prediction level:** Customer (grouped by `NATIONAL_CODE`), not individual loan.
-- **Target:** 3-class classification:
+- **Target:** 4-class classification (bumped from 3 classes on 2026-07-08 — see §11 item 10):
   - `0` — No Delay (performing)
   - `1` — Current / Minor Delay (pre-delinquent)
-  - `2` — Past Due+ (NPL, categories 2-4 collapsed)
-- **Label construction:** For each customer-snapshot, label = `min(max(WORST_FUTURE_CAT across all loans), 2)`. Features retain the full 5-category granularity internally; only the prediction target is capped to 3 classes.
-- **Business constraint:** This is heavily cost-sensitive. Missing a Cat-2 customer is penalized **4×** more than a false positive over-flagging. The full cost matrix is in `src/model/losses.py`.
+  - `2` — Past Due+ (NPL, raw category 2 only)
+  - `3` — Severe Past Due (raw categories 3-4 collapsed)
+- **Label construction:** For each customer-snapshot, label = `min(max(WORST_FUTURE_CAT across all loans), config.NUM_CLASSES - 1)`. Features retain the full 5-category granularity internally; only the prediction target is capped (currently to 4 classes).
+- **Business constraint:** This is heavily cost-sensitive. Missing a Cat-2 customer is penalized **4×** more than a false positive over-flagging; the class-3 (Severe Past Due) costs are a derived placeholder, not yet business-tuned. The single source of truth is `project_config.COST_MATRIX`.
 - **Prior work:** A previous project used per-loan LightGBM classifiers and performed poorly. This project replaces that approach with a portfolio-level architecture.
 
 ---
@@ -147,7 +148,7 @@ These are the key toggles a new agent needs to understand:
 | `OPTIMIZE_ON_VALIDATION` | `True` | `True` = use a val set for early stopping + Optuna. `False` = skip Optuna, train for FIXED_EPOCHS with fixed XGB params, no val set created (Run 3 mode). |
 | `VAL_SPLIT_MODE` | `"customer"` | How the val set is built when optimizing: `"customer"` = in-time customer-disjoint holdout (leakage-free tuning, see §6). `"temporal"` = legacy second-newest-snapshot val (leaky, Run 2). |
 | `CUSTOMER_VAL_FRACTION` | `0.20` | Share of customers held out when `VAL_SPLIT_MODE="customer"`. |
-| `COST_MATRIX` | 3×3 | Single source of truth for costs. Shared by the DeepSets loss, the expected-cost decision rule (`src/evaluation/decision.py`), and the `avg_cost` metric. |
+| `COST_MATRIX` | 4×4 | Single source of truth for costs. Shared by the DeepSets loss, the expected-cost decision rule (`src/evaluation/decision.py`), and the `avg_cost` metric. The class-3 row/col is a derived placeholder (exactly reproduces the old 3×3 sub-block) pending business tuning. |
 | `BASELINE_COST_WEIGHTS` | `True` | Baseline XGBoost sample weights scaled by cost-matrix row sums (same nudge the DeepSets gets from its loss) — makes the baseline-vs-model comparison fair. |
 | `RECALIBRATE_ON_PREDICT` | `True` | At predict time, refit the probability calibrator on the newest matured-label snapshot (tracks base-rate drift). |
 | `FIXED_EPOCHS` | `15` | Number of DeepSets training epochs when `OPTIMIZE_ON_VALIDATION = False`. |
@@ -261,7 +262,7 @@ Three standalone scripts exist in the project root for data quality analysis. Th
 
 | Script | Purpose |
 |--------|---------|
-| `explore_iv_woe.py` | Information Value & Weight of Evidence per feature, One-vs-Rest for all 3 classes. Reads from NPZ cache (no DB needed). |
+| `explore_iv_woe.py` | Information Value & Weight of Evidence per feature, One-vs-Rest for all `config.NUM_CLASSES` classes. Reads from NPZ cache (no DB needed). |
 | `explore_umap.py` | UMAP projection of raw features or model embeddings with CLI-tunable hyperparameters. |
 | `explore_shap.py` | SHAP TreeExplainer on XGBoost meta-learner. Needs `.npy` embeddings copied from the training server. |
 
@@ -343,7 +344,7 @@ Loan Default Classification/
 
 ---
 
-## 11. Changes of July 7, 2026 (methodology overhaul — not yet run on server)
+## 11. Changes of July 7-8, 2026 (methodology overhaul + 4-class bump — not yet run on server)
 
 All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB).
 
@@ -351,15 +352,16 @@ All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB
 2. **Expected-cost decision rule** (`src/evaluation/decision.py`): predictions and the top-K ranking use `argmin(probs @ COST_MATRIX)` instead of argmax / ad-hoc `2·P₂+P₁`. Applied identically to baseline and model via `metrics.full_evaluation`.
 3. **Customer-disjoint in-time validation** (`temporal_split.split_train_by_customer`, `VAL_SPLIT_MODE="customer"`): restores early stopping + Optuna without test leakage (§6, Resolution 2).
 4. **Per-class isotonic calibration** (`src/evaluation/calibration.py`): fitted on the customer holdout (both baseline and meta-learner), saved as `calibrator.pkl`, applied before decisions/ranking. `Predictor` refreshes it on the newest matured snapshot when `RECALIBRATE_ON_PREDICT=True`.
-5. **Stratified evaluation**: every instance now carries `current_cat` (current worst `LOAN_CATEGORY`, capped to 3 classes, computed over ALL loans pre-truncation). Test metrics are reported per slice (`by_current_cat`). The `current_cat_0` slice — currently-clean customers — is the real early-warning task; aggregate F1 is inflated by the mechanical already-delinquent slices.
+5. **Stratified evaluation**: every instance now carries `current_cat` (current worst `LOAN_CATEGORY`, capped to `config.NUM_CLASSES` classes, computed over ALL loans pre-truncation). Test metrics are reported per slice (`by_current_cat`). The `current_cat_0` slice — currently-clean customers — is the real early-warning task; aggregate F1 is inflated by the mechanical already-delinquent slices.
 6. **`metadata.json` now written per fold** — `ModelLoader` always required it but nothing produced it (inference would have failed).
 7. **IV binning fixed** in `explore_iv_woe.py` (see §7 correction). `explore_output/iv_report.csv` is stale until re-run.
 8. Cost matrix consolidated into `project_config.COST_MATRIX` (was duplicated in `losses.py` and `metrics.py`).
 9. **Prediction unified onto `TRAIN_TABLE`, multi-snapshot + auto-selection** (`project_config.PRED_SNAPSHOT_DATES`, `MSSQLConnector.get_available_snapshots`, `DataLoader.resolve_pred_snapshots`, `Predictor.predict`): `PRED_TABLE`/`EDP_Feature_pred` removed. `--snapshot_date` (CLI, now `nargs="*"`) or `PRED_SNAPSHOT_DATES` (config) pick the snapshot(s) to score; unset or not-found dates fall back to every currently-immature snapshot, then to the single latest snapshot if even that's empty. `--output` is optional, defaulting to `<artifact_dir>/predictions/predictions_<tag>.csv`. See Gotcha 8 for the accompanying degenerate-label fix.
+10. **NUM_CLASSES 3 → 4, single-file deployment bundle (2026-07-08):** `config.NUM_CLASSES=4` — raw cats 0/1/2 pass through 1:1, raw cats 3-4 now collapse into a new class 3 ("Severe Past Due") instead of into class 2. `COST_MATRIX` is now 4×4 (class-3 row/col is a derived, not-yet-business-tuned placeholder — see the table above). Every hardcoded `3`/`range(3)` tied to class count was swept to `config.NUM_CLASSES` (`losses.py`, `deep_sets.py`, `meta_learner.py`, `aggregated_xgboost.py`, `metrics.py`, `visualization.py`, `explore_iv_woe.py`, `explore_shap.py`, `explore_umap.py`); `bootstrap_confidence_intervals` now tracks both `recall_class_2` and `recall_class_3`; `Predictor` emits a 4th probability column `P_SEVERE_PAST_DUE`. `DATA_VERSION` bumped to `v1.2` (labels are baked into the NPZ cache, so this forces a rebuild). Separately, `train_single_fold` now also writes `<fold_dir>/model_bundle.pkl` — everything `Predictor` needs (scaler, DeepSets state_dict + hparams, XGBoost raw model bytes, calibrator) in one file; `ModelLoader.load_pipeline()` dispatches to it when `artifact_dir` points at a file instead of a directory. Pure export convenience — the per-file directory artifacts are unchanged and still used in-pipeline. All verified locally via `tests/test_pipeline_changes.py` (20 tests, synthetic data, no DB) — **not yet run on the training server.**
 
 ## 12. What's Next (Prioritized)
 
-1. **Run 4 on the server:** delete/ignore old cache (v1.1 rebuild is automatic), then `python run.py train` with the new defaults (`OPTIMIZE_ON_VALIDATION=True`, `VAL_SPLIT_MODE="customer"`). Old run dirs are NOT resumable (instance dicts lack `current_cat`). This one run delivers: unbiased-but-tuned test metrics, the fair baseline-vs-DeepSets comparison under the shared cost rule, calibrated probabilities, and the per-slice numbers.
+1. **Run 4 on the server:** old cache rebuild is automatic (`DATA_VERSION` now v1.2 — bumped again for the NUM_CLASSES 3→4 change, item 10 above), then `python run.py train` with the new defaults (`OPTIMIZE_ON_VALIDATION=True`, `VAL_SPLIT_MODE="customer"`, `NUM_CLASSES=4`). Old run dirs are NOT resumable (instance dicts lack `current_cat`; also predate the 4-class labels). This one run delivers: unbiased-but-tuned test metrics under 4 classes, the fair baseline-vs-DeepSets comparison under the shared cost rule, calibrated probabilities, the per-slice numbers, and a first `model_bundle.pkl` to sanity-check end-to-end (load it via `--artifact_dir <fold_dir>/model_bundle.pkl`).
 2. **Re-run `explore_iv_woe.py`** (after the cache rebuild) for true IVs of the flags/rare-event features the old binning zeroed out.
 3. **Architecture decision:** if baseline ≈ DeepSets+XGB on the `cost_rule` and `current_cat_0` metrics in Run 4, retire the DeepSets stage — single XGBoost on named aggregated features is simpler, faster, and SHAP-explainable to auditors.
 4. **Wait for more data:** 2-3 more monthly snapshots enable strict walk-forward validation.
