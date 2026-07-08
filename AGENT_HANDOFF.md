@@ -372,7 +372,12 @@ Run 4 ran on the server (results_4/): the July-7 machinery worked; aggregate F1 
 
 Implementation landed (2026-07-08, all local-tested — 26 tests): `ranking.py`; `mask_monotone` + `severity_scores`; `StratifiedCalibrator` everywhere a calibrator is fit; `full_evaluation` reworked (calibrate → mask → `ranking`/`argmax_cal`/`cost_rule`/`by_current_cat`); `BinarySevereBaseline` comparator (does multiclass cost ranking quality? also informs the deferred per-current-cat-models idea); `Predictor` queue output (`RISK_RANK`, `RISK_SCORE`=P(severe), `RULE_FLAG` ALREADY_SEVERE/SUPERSEDED, `PRED_DEDUP_LATEST`); `run.py train --final` (deployment fit on ALL mature snapshots, no test, bundle out); fold_aggregator/explore-script 4-class residue.
 
-Open business questions: (a) month-over-month API dedup rule (is last month's enrichment still fresh?); (b) whether near-boundary cat-2 customers (mechanically rolling into severe) should also be carved out — `DAYS_TO_NEXT_THRESHOLD` makes that a one-line rule; (c) real cost numbers if the cost rule is ever promoted again.
+Business answers received (2026-07-08 follow-up):
+- (a) **API freshness ≈ 1 month** ("the oldest data we could consider would be a month old") → `API_DATA_TTL_DAYS=30` + call-ledger support: `predict --called_log <csv>` (columns `NATIONAL_CODE, CALLED_AT`, appended by the API-calling process) flags customers with a fresh call as `RECENTLY_CALLED` (skipped by the queue).
+- (b) Mohammad will ask business whether near-certain severe predictions should be acted on directly (saving API calls for genuinely uncertain cases — a call buys no information when the decision wouldn't change). Implemented behind `CERTAINTY_ACT_THRESHOLD` (default `None` = off); when set, queue rows with `RISK_SCORE >= threshold` get `RULE_FLAG=PREDICTED_SEVERE`. Note: if enabled, evaluation's ranking block does NOT yet mirror this band — revisit then. Clarified: monotone masking does not push cat-2 customers toward cat-3; it computes the honest conditional P₃/(P₂+P₃).
+- (c) 2025-12 labels confirmed fresh (query executed recently, after 2026-06 closed).
+
+Still open: real cost numbers if the cost rule is ever promoted again.
 
 ## 13. What's Next (Prioritized)
 

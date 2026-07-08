@@ -125,6 +125,22 @@ RANKING_REF_WINDOWS = {          # label -> hours of continuous calling
 # samples than this floor fall back to the pooled calibrator.
 CALIBRATION_MIN_STRATUM_N = 5000
 
+# Enrichment data freshness: an API result stays usable for ~this many
+# days (business: "the oldest data we could consider would be a month
+# old"). Customers whose last call is fresher than the TTL are flagged
+# RECENTLY_CALLED and skipped by the queue — re-calling them buys nothing.
+# Feed predict the call ledger (CSV with NATIONAL_CODE, CALLED_AT columns,
+# appended by the API-calling process) via --called_log or API_CALL_LOG.
+API_DATA_TTL_DAYS = 30
+API_CALL_LOG      = None   # optional default path to the ledger CSV
+
+# Optional certainty band (PENDING business decision): when set (e.g.
+# 0.90), queue rows with RISK_SCORE >= threshold are flagged
+# PREDICTED_SEVERE — treated as certain enough to act on directly, saving
+# API calls for cases where enrichment could still change the decision.
+# None = disabled.
+CERTAINTY_ACT_THRESHOLD = None
+
 
 # ── Cache ────────────────────────────────────────────────
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)

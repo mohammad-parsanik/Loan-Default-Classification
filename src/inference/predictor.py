@@ -38,6 +38,47 @@ from src.inference.model_loader import ModelLoader
 logger = logging.getLogger(__name__)
 
 
+def apply_queue_flags(
+    results: pd.DataFrame,
+    multi_snapshot: bool,
+    called_log: Optional[pd.DataFrame] = None,
+) -> np.ndarray:
+    """
+    RULE_FLAG per row. Priority (first match wins):
+      ALREADY_SEVERE   — current_cat >= CARVE_CURRENT_CAT_GE: known risk, no API
+      SUPERSEDED       — an older snapshot row of a customer whose newer row
+                         carries the decision (only when several snapshots
+                         were scored and PRED_DEDUP_LATEST is on)
+      PREDICTED_SEVERE — RISK_SCORE >= CERTAINTY_ACT_THRESHOLD (when set):
+                         certain enough to act on directly, API adds nothing
+      RECENTLY_CALLED  — last API call fresher than API_DATA_TTL_DAYS:
+                         re-calling buys no new information yet
+      ""               — competes for API budget in the ranked queue
+    """
+    flags = np.full(len(results), "", dtype=object)
+
+    strata = results["CURRENT_CAT"].to_numpy()
+    flags[strata >= config.CARVE_CURRENT_CAT_GE] = "ALREADY_SEVERE"
+
+    if multi_snapshot and getattr(config, "PRED_DEDUP_LATEST", True):
+        latest = results.groupby("NATIONAL_CODE")["SNAPSHOT_DATE"].transform("max")
+        stale = (results["SNAPSHOT_DATE"] < latest).to_numpy()
+        flags[(flags == "") & stale] = "SUPERSEDED"
+
+    threshold = getattr(config, "CERTAINTY_ACT_THRESHOLD", None)
+    if threshold is not None:
+        certain = results["RISK_SCORE"].to_numpy() >= threshold
+        flags[(flags == "") & certain] = "PREDICTED_SEVERE"
+
+    if called_log is not None and len(called_log):
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=config.API_DATA_TTL_DAYS)
+        fresh_calls = called_log[pd.to_datetime(called_log["CALLED_AT"]) >= cutoff]
+        recently = results["NATIONAL_CODE"].isin(set(fresh_calls["NATIONAL_CODE"])).to_numpy()
+        flags[(flags == "") & recently] = "RECENTLY_CALLED"
+
+    return flags
+
+
 class Predictor:
     """Loads trained artifacts and scores a new snapshot."""
 
@@ -132,9 +173,29 @@ class Predictor:
         base_dir = artifact_path if artifact_path.is_dir() else artifact_path.parent
         return base_dir / "predictions" / f"predictions_{tag}.csv"
 
-    def predict(self, snapshot_date=None, output_path=None) -> pd.DataFrame:
+    @staticmethod
+    def _load_called_log(called_log_path=None) -> Optional[pd.DataFrame]:
+        """Load the API-call ledger CSV (NATIONAL_CODE, CALLED_AT) if any."""
+        path = called_log_path or getattr(config, "API_CALL_LOG", None)
+        if not path:
+            return None
+        path = Path(path)
+        if not path.exists():
+            logger.warning(f"Call ledger not found: {path} — RECENTLY_CALLED flags skipped.")
+            return None
+        log_df = pd.read_csv(path)
+        missing = {"NATIONAL_CODE", "CALLED_AT"} - set(log_df.columns)
+        if missing:
+            logger.warning(f"Call ledger {path} lacks columns {missing} — ignored.")
+            return None
+        logger.info(f"Loaded call ledger: {len(log_df):,} entries from {path}.")
+        return log_df
+
+    def predict(self, snapshot_date=None, output_path=None,
+                called_log_path=None) -> pd.DataFrame:
         requested = self._normalize_snapshot_arg(snapshot_date)
         resolved  = self.data_loader.resolve_pred_snapshots(requested)
+        called_log = self._load_called_log(called_log_path)
         logger.info(f"Starting inference for snapshot(s) {resolved}")
 
         if getattr(config, "RECALIBRATE_ON_PREDICT", False):
@@ -179,14 +240,9 @@ class Predictor:
         })
 
         # ── Rule flags: who does NOT compete for API budget ──────────────
-        flags = np.where(
-            strata >= config.CARVE_CURRENT_CAT_GE, "ALREADY_SEVERE", ""
-        ).astype(object)
-        if getattr(config, "PRED_DEDUP_LATEST", True) and len(resolved) > 1:
-            latest_per_cust = results.groupby("NATIONAL_CODE")["SNAPSHOT_DATE"].transform("max")
-            stale = (results["SNAPSHOT_DATE"] < latest_per_cust) & (flags == "")
-            flags[stale.to_numpy()] = "SUPERSEDED"
-        results["RULE_FLAG"] = flags
+        results["RULE_FLAG"] = apply_queue_flags(
+            results, multi_snapshot=len(resolved) > 1, called_log=called_log
+        )
 
         # Queue rows first (by risk), flagged rows after; rank only the queue
         results["_flagged"] = results["RULE_FLAG"] != ""
@@ -200,10 +256,10 @@ class Predictor:
         rank[:n_queue] = np.arange(1, n_queue + 1)
         results.insert(0, "RISK_RANK", rank)
 
+        flag_counts = results.loc[results["RULE_FLAG"] != "", "RULE_FLAG"].value_counts()
+        flag_str = " | ".join(f"{int(v):,} {k}" for k, v in flag_counts.items()) or "none flagged"
         logger.info(
-            f"Queue: {n_queue:,} ranked | "
-            f"{int((results['RULE_FLAG'] == 'ALREADY_SEVERE').sum()):,} already-severe (rule) | "
-            f"{int((results['RULE_FLAG'] == 'SUPERSEDED').sum()):,} superseded. "
+            f"Queue: {n_queue:,} ranked | {flag_str}. "
             f"At {config.API_RATE_PER_HOUR}/h the full queue takes "
             f"{n_queue / config.API_RATE_PER_HOUR:.0f}h to call."
         )

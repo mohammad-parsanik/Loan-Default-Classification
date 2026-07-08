@@ -761,9 +761,10 @@ def _to_json_safe(obj):
 
 # ── Predict pipeline ──────────────────────────────────────────────────────────
 
-def predict_pipeline(artifact_dir: str, snapshot_date=None, output_path: str = None):
+def predict_pipeline(artifact_dir: str, snapshot_date=None, output_path: str = None,
+                     called_log: str = None):
     predictor = Predictor(Path(artifact_dir))
-    predictor.predict(snapshot_date, output_path)
+    predictor.predict(snapshot_date, output_path, called_log_path=called_log)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -795,6 +796,13 @@ if __name__ == "__main__":
         "--output", type=str, default=None,
         help="Output CSV path. Omit to auto-name under <artifact_dir>/predictions/.",
     )
+    parser.add_argument(
+        "--called_log", type=str, default=None,
+        help="CSV ledger of past API calls (NATIONAL_CODE, CALLED_AT). "
+             "Customers called within API_DATA_TTL_DAYS are flagged "
+             "RECENTLY_CALLED and skipped by the queue. Defaults to "
+             "project_config.API_CALL_LOG.",
+    )
 
     args = parser.parse_args()
 
@@ -807,4 +815,5 @@ if __name__ == "__main__":
         if not args.artifact_dir:
             logger.error("predict requires --artifact_dir")
             sys.exit(1)
-        predict_pipeline(args.artifact_dir, args.snapshot_date, args.output)
+        predict_pipeline(args.artifact_dir, args.snapshot_date, args.output,
+                         called_log=args.called_log)

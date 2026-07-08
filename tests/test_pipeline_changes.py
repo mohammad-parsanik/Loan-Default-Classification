@@ -540,3 +540,55 @@ def test_severity_scores_is_last_class_probability():
 
     p = np.array([[0.1, 0.2, 0.3, 0.4], [0.7, 0.1, 0.1, 0.1]])
     assert np.allclose(severity_scores(p), [0.4, 0.1])
+
+
+# ── queue rule flags: certainty band + call-ledger freshness ────────────────────
+
+def _queue_df():
+    return pd.DataFrame({
+        "SNAPSHOT_DATE":  [20260601.0, 20260601.0, 20260601.0, 20260501.0, 20260601.0],
+        "NATIONAL_CODE":  ["already_sev", "certain", "called", "stale_dup", "stale_dup"],
+        "CURRENT_CAT":    [3, 1, 0, 0, 0],
+        "RISK_SCORE":     [0.99, 0.95, 0.50, 0.40, 0.40],
+    })
+
+
+def test_apply_queue_flags_priorities(monkeypatch):
+    from src.inference.predictor import apply_queue_flags
+
+    monkeypatch.setattr(config, "CERTAINTY_ACT_THRESHOLD", 0.9)
+    called_log = pd.DataFrame({
+        "NATIONAL_CODE": ["called"],
+        "CALLED_AT": [(date.today() - timedelta(days=5)).isoformat()],
+    })
+
+    flags = apply_queue_flags(_queue_df(), multi_snapshot=True, called_log=called_log)
+    assert flags.tolist() == [
+        "ALREADY_SEVERE",     # current_cat 3, even though score is highest
+        "PREDICTED_SEVERE",   # certain enough to act without API
+        "RECENTLY_CALLED",    # fresh enrichment already exists
+        "SUPERSEDED",         # older snapshot row of stale_dup
+        "",                   # the newest stale_dup row competes for budget
+    ]
+
+
+def test_apply_queue_flags_ttl_and_disabled_knob(monkeypatch):
+    from src.inference.predictor import apply_queue_flags
+
+    # Knob off (default): no PREDICTED_SEVERE even at score 0.95
+    monkeypatch.setattr(config, "CERTAINTY_ACT_THRESHOLD", None)
+    # Ledger entry older than the TTL: no RECENTLY_CALLED either
+    old_log = pd.DataFrame({
+        "NATIONAL_CODE": ["called"],
+        "CALLED_AT": [
+            (date.today() - timedelta(days=config.API_DATA_TTL_DAYS + 10)).isoformat()
+        ],
+    })
+
+    flags = apply_queue_flags(_queue_df(), multi_snapshot=True, called_log=old_log)
+    assert flags.tolist() == ["ALREADY_SEVERE", "", "", "SUPERSEDED", ""]
+
+    # Single snapshot: no SUPERSEDED possible
+    df = _queue_df().iloc[[0, 1, 2]]
+    flags2 = apply_queue_flags(df, multi_snapshot=False, called_log=None)
+    assert flags2.tolist() == ["ALREADY_SEVERE", "", ""]
