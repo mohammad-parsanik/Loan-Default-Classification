@@ -23,6 +23,7 @@ _TRACKED_METRICS = [
     "recall_class_0",
     "recall_class_1",
     "recall_class_2",
+    "recall_class_3",
     "brier_score",
     "avg_cost",
 ]
@@ -134,7 +135,7 @@ def log_fold_summary(aggregated: Dict) -> None:
     # Key metrics summary
     logger.info("  " + "-" * 52)
     logger.info("  Key metrics (mean ± std across folds):")
-    for metric in ["macro_f1", "qwk", "recall_class_2", "brier_score"]:
+    for metric in ["macro_f1", "qwk", "recall_class_2", "recall_class_3", "brier_score"]:
         ms = aggregated["model"].get(metric, {})
         if ms:
             logger.info(

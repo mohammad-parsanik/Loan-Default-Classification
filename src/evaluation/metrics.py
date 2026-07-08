@@ -48,21 +48,41 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None) -> dict:
     Single evaluation path shared by the baseline and the DeepSets+XGB model,
     so the two are compared under the SAME decision policy.
 
+    Pipeline: raw probs → calibrate (stratified if the calibrator supports
+    it) → monotone mask (label >= current_cat) → score.
+
     Top-level metrics: raw-prob argmax (backwards-compatible with earlier runs).
-    "cost_rule":       expected-cost decisions on calibrated probs — the
-                       deployed policy.
+    "ranking":         THE headline — recall/lift at API-budget reference
+                       windows on P(severe), carved population only.
+    "argmax_cal":      argmax on calibrated+masked probs (separates the
+                       effect of calibration from the cost rule).
+    "cost_rule":       expected-cost decisions on calibrated+masked probs.
     "by_current_cat":  cost-rule metrics per current-category slice.
-    Also returns the cost-rule predictions under "_cost_preds" for plots/CIs.
+    Also returns "_cost_preds"/"_probs_cal" for plots/CIs.
     """
-    from src.evaluation.decision import cost_decisions  # local: avoid cycles
+    from src.evaluation.calibration import StratifiedCalibrator
+    from src.evaluation.decision import cost_decisions, mask_monotone, severity_scores
+    from src.evaluation.ranking import ranking_metrics
 
     y_true = np.asarray(y_true)
-    probs_cal = calibrator.transform(probs) if calibrator is not None else probs
+
+    if calibrator is None:
+        probs_cal = np.asarray(probs, dtype=np.float64)
+    elif isinstance(calibrator, StratifiedCalibrator):
+        probs_cal = calibrator.transform(probs, strata)
+    else:
+        probs_cal = calibrator.transform(probs)
+
+    if strata is not None:
+        probs_cal = mask_monotone(probs_cal, strata)
+
     cost_preds = cost_decisions(probs_cal)
 
     out = compute_metrics(y_true, probs.argmax(axis=1), probs)
+    out["argmax_cal"] = compute_metrics(y_true, probs_cal.argmax(axis=1), probs_cal)
     out["cost_rule"] = compute_metrics(y_true, cost_preds, probs_cal)
     if strata is not None:
+        out["ranking"] = ranking_metrics(y_true, severity_scores(probs_cal), strata)
         out["by_current_cat"] = stratified_metrics(y_true, cost_preds, strata, probs_cal)
     out["_cost_preds"] = cost_preds
     out["_probs_cal"] = probs_cal
@@ -116,10 +136,12 @@ def bootstrap_confidence_intervals(y_true, y_pred, y_prob=None, n_iterations=100
         stats['macro_f1'].append(f1_score(y_t, y_p, average='macro'))
         stats['qwk'].append(cohen_kappa_score(y_t, y_p, weights='quadratic'))
 
-        recalls = recall_score(y_t, y_p, average=None, zero_division=0)
-        # Handle edge case where a class is not present in the bootstrap sample
-        stats['recall_class_2'].append(recalls[2] if len(recalls) > 2 else 0.0)
-        stats['recall_class_3'].append(recalls[3] if len(recalls) > 3 else 0.0)
+        # Explicit labels: keeps indices aligned when a class is absent
+        # from the bootstrap sample
+        recalls = recall_score(y_t, y_p, average=None,
+                               labels=list(range(config.NUM_CLASSES)), zero_division=0)
+        stats['recall_class_2'].append(recalls[2])
+        stats['recall_class_3'].append(recalls[3])
             
     # Calculate confidence intervals
     ci = {}

@@ -97,6 +97,34 @@ RECALIBRATE_ON_PREDICT = True
 # dropped (with a warning) and falls back the same way as an unset value.
 PRED_SNAPSHOT_DATES = None
 
+# When multiple snapshots are scored in one predict call, keep only each
+# customer's NEWEST row in the ranked queue. The enrichment API returns
+# present-time information only (cannot query the past), so acting on a
+# stale score wastes budget; the older rows are still written to the CSV
+# flagged as superseded.
+PRED_DEDUP_LATEST = True
+
+# ── Deliverable: ranked API queue ────────────────────────
+# The business objective is to find customers NOT yet in the severe class
+# (NUM_CLASSES-1) with the highest probability of entering it within the
+# label horizon. Customers already severe are rule-flagged, never ranked.
+CARVE_CURRENT_CAT_GE = NUM_CLASSES - 1   # current_cat >= this ⇒ rule, not model queue
+
+# Enrichment API budget is a RATE, so "top-K" is really "hours of calling".
+# Ranking metrics are reported at K = API_RATE_PER_HOUR * window_hours.
+API_RATE_PER_HOUR   = 240
+RANKING_REF_WINDOWS = {          # label -> hours of continuous calling
+    "1_day":   24,
+    "1_week":  168,
+    "1_month": 720,
+}
+
+# Per-current-cat calibration: P(severe) is a rare event for cat-0 but a
+# common one for cat-2 — pooled isotonic miscalibrates the strata against
+# each other, and the ranked queue mixes strata. Strata with fewer val
+# samples than this floor fall back to the pooled calibrator.
+CALIBRATION_MIN_STRATUM_N = 5000
+
 
 # ── Cache ────────────────────────────────────────────────
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)

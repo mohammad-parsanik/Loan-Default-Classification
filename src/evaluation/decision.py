@@ -26,12 +26,41 @@ def cost_decisions(probs: np.ndarray) -> np.ndarray:
 
 def risk_scores(probs: np.ndarray) -> np.ndarray:
     """
-    Ranking score for the top-K API budget: the expected cost of *doing
-    nothing* (predicting class 0) for each customer.  With the current
-    matrix this is 1.5*P(cat1) + 4.0*P(cat2) — the principled replacement
-    for the ad-hoc 2*P2 + P1.
+    Expected cost of *doing nothing* (predicting class 0) for each customer.
+    Kept as a secondary/diagnostic score — the ranked API queue uses
+    severity_scores() instead, because the cost matrix values are guessed
+    while P(severe) uses only the observed label.
     """
     return expected_costs(probs)[:, 0]
+
+
+def severity_scores(probs: np.ndarray) -> np.ndarray:
+    """
+    THE ranking score for the API queue: calibrated P(entering the severe
+    class within the horizon). Cost-matrix-free by design.
+    """
+    return np.asarray(probs)[:, config.NUM_CLASSES - 1]
+
+
+def mask_monotone(probs: np.ndarray, current_cat: np.ndarray) -> np.ndarray:
+    """
+    Enforce the label's monotonicity: WORST_FUTURE_CAT includes the current
+    month, so label >= current_cat always — P(label < current_cat) is
+    logically impossible. Zero that mass and renormalise rows. Sharpens
+    P(severe) for already-delinquent customers and guarantees coherent output.
+    """
+    probs = np.asarray(probs, dtype=np.float64).copy()
+    current_cat = np.asarray(current_cat)
+    class_idx = np.arange(probs.shape[1])
+    probs[class_idx[None, :] < current_cat[:, None]] = 0.0
+    # Degenerate guard: if everything was masked away (can't happen with
+    # capped current_cat, but cheap), fall back to the top allowed class.
+    row_sums = probs.sum(axis=1, keepdims=True)
+    dead = row_sums[:, 0] == 0.0
+    if dead.any():
+        probs[dead, -1] = 1.0
+        row_sums = probs.sum(axis=1, keepdims=True)
+    return probs / row_sums
 
 
 if __name__ == "__main__":
@@ -40,4 +69,12 @@ if __name__ == "__main__":
     assert p.argmax(axis=1).tolist() == [0, 0]
     assert cost_decisions(p).tolist() == [2, 0]
     assert np.isclose(risk_scores(p)[0], 0.20 * 1.5 + 0.30 * 4.0 + 0.05 * 7.5)
+    assert np.allclose(severity_scores(p), [0.05, 0.01])
+
+    # Masking: a cat-2 customer cannot end below 2.
+    m = mask_monotone(p, np.array([2, 0]))
+    assert m[0, 0] == 0.0 and m[0, 1] == 0.0
+    assert np.isclose(m[0, 2], 0.30 / 0.35) and np.isclose(m[0, 3], 0.05 / 0.35)
+    assert np.allclose(m[1], p[1])          # cat-0 row untouched
+    assert np.allclose(m.sum(axis=1), 1.0)
     print("decision.py self-check OK")

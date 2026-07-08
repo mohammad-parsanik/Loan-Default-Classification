@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A bank early-warning system that predicts the **worst delinquency class of a customer's loan portfolio over the next 6 months** (4 classes: 0 = No Delay, 1 = Current/Minor Delay, 2 = Past Due+, 3 = Severe Past Due). Records are monthly point-in-time snapshots of an upstream ETL table (~64 numeric per-loan features, no categoricals). Prediction is at customer level (`NATIONAL_CODE`), cost-sensitive (missing a Cat-2 costs 4× a false alarm; the class-3 costs are a derived placeholder pending business tuning, see `project_config.COST_MATRIX`).
+A bank early-warning system that predicts the **worst delinquency class of a customer's loan portfolio over the next 6 months** (4 classes: 0 = No Delay, 1 = Current/Minor Delay, 2 = Past Due+, 3 = Severe Past Due). Records are monthly point-in-time snapshots of an upstream ETL table (~64 numeric per-loan features, no categoricals). Prediction is at customer level (`NATIONAL_CODE`).
+
+**The deliverable is a ranked API queue** (July 2026 reframe): customers not yet severe (`current_cat < 3`), ranked by calibrated+masked P(entering class 3), consumed by an enrichment API at 240 requests/hour (`API_RATE_PER_HOUR`). Already-severe customers are rule-flagged, never ranked. **Headline metric: `ranking` block (recall/lift at K-hours, PR-AUC) from `full_evaluation`**, cost-matrix-free by design — the `COST_MATRIX` values are guessed (business gave the 4× anchor only; the class-3 row is extrapolated), so cost is a secondary diagnostic, never the target. The enrichment API returns present-time data only (cannot backtest past calls), so API value is only assessable forward.
+
+**Key label property:** `WORST_FUTURE_CAT` includes the current month ⇒ `label >= current_cat` always (a loan can't improve past its current category). Not leakage — a definition. Exploited via `decision.mask_monotone` (zero impossible probability mass) and per-current-cat calibration (`StratifiedCalibrator`). It also makes already-delinquent slices mechanically easy — judge models on the `current_cat_0` slice and the ranking block, never aggregate F1.
 
 **Read `AGENT_HANDOFF.md` first** — it is the authoritative record of decisions, run results, and the leakage analysis. `column_changes.md` is the feature dictionary; `leakage_analysis.md` explains the temporal-split constraints.
 
@@ -19,7 +23,8 @@ A bank early-warning system that predicts the **worst delinquency class of a cus
 ## Commands (run on the training server)
 
 ```bash
-python run.py train                          # full pipeline
+python run.py train                          # evaluation run (holds out newest mature snapshot as test)
+python run.py train --final                  # deployment fit: ALL mature snapshots, no test, emits bundle
 python run.py train --resume <run_dir>       # resume; completed stages are skipped
 python run.py predict --artifact_dir <dir> [--snapshot_date <YYYYMMDD> ...] [--output <csv>]
 # snapshot_date defaults to PRED_SNAPSHOT_DATES, else every currently-immature snapshot
@@ -41,8 +46,10 @@ Load (NPZ cache) → temporal split (or walk-forward folds) → per fold: prepro
 
 Key behavioral toggles in `project_config.py`:
 - `OPTIMIZE_ON_VALIDATION` + `VAL_SPLIT_MODE` — current default is `True` + `"customer"`: an in-time, customer-disjoint 20% holdout (stable md5 of `NATIONAL_CODE`) drives early stopping + Optuna without touching the test label window, and is then reused to fit the probability calibrator (final XGB trains on the 80% only). `VAL_SPLIT_MODE="temporal"` is the legacy leaky mode (val/test label windows overlap 5 months — Run 2). `OPTIMIZE_ON_VALIDATION=False` = no val set, `FIXED_EPOCHS` + fixed XGB params (Run 3 mode).
-- `COST_MATRIX` — single source of truth for costs (DeepSets loss, expected-cost decision rule in `src/evaluation/decision.py`, `avg_cost` metric). Decisions and the top-K ranking use `argmin(probs @ COST_MATRIX)` on calibrated probs, never plain argmax.
-- `WALK_FORWARD_ENABLED` — currently `False`; walk-forward finds 0 valid folds because two 6-month gaps don't fit in the 13-month data span.
+- `COST_MATRIX` — single source of truth for costs (DeepSets loss, expected-cost `PREDICTED_CLASS` in `src/evaluation/decision.py`, `avg_cost` metric). Class decisions use `argmin(probs @ COST_MATRIX)`; the queue RANKING does not use costs (see above).
+- `CARVE_CURRENT_CAT_GE` / `API_RATE_PER_HOUR` / `RANKING_REF_WINDOWS` — define the ranked-queue population and the K values (K = rate × window hours) reported by `src/evaluation/ranking.py`.
+- `CALIBRATION_MIN_STRATUM_N` — per-current-cat calibration floor; smaller strata fall back to the pooled calibrator.
+- `WALK_FORWARD_ENABLED` — currently `False`. With 18 mature snapshots (2024-07…2025-12) walk-forward IS now feasible; deliberately deferred — decide after the next evaluation run whether temporal-stability evidence is worth ~1.5-2h/fold.
 - `PRED_SNAPSHOT_DATES` — snapshot(s) `predict` scores (int or list[int], overridden by `--snapshot_date`). `None` (default) auto-selects every currently-immature snapshot in `TRAIN_TABLE`; a requested date absent from the table is dropped (warn) and falls back the same way. There is no separate prediction table — `TRAIN_TABLE` holds both matured and not-yet-matured snapshots, and `Predictor` strips `WORST_FUTURE_CAT`/`WORST_FUTURE_DPD` before scoring since those columns hold a degenerate (not real) value on immature rows.
 
 Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickle. `--resume` skips completed stages. **Careful:** resuming after a config change silently reuses artifacts produced under the old config. Run dirs from before July 2026 (DATA_VERSION v1.0) are not resumable — instance dicts lack `current_cat`.
@@ -56,7 +63,8 @@ Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickl
 - Labels: features keep 5-category granularity; the target is capped at `config.NUM_CLASSES` classes (`min(max(cat), NUM_CLASSES - 1)`, currently 4: raw cats 0/1/2 pass through 1:1, raw cats 3-4 collapse into class 3). For already-delinquent customers the label is largely mechanical DPD accrual — judge models on the `current_cat_0` slice (`by_current_cat` metrics), not aggregate F1.
 - `run.py train` now also writes `<fold_dir>/model_bundle.pkl` — a single-file deployment artifact (fitted scaler + DeepSets state_dict/hparams + XGBoost raw bytes + calibrator) that `ModelLoader`/`Predictor` can load directly by pointing `--artifact_dir` at the `.pkl` file instead of the fold directory. It's a pure export convenience; the existing per-file directory artifacts are unchanged and still used in-pipeline.
 - `explore_output/iv_report.csv` is **stale**: the old IV binning forced IV=0.0 for ~10 skewed/binary features (they are NOT constant — DB-verified). Re-run `explore_iv_woe.py` after the v1.1 cache rebuild.
-- The inference deliverable is a **ranked top-K list** (external API budget limits how many customers can be enriched), not just class predictions. `Predictor` ranks by `RISK_SCORE` = expected cost of predicting class 0 (`probs @ COST_MATRIX[:,0]`) on calibrated probabilities.
+- `Predictor` output: `RISK_RANK` (queue position, NaN for flagged rows), `RISK_SCORE` = calibrated+masked P(severe), `RULE_FLAG` ∈ {"", ALREADY_SEVERE, SUPERSEDED}, `EXPECTED_COST` (secondary). When several snapshots are scored, `PRED_DEDUP_LATEST` keeps only each customer's newest row in the queue (stale scores waste API budget — the API can't be queried "as of" the past).
+- The evaluation run also trains a **binary severe-event comparator** (`BinarySevereBaseline`, same 257 aggregated features, `binary:logistic`) — its `binary_ranking` block vs the multiclass `ranking` block answers whether the multiclass pipeline costs ranking quality, and informs the deferred per-current-cat-models idea.
 
 ## Code style
 

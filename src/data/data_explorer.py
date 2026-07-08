@@ -194,7 +194,7 @@ def explore_data(sample_size=1000):
             plt.figure(figsize=(10, 5))
             capped_target.value_counts().sort_index().plot(kind='bar')
             plt.title(f'Capped Target Class Distribution (snapshot {label_snap})')
-            plt.xlabel('Class (0=No Delay, 1=Current, 2=Past Due+)')
+            plt.xlabel('Class (0=No Delay, 1=Current, 2=Past Due+, 3=Severe Past Due)')
             plt.ylabel('Count')
             plt.savefig(config.ARTIFACT_DIR / "class_distribution.png")
             plt.close()

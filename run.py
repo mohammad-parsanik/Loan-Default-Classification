@@ -4,6 +4,7 @@ Entry point for the Loan Default Classification pipeline.
 Usage:
     python run.py explore                          # profile data (one-shot)
     python run.py train                            # full training run
+    python run.py train --final                    # deployment fit: all mature snapshots, no test
     python run.py train --resume <run_dir>         # resume a crashed run
     python run.py predict --artifact_dir <dir> \\
                           [--snapshot_date <int> [<int> ...]] \\
@@ -45,21 +46,26 @@ from src.data.dataset import create_dataloaders
 from src.data.preprocessing import create_preprocessing_pipeline
 from src.data.temporal_split import (
     split_by_time,
+    split_for_final_fit,
     generate_walk_forward_folds,
     build_fold_instances,
 )
-from src.baselines.aggregated_xgboost import AggregatedXGBoostBaseline
+from src.baselines.aggregated_xgboost import (
+    AggregatedXGBoostBaseline,
+    BinarySevereBaseline,
+)
 from src.evaluation.fold_aggregator import (
     aggregate_fold_metrics,
     log_fold_summary,
     save_fold_summary,
 )
-from src.evaluation.calibration import PerClassIsotonicCalibrator
+from src.evaluation.calibration import StratifiedCalibrator
 from src.evaluation.metrics import (
     bootstrap_confidence_intervals,
     compute_metrics,
     full_evaluation,
 )
+from src.evaluation.ranking import ranking_metrics
 from src.evaluation.visualization import (
     plot_confusion_matrix,
     plot_embeddings_umap,
@@ -200,9 +206,10 @@ def train_single_fold(
         "features": features,
     }))
 
-    # Current-category strata for slice-level evaluation (order matches
-    # test_dl: shuffle=False preserves instance order)
+    # Current-category strata for slice-level evaluation and stratified
+    # calibration (order matches the dataloaders: shuffle=False for val/test)
     test_strata = np.array([i["current_cat"] for i in test_inst])
+    val_strata  = np.array([i["current_cat"] for i in val_inst])
 
     # ── Stage: Preprocessing ──────────────────────────────────────────────────
     stage_key = f"fold{fold_id:02d}_preprocessing"
@@ -234,6 +241,9 @@ def train_single_fold(
     if ckpt.is_done("baseline"):
         logger.info(f"[skip] {fold_label} baseline already complete.")
         baseline_metrics = ckpt.load("baseline")
+    elif not test_inst:
+        logger.info(f"[skip] {fold_label} baseline skipped (final fit — no test set to compare on).")
+        baseline_metrics = {}
     else:
         with timed(f"{fold_label}: Aggregated XGBoost baseline", timing):
             baseline = AggregatedXGBoostBaseline()
@@ -244,7 +254,9 @@ def train_single_fold(
             bl_calibrator = None
             if val_inst:
                 val_probs, y_val_bl = baseline.predict_proba(val_inst)
-                bl_calibrator = PerClassIsotonicCalibrator().fit(val_probs, y_val_bl)
+                bl_calibrator = StratifiedCalibrator(
+                    min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
+                ).fit(val_probs, y_val_bl, val_strata)
                 joblib.dump(bl_calibrator, fold_dir / "baseline_calibrator.pkl")
 
             test_probs, y_test_bl = baseline.predict_proba(test_inst)
@@ -253,21 +265,31 @@ def train_single_fold(
             )
             baseline_metrics.pop("_cost_preds", None)
             baseline_metrics.pop("_probs_cal", None)
+
+            # Binary severe-event comparator: same features, direct binary
+            # target — does the multiclass detour cost ranking quality?
+            comparator = BinarySevereBaseline()
+            comparator.train(train_inst)
+            comp_scores, comp_y = comparator.severity_scores(test_inst)
+            baseline_metrics["binary_ranking"] = ranking_metrics(
+                comp_y, comp_scores, strata=test_strata
+            )
         ckpt.save("baseline", baseline_metrics)
         ckpt.mark_done("baseline", {"macro_f1": baseline_metrics["macro_f1"]})
 
-    logger.info(
-        f"{fold_label} | Baseline → Macro F1: {baseline_metrics['macro_f1']:.4f}, "
-        f"QWK: {baseline_metrics['qwk']:.4f}"
-    )
-    if "cost_rule" in baseline_metrics:
+    if baseline_metrics:
         logger.info(
-            f"{fold_label} | Baseline (cost rule) → "
-            f"Macro F1: {baseline_metrics['cost_rule']['macro_f1']:.4f}, "
-            f"Cat-2 Recall: {baseline_metrics['cost_rule']['recall_class_2']:.4f}, "
-            f"Cat-3 Recall: {baseline_metrics['cost_rule']['recall_class_3']:.4f}, "
-            f"Avg Cost: {baseline_metrics['cost_rule']['avg_cost']:.4f}"
+            f"{fold_label} | Baseline → Macro F1: {baseline_metrics['macro_f1']:.4f}, "
+            f"QWK: {baseline_metrics['qwk']:.4f}"
         )
+        if "cost_rule" in baseline_metrics:
+            logger.info(
+                f"{fold_label} | Baseline (cost rule) → "
+                f"Macro F1: {baseline_metrics['cost_rule']['macro_f1']:.4f}, "
+                f"Cat-2 Recall: {baseline_metrics['cost_rule']['recall_class_2']:.4f}, "
+                f"Cat-3 Recall: {baseline_metrics['cost_rule']['recall_class_3']:.4f}, "
+                f"Avg Cost: {baseline_metrics['cost_rule']['avg_cost']:.4f}"
+            )
 
     # ── Stage: DataLoaders ────────────────────────────────────────────────────
     with timed(f"{fold_label}: Build DataLoaders", timing):
@@ -369,38 +391,47 @@ def train_single_fold(
     else:
         with timed(f"{fold_label}: Final evaluation", timing):
             # Fit the probability calibrator on the (customer-disjoint) val
-            # set — data the final XGBoost never trained on.
+            # set — data the final XGBoost never trained on. Runs even
+            # without a test set: the calibrator ships with the deployment
+            # bundle, so a --final fit needs it too.
             calibrator = None
             if val_inst:
                 _, _, y_val_m, val_probs_m = meta_learner.evaluate(val_dl)
-                calibrator = PerClassIsotonicCalibrator().fit(val_probs_m, y_val_m)
+                calibrator = StratifiedCalibrator(
+                    min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
+                ).fit(val_probs_m, y_val_m, val_strata)
                 joblib.dump(calibrator, fold_dir / "calibrator.pkl")
-                logger.info(f"{fold_label} | Calibrator fitted on val and saved.")
+                logger.info(f"{fold_label} | Stratified calibrator fitted on val and saved.")
 
-            _, X_test_emb, y_test, y_prob = meta_learner.evaluate(test_dl)
-            final_metrics = full_evaluation(
-                y_test, y_prob, strata=test_strata, calibrator=calibrator
-            )
-            # Deployed policy = expected-cost decisions on calibrated probs;
-            # plots and CIs reflect it.
-            y_pred     = final_metrics.pop("_cost_preds")
-            y_prob_cal = final_metrics.pop("_probs_cal")
+            if test_inst:
+                _, X_test_emb, y_test, y_prob = meta_learner.evaluate(test_dl)
+                final_metrics = full_evaluation(
+                    y_test, y_prob, strata=test_strata, calibrator=calibrator
+                )
+                # Deployed policy = expected-cost decisions on calibrated probs;
+                # plots and CIs reflect it.
+                y_pred     = final_metrics.pop("_cost_preds")
+                y_prob_cal = final_metrics.pop("_probs_cal")
 
-            ci = bootstrap_confidence_intervals(y_test, y_pred, y_prob_cal, n_iterations=500)
-            final_metrics["bootstrap_ci"] = ci
+                ci = bootstrap_confidence_intervals(y_test, y_pred, y_prob_cal, n_iterations=500)
+                final_metrics["bootstrap_ci"] = ci
+                logger.info(f"{fold_label} | Test Metrics: {final_metrics}")
+            else:
+                final_metrics = {}
+                logger.info(f"{fold_label} | Final fit — no test set, evaluation skipped.")
 
-        logger.info(f"{fold_label} | Test Metrics: {final_metrics}")
         ckpt.save("evaluation", final_metrics)
         ckpt.mark_done("evaluation")
 
-        # Export test embeddings for downstream SHAP analysis
-        np.save(fold_dir / "test_embeddings.npy", X_test_emb)
-        np.save(fold_dir / "test_labels.npy", y_test)
+        if test_inst:
+            # Export test embeddings for downstream SHAP analysis
+            np.save(fold_dir / "test_embeddings.npy", X_test_emb)
+            np.save(fold_dir / "test_labels.npy", y_test)
 
-        with timed(f"{fold_label}: Plots", timing):
-            plot_confusion_matrix(y_test, y_pred,    save_path=plots_dir / "confusion_matrix.png")
-            plot_roc_curves(y_test, y_prob,          save_path=plots_dir / "roc_curves.png")
-            plot_embeddings_umap(X_test_emb, y_test, save_path=plots_dir / "embedding_umap.png")
+            with timed(f"{fold_label}: Plots", timing):
+                plot_confusion_matrix(y_test, y_pred,    save_path=plots_dir / "confusion_matrix.png")
+                plot_roc_curves(y_test, y_prob,          save_path=plots_dir / "roc_curves.png")
+                plot_embeddings_umap(X_test_emb, y_test, save_path=plots_dir / "embedding_umap.png")
 
     # ── Single-file deployment bundle ─────────────────────────────────────────
     # Pure export convenience: packs the same trained artifacts already on
@@ -436,12 +467,15 @@ def train_single_fold(
     joblib.dump(bundle, fold_dir / "model_bundle.pkl")
     logger.info(f"{fold_label} | Deployment bundle saved to {fold_dir / 'model_bundle.pkl'}")
 
-    logger.info(
-        f"{fold_label} DONE | "
-        f"Baseline Macro F1: {baseline_metrics['macro_f1']:.4f}  "
-        f"Model Macro F1: {final_metrics['macro_f1']:.4f}  "
-        f"Delta: {final_metrics['macro_f1'] - baseline_metrics['macro_f1']:+.4f}"
-    )
+    if final_metrics and baseline_metrics:
+        logger.info(
+            f"{fold_label} DONE | "
+            f"Baseline Macro F1: {baseline_metrics['macro_f1']:.4f}  "
+            f"Model Macro F1: {final_metrics['macro_f1']:.4f}  "
+            f"Delta: {final_metrics['macro_f1'] - baseline_metrics['macro_f1']:+.4f}"
+        )
+    else:
+        logger.info(f"{fold_label} FINAL FIT DONE — deployment bundle ready.")
 
     return {
         "baseline_metrics": baseline_metrics,
@@ -452,9 +486,13 @@ def train_single_fold(
 
 # ── Training pipeline ─────────────────────────────────────────────────────────
 
-def train_pipeline(resume_dir: Path = None):
+def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
     logger.info("=" * 60)
-    logger.info("  Loan Default Classification — Training Pipeline")
+    if final_fit:
+        logger.info("  Loan Default Classification — FINAL DEPLOYMENT FIT")
+        logger.info("  (all mature snapshots, no test hold-out)")
+    else:
+        logger.info("  Loan Default Classification — Training Pipeline")
     logger.info("=" * 60)
 
     # ── Global setup ──────────────────────────────────────────────────────────
@@ -473,7 +511,7 @@ def train_pipeline(resume_dir: Path = None):
         logger.info(f"Resuming from {run_dir}")
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = config.ARTIFACT_DIR / ts
+        run_dir = config.ARTIFACT_DIR / (f"{ts}_final" if final_fit else ts)
         run_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Run directory: {run_dir}")
 
@@ -500,7 +538,13 @@ def train_pipeline(resume_dir: Path = None):
     # ── Stage 2: Split (single) or generate folds (walk-forward) ─────────────
     fold_results: list = []
 
-    if config.WALK_FORWARD_ENABLED:
+    if final_fit:
+        _run_single_split(
+            instances, features, run_dir, device, timing, ckpt, pipeline_log,
+            fold_results, final_fit=True,
+        )
+        aggregated = {}
+    elif config.WALK_FORWARD_ENABLED:
         # Walk-forward: generate all valid folds from usable snapshots
         if ckpt.is_done("folds_complete"):
             logger.info("[skip] All walk-forward folds already complete.")
@@ -601,19 +645,22 @@ def train_pipeline(resume_dir: Path = None):
     logger.info("=" * 60)
 
 
-def _run_single_split(instances, features, run_dir, device, timing, ckpt, pipeline_log, fold_results):
+def _run_single_split(instances, features, run_dir, device, timing, ckpt,
+                      pipeline_log, fold_results, final_fit: bool = False):
     """Helper: run the original single-split flow and append the result to fold_results."""
     if ckpt.is_done("split"):
         logger.info("[skip] Stage 'split' already complete.")
         train_inst, val_inst, test_inst = ckpt.load("split")
     else:
         with timed("Stage 2: Temporal split", timing):
-            train_inst, val_inst, test_inst = split_by_time(instances)
+            split_fn = split_for_final_fit if final_fit else split_by_time
+            train_inst, val_inst, test_inst = split_fn(instances)
         ckpt.save("split", (train_inst, val_inst, test_inst))
         ckpt.mark_done("split", {
             "n_train": len(train_inst),
             "n_val":   len(val_inst),
             "n_test":  len(test_inst),
+            "final_fit": final_fit,
         })
 
     fold_dir = run_dir / "fold_01"
@@ -640,6 +687,8 @@ def _run_single_split(instances, features, run_dir, device, timing, ckpt, pipeli
     # Log summary for single split
     bm = result["baseline_metrics"]
     fm = result["final_metrics"]
+    if not fm:
+        return   # final fit — nothing to compare
     logger.info(f"  Baseline  Macro F1: {bm['macro_f1']:.4f}")
     logger.info(f"  DeepSets+XGB Macro F1: {fm['macro_f1']:.4f}")
     logger.info(f"  Cat-2 Recall: {fm.get('recall_class_2', float('nan')):.4f}")
@@ -647,8 +696,32 @@ def _run_single_split(instances, features, run_dir, device, timing, ckpt, pipeli
     _log_policy_comparison(bm, fm)
 
 
+def _log_ranking_line(name: str, rk: dict):
+    """One log line summarising a ranking-metrics dict."""
+    if not rk or "pr_auc" not in rk:
+        return
+    parts = []
+    for w in config.RANKING_REF_WINDOWS:
+        block = rk.get(f"at_{w}")
+        if block:
+            parts.append(f"{w}: R={block['recall']:.3f} lift={block['lift']:.1f}x")
+    logger.info(
+        f"  {name:24s} | base_rate={rk['base_rate']:.4f}  "
+        f"PR-AUC={rk['pr_auc']:.4f}  " + "  ".join(parts)
+    )
+
+
 def _log_policy_comparison(bm: dict, fm: dict):
     """Same-decision-policy comparison + per-current-category slices."""
+    # ── THE headline: ranked API queue quality (P(severe), carved pop.) ──
+    if "ranking" in fm:
+        logger.info("  ── Ranking (API queue): recall of future-severe in top K-hours ──")
+        _log_ranking_line("Baseline (multiclass P3)", bm.get("ranking"))
+        _log_ranking_line("Binary comparator", bm.get("binary_ranking"))
+        _log_ranking_line("DeepSets+XGB (P3)", fm.get("ranking"))
+        for slice_name, sub in fm["ranking"].get("by_current_cat", {}).items():
+            _log_ranking_line(f"DeepSets+XGB [{slice_name}]", sub)
+
     if "cost_rule" in bm and "cost_rule" in fm:
         b, f = bm["cost_rule"], fm["cost_rule"]
         logger.info("  ── Cost-rule (deployed policy) comparison ──")
@@ -705,6 +778,12 @@ if __name__ == "__main__":
         "--resume", type=str, default=None,
         help="Path to a previous run directory to resume from.",
     )
+    parser.add_argument(
+        "--final", action="store_true",
+        help="Deployment fit: train on ALL mature snapshots (no test "
+             "hold-out), emit the model bundle. Use after evaluation runs "
+             "have graded the recipe.",
+    )
     parser.add_argument("--artifact_dir",  type=str)
     parser.add_argument(
         "--snapshot_date", type=int, nargs="*", default=None,
@@ -723,7 +802,7 @@ if __name__ == "__main__":
         explore_data()
     elif args.action == "train":
         resume = Path(args.resume) if args.resume else None
-        train_pipeline(resume_dir=resume)
+        train_pipeline(resume_dir=resume, final_fit=args.final)
     elif args.action == "predict":
         if not args.artifact_dir:
             logger.error("predict requires --artifact_dir")

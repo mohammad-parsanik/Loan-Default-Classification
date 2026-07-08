@@ -1,11 +1,17 @@
 """
 End-to-end scoring pipeline using the trained DeepSets + XGBoost pipeline.
 
-Decisions and ranking follow the expected-cost rule on calibrated
-probabilities (see src/evaluation/decision.py).  With
-config.RECALIBRATE_ON_PREDICT = True, the calibrator is refreshed at scoring
-time on the newest snapshot whose labels have matured, so probability
-thresholds in the downstream rule system track base-rate drift.
+Output is the ranked API queue: customers not yet severe, ordered by
+calibrated+masked P(entering the severe class), consumed at
+config.API_RATE_PER_HOUR. Already-severe customers are rule-flagged
+(ALREADY_SEVERE) and never compete for API budget; when several snapshots
+are scored, only each customer's newest row enters the queue (older rows
+flagged SUPERSEDED — the enrichment API returns present-time data only, so
+acting on a stale score wastes budget).
+
+With config.RECALIBRATE_ON_PREDICT = True, the calibrator is refreshed at
+scoring time on the newest snapshot whose labels have matured, so
+probability thresholds in the downstream rule system track base-rate drift.
 """
 
 import logging
@@ -20,8 +26,13 @@ from tqdm import tqdm
 import project_config as config
 from src.data.data_loader import DataLoader
 from src.data.temporal_split import _get_usable_snapshots
-from src.evaluation.calibration import PerClassIsotonicCalibrator
-from src.evaluation.decision import cost_decisions, risk_scores
+from src.evaluation.calibration import StratifiedCalibrator
+from src.evaluation.decision import (
+    cost_decisions,
+    mask_monotone,
+    risk_scores,
+    severity_scores,
+)
 from src.inference.model_loader import ModelLoader
 
 logger = logging.getLogger(__name__)
@@ -94,9 +105,12 @@ class Predictor:
 
         logger.info(f"Refreshing calibrator on snapshot {latest} "
                     f"({len(subset):,} instances)…")
-        probs = self._predict_probs(subset)
-        y     = np.array([i["label"] for i in subset])
-        self.calibrator = PerClassIsotonicCalibrator().fit(probs, y)
+        probs  = self._predict_probs(subset)
+        y      = np.array([i["label"] for i in subset])
+        strata = np.array([i["current_cat"] for i in subset])
+        self.calibrator = StratifiedCalibrator(
+            min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
+        ).fit(probs, y, strata)
         logger.info("Calibrator refreshed.")
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -135,26 +149,64 @@ class Predictor:
             logger.warning("No data found to predict.")
             return pd.DataFrame()
 
+        strata    = np.array([i["current_cat"] for i in instances])
         probs_raw = self._predict_probs(instances)
-        probs = (self.calibrator.transform(probs_raw)
-                 if self.calibrator is not None else probs_raw)
+
+        if isinstance(self.calibrator, StratifiedCalibrator):
+            probs = self.calibrator.transform(probs_raw, strata)
+        elif self.calibrator is not None:
+            probs = self.calibrator.transform(probs_raw)
+        else:
+            probs = probs_raw
+        # label >= current_cat always — zero the impossible mass
+        probs = mask_monotone(probs, strata)
 
         results = pd.DataFrame({
             "SNAPSHOT_DATE":        [i["snapshot_date"]  for i in instances],
             "NATIONAL_CODE":        [i["national_code"]  for i in instances],
             "N_LOANS_IN_PORTFOLIO": [i["n_loans"]        for i in instances],
-            "CURRENT_CAT":          [i["current_cat"]    for i in instances],
+            "CURRENT_CAT":          strata,
             "P_NO_DELAY":           probs[:, 0],
             "P_CURRENT":            probs[:, 1],
             "P_PAST_DUE":           probs[:, 2],
             "P_SEVERE_PAST_DUE":    probs[:, 3],
             # Minimum-expected-cost class under the business cost matrix
             "PREDICTED_CLASS":      cost_decisions(probs),
-            # Expected cost of taking no action — the top-K ranking score
-            "RISK_SCORE":           risk_scores(probs),
+            # THE queue ranking score: calibrated P(entering severe)
+            "RISK_SCORE":           severity_scores(probs),
+            # Secondary/diagnostic: expected cost of taking no action
+            "EXPECTED_COST":        risk_scores(probs),
         })
 
-        results = results.sort_values("RISK_SCORE", ascending=False).reset_index(drop=True)
+        # ── Rule flags: who does NOT compete for API budget ──────────────
+        flags = np.where(
+            strata >= config.CARVE_CURRENT_CAT_GE, "ALREADY_SEVERE", ""
+        ).astype(object)
+        if getattr(config, "PRED_DEDUP_LATEST", True) and len(resolved) > 1:
+            latest_per_cust = results.groupby("NATIONAL_CODE")["SNAPSHOT_DATE"].transform("max")
+            stale = (results["SNAPSHOT_DATE"] < latest_per_cust) & (flags == "")
+            flags[stale.to_numpy()] = "SUPERSEDED"
+        results["RULE_FLAG"] = flags
+
+        # Queue rows first (by risk), flagged rows after; rank only the queue
+        results["_flagged"] = results["RULE_FLAG"] != ""
+        results = (
+            results.sort_values(["_flagged", "RISK_SCORE"], ascending=[True, False])
+            .drop(columns="_flagged")
+            .reset_index(drop=True)
+        )
+        n_queue = int((results["RULE_FLAG"] == "").sum())
+        rank = np.full(len(results), np.nan)
+        rank[:n_queue] = np.arange(1, n_queue + 1)
+        results.insert(0, "RISK_RANK", rank)
+
+        logger.info(
+            f"Queue: {n_queue:,} ranked | "
+            f"{int((results['RULE_FLAG'] == 'ALREADY_SEVERE').sum()):,} already-severe (rule) | "
+            f"{int((results['RULE_FLAG'] == 'SUPERSEDED').sum()):,} superseded. "
+            f"At {config.API_RATE_PER_HOUR}/h the full queue takes "
+            f"{n_queue / config.API_RATE_PER_HOUR:.0f}h to call."
+        )
 
         if output_path is None:
             output_path = self._default_output_path(resolved)

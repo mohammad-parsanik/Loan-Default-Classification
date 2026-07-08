@@ -426,3 +426,117 @@ def test_model_loader_dispatches_to_bundle_when_path_is_a_file(tmp_path, monkeyp
 
     loader = model_loader_mod.ModelLoader(bundle_path)
     assert loader.load_pipeline() is sentinel
+
+
+# ── ranking deliverable (July 8): masking, stratified calibration, queue ───────
+
+def test_mask_monotone_zeroes_impossible_classes():
+    from src.evaluation.decision import mask_monotone
+
+    probs = np.array([
+        [0.4, 0.3, 0.2, 0.1],   # current_cat 2 → classes 0,1 impossible
+        [0.4, 0.3, 0.2, 0.1],   # current_cat 0 → untouched
+    ])
+    out = mask_monotone(probs, np.array([2, 0]))
+    assert out[0, 0] == 0.0 and out[0, 1] == 0.0
+    assert np.isclose(out[0, 2], 0.2 / 0.3) and np.isclose(out[0, 3], 0.1 / 0.3)
+    assert np.allclose(out[1], probs[1])
+    assert np.allclose(out.sum(axis=1), 1.0)
+
+
+def test_stratified_calibrator_separates_strata():
+    from src.evaluation.calibration import StratifiedCalibrator
+
+    rng = np.random.default_rng(0)
+    n = 8000
+    y = rng.integers(0, 4, n)
+    probs = np.full((n, 4), 0.2 / 3)
+    probs[np.arange(n), y] = 0.8
+    # Stratum 0 noisy (50% flips), stratum 1 clean (10% flips)
+    strata = (rng.random(n) < 0.5).astype(int)
+    flip = rng.random(n) < np.where(strata == 0, 0.5, 0.1)
+    y_obs = np.where(flip, (y + 1) % 4, y)
+
+    cal = StratifiedCalibrator(min_stratum_n=1000).fit(probs, y_obs, strata)
+    out = cal.transform(probs, strata)
+    top = out[np.arange(n), probs.argmax(axis=1)]
+    assert abs(top[strata == 0].mean() - 0.5) < 0.07
+    assert abs(top[strata == 1].mean() - 0.9) < 0.07
+
+    # Below the floor for one stratum → falls back to pooled, still works
+    cal2 = StratifiedCalibrator(min_stratum_n=n).fit(probs, y_obs, strata)
+    out2 = cal2.transform(probs, strata)
+    assert np.allclose(out2.sum(axis=1), 1.0)
+    assert not cal2.per_stratum_          # everything pooled
+
+
+def test_ranking_metrics_recall_lift_and_carveout(monkeypatch):
+    import src.evaluation.ranking as ranking
+
+    monkeypatch.setattr(
+        config, "RANKING_REF_WINDOWS", {"w": 3 / config.API_RATE_PER_HOUR}
+    )
+    y = np.array([3, 3, 0, 1, 2, 0, 0, 1, 0, 3])
+    s = np.array([.9, .8, .7, .6, .5, .4, .3, .2, .15, .1])
+
+    m = ranking.ranking_metrics(y, s)
+    assert m["n_severe"] == 3
+    assert np.isclose(m["at_w"]["recall"], 2 / 3)         # 2 of 3 severe in top 3
+    assert np.isclose(m["at_w"]["lift"], (2 / 3) / 0.3)
+
+    # Carve-out: already-severe (current_cat 3) leave the ranked population
+    strata = np.array([3, 0, 0, 1, 2, 0, 0, 1, 0, 2])
+    m2 = ranking.ranking_metrics(y, s, strata=strata)
+    assert m2["n_ranked"] == 9 and m2["n_severe"] == 2
+    assert "by_current_cat" in m2
+
+    # Perfect ranking → recall hits 1.0 within n_severe calls
+    monkeypatch.setattr(
+        config, "RANKING_REF_WINDOWS", {"w": 2 / config.API_RATE_PER_HOUR}
+    )
+    y3 = np.array([3, 3, 0, 0])
+    s3 = np.array([.9, .8, .2, .1])
+    m3 = ranking.ranking_metrics(y3, s3)
+    assert m3["at_w"]["recall"] == 1.0
+
+
+def test_capture_curve_is_monotone_and_complete():
+    from src.evaluation.ranking import capture_curve
+
+    rng = np.random.default_rng(0)
+    y = (rng.random(500) < 0.1).astype(int) * 3
+    s = rng.random(500)
+    cc = capture_curve(y, s, n_points=50)
+    rec = np.array(cc["recall"])
+    assert (np.diff(rec) >= -1e-12).all()      # non-decreasing
+    assert rec[-1] == 1.0                      # full list captures everyone
+    assert len(cc["hours"]) == len(rec)
+
+
+def test_split_for_final_fit_uses_all_mature_snapshots():
+    from src.data.temporal_split import split_for_final_fit
+
+    horizon = config.LABEL_HORIZON_MONTHS
+    mature_a   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 8)))
+    mature_b   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2)))
+    immature   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3)))
+
+    instances = [
+        {"national_code": f"c{i}", "snapshot_date": snap, "label": 0, "current_cat": 0}
+        for i in range(200) for snap in (mature_a, mature_b, immature)
+    ]
+    train, val, test = split_for_final_fit(instances)
+
+    assert test == []
+    used_snaps = {i["snapshot_date"] for i in train} | {i["snapshot_date"] for i in val}
+    assert used_snaps == {mature_a, mature_b}          # immature excluded
+    # Customer-disjoint val carved (OPTIMIZE_ON_VALIDATION=True in config)
+    assert val and not ({i["national_code"] for i in train}
+                        & {i["national_code"] for i in val})
+
+
+def test_severity_scores_is_last_class_probability():
+    from src.evaluation.decision import severity_scores
+
+    p = np.array([[0.1, 0.2, 0.3, 0.4], [0.7, 0.1, 0.1, 0.1]])
+    assert np.allclose(severity_scores(p), [0.4, 0.1])

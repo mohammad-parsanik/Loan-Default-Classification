@@ -240,6 +240,38 @@ def split_by_time(instances: List[Dict]) -> tuple:
     return train_inst, val_inst, test_inst
 
 
+# ── Final deployment fit ──────────────────────────────────────────────────────
+
+def split_for_final_fit(instances: List[Dict]) -> tuple:
+    """
+    Deployment fit: train on ALL mature snapshots (no test hold-out — the
+    recipe was already graded by evaluation runs; the shipped model should
+    use the freshest labels available). A customer-disjoint holdout is still
+    carved when OPTIMIZE_ON_VALIDATION is on, because early stopping, Optuna
+    and the calibrator all need held-out data.
+
+    Returns (train_inst, val_inst, []) — empty test set.
+    """
+    usable_raw, _ = _get_usable_snapshots(instances)
+    if not usable_raw:
+        raise ValueError("No mature snapshots available for a final fit.")
+
+    usable_set = set(usable_raw)
+    train_inst = [i for i in instances if i["snapshot_date"] in usable_set]
+    val_inst: List[Dict] = []
+
+    if getattr(config, "OPTIMIZE_ON_VALIDATION", True):
+        train_inst, val_inst = split_train_by_customer(
+            train_inst, getattr(config, "CUSTOMER_VAL_FRACTION", 0.2)
+        )
+
+    logger.info(
+        f"Final-fit split: {len(usable_raw)} snapshots → "
+        f"{len(train_inst):,} train / {len(val_inst):,} val / 0 test"
+    )
+    return train_inst, val_inst, []
+
+
 # ── Customer-disjoint split ───────────────────────────────────────────────────
 
 def _customer_bucket(national_code, seed: int) -> float:

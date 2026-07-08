@@ -290,11 +290,17 @@ def plot_iv_chart(df_iv: pd.DataFrame, output_dir: Path, top_n: int = 40) -> Non
 
     fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.28)))
     y = np.arange(len(df_plot))
-    h = 0.25
 
-    ax.barh(y - h, df_plot["iv_ovr0"], h * 0.9, label="OvR-0 (No Delay)",  color="steelblue",  alpha=0.85)
-    ax.barh(y,     df_plot["iv_ovr1"], h * 0.9, label="OvR-1 (Current)",   color="darkorange", alpha=0.85)
-    ax.barh(y + h, df_plot["iv_ovr2"], h * 0.9, label="OvR-2 (Past Due+)", color="crimson",    alpha=0.85)
+    n_classes = config.NUM_CLASSES
+    colors = ["steelblue", "darkorange", "crimson", "seagreen"]
+    h = 0.8 / n_classes
+    for cls in range(n_classes):
+        offset = (cls - (n_classes - 1) / 2) * h
+        ax.barh(
+            y + offset, df_plot[f"iv_ovr{cls}"], h * 0.9,
+            label=f"OvR-{cls} ({CLASS_NAMES[cls]})",
+            color=colors[cls % len(colors)], alpha=0.85,
+        )
 
     ax.set_yticks(y)
     ax.set_yticklabels(df_plot["feature"], fontsize=8)

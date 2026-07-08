@@ -107,3 +107,41 @@ class AggregatedXGBoostBaseline:
             f"QWK={metrics['qwk']:.4f}, Brier={metrics.get('brier_score', '?'):.4f}"
         )
         return metrics
+
+
+class BinarySevereBaseline(AggregatedXGBoostBaseline):
+    """
+    Binary comparator for the ranking deliverable: models the severe event
+    y = (label == NUM_CLASSES-1) directly on the same aggregated features.
+    Answers "does the multiclass detour cost ranking quality?" — its raw
+    P(severe) is compared on recall@K/lift/PR-AUC, which are invariant to
+    monotone calibration, so no calibrator is needed for the comparison.
+    """
+
+    def train(self, train_inst: list[dict], val_inst: Optional[list[dict]] = None) -> None:
+        X_train, y_train = self._aggregate(train_inst)
+        y_bin = (y_train == config.NUM_CLASSES - 1).astype(np.int32)
+        n_pos = max(int(y_bin.sum()), 1)
+
+        logger.info(
+            f"Training binary severe-event comparator on {X_train.shape[1]} "
+            f"features ({n_pos:,} positives / {len(y_bin):,})…"
+        )
+        self.model = xgb.XGBClassifier(
+            objective="binary:logistic",
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=(len(y_bin) - n_pos) / n_pos,
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+        self.model.fit(X_train, y_bin, verbose=False)
+        logger.info("Binary comparator training complete.")
+
+    def severity_scores(self, instances: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (P(severe), y_true_multiclass) for ranking evaluation."""
+        X, y = self._aggregate(instances)
+        return self.model.predict_proba(X)[:, 1], y
