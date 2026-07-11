@@ -610,18 +610,43 @@ def _arm_instances(n, seed):
     return out
 
 
+def _arm_arrays(n, seed):
+    """Instances + the (X, y, current_cat) arrays every arm now trains on."""
+    from src.baselines.aggregated_xgboost import aggregate_features
+    inst = _arm_instances(n, seed)
+    X, y = aggregate_features(inst)
+    cat = np.array([i["current_cat"] for i in inst])
+    return X, y, cat
+
+
+def test_aggregate_features_matches_naive_reference():
+    from src.baselines.aggregated_xgboost import aggregate_features
+
+    insts = _arm_instances(50, 99)
+    X, y = aggregate_features(insts)
+
+    X_ref = []
+    for inst in insts:
+        f = inst["features"]
+        X_ref.append(np.concatenate([f.min(0), f.max(0), f.mean(0), f.std(0), [inst["n_loans"]]]))
+    X_ref = np.vstack(X_ref).astype(np.float32)
+
+    assert np.allclose(X, X_ref, atol=1e-4)
+    assert y.tolist() == [i["label"] for i in insts]
+
+
 def test_ordinal_arm_produces_valid_distribution():
     from src.baselines.aggregated_xgboost import OrdinalXGBArm
 
-    train, test = _arm_instances(1500, 1), _arm_instances(400, 2)
+    X_train, y_train, cat_train = _arm_arrays(1500, 1)
+    X_test, y_test, cat_test = _arm_arrays(400, 2)
     arm = OrdinalXGBArm()
-    arm.train(train)
-    probs, y = arm.predict_proba(test)
+    arm.train(X_train, y_train, cat_train)
+    probs = arm.predict_proba(X_test)
 
     assert probs.shape == (400, config.NUM_CLASSES)
     assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
     assert (probs >= 0).all()
-    assert len(y) == 400
 
 
 def test_per_cat_arm_is_natively_monotone_and_handles_missing_classes():
@@ -629,36 +654,40 @@ def test_per_cat_arm_is_natively_monotone_and_handles_missing_classes():
 
     # Stratum 0 never reaches class 3 in training (the XGB classes_ mapping
     # regression: predicted columns must land on the classes actually seen)
-    train = [i for i in _arm_instances(2000, 3)
-             if not (i["current_cat"] == 0 and i["label"] == 3)]
-    test = _arm_instances(500, 4)
+    inst_train = [i for i in _arm_instances(2000, 3)
+                  if not (i["current_cat"] == 0 and i["label"] == 3)]
+    from src.baselines.aggregated_xgboost import aggregate_features
+    X_train, y_train = aggregate_features(inst_train)
+    cat_train = np.array([i["current_cat"] for i in inst_train])
+
+    inst_test = _arm_instances(500, 4)
+    X_test, y_test = aggregate_features(inst_test)
+    cat_test = np.array([i["current_cat"] for i in inst_test])
 
     arm = PerCatXGBArm()
-    arm.train(train)
-    probs, y = arm.predict_proba(test)
+    arm.train(X_train, y_train, cat_train)
+    probs = arm.predict_proba(X_test, cat_test)
 
     assert probs.shape == (500, config.NUM_CLASSES)
     assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
-    strata = np.array([i["current_cat"] for i in test])
     for c in range(1, config.NUM_CLASSES):
         # No probability mass below the current category — by construction
-        assert probs[strata == c][:, :c].max() <= 1e-12
+        assert probs[cat_test == c][:, :c].max() <= 1e-12
     # Already-severe stratum gets the point mass
-    assert np.allclose(probs[strata == 3][:, 3], 1.0)
+    assert np.allclose(probs[cat_test == 3][:, 3], 1.0)
 
 
 def test_binary_arm_two_columns_for_calibrator_reuse():
     from src.baselines.aggregated_xgboost import BinarySevereBaseline
 
-    train, test = _arm_instances(1500, 5), _arm_instances(300, 6)
+    X_train, y_train, cat_train = _arm_arrays(1500, 5)
+    X_test, y_test, cat_test = _arm_arrays(300, 6)
     arm = BinarySevereBaseline()
-    arm.train(train)
-    probs, y = arm.predict_proba(test)
+    arm.train(X_train, y_train, cat_train)
+    probs = arm.predict_proba(X_test)
 
     assert probs.shape == (300, 2)
     assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
-    sev, y2 = arm.severity_scores(test)
-    assert np.allclose(sev, probs[:, 1]) and (y2 == y).all()
     assert not arm.full_distribution        # never deployable
 
 

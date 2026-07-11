@@ -50,7 +50,7 @@ from src.data.temporal_split import (
     generate_walk_forward_folds,
     build_fold_instances,
 )
-from src.baselines.aggregated_xgboost import ARM_BUILDERS
+from src.baselines.aggregated_xgboost import ARM_BUILDERS, aggregate_features
 from src.evaluation.fold_aggregator import (
     aggregate_fold_metrics,
     log_fold_summary,
@@ -204,34 +204,44 @@ def train_single_fold(
 
     # Current-category strata for slice-level evaluation and stratified
     # calibration (order matches the dataloaders: shuffle=False for val/test)
-    test_strata = np.array([i["current_cat"] for i in test_inst])
-    val_strata  = np.array([i["current_cat"] for i in val_inst])
+    train_strata = np.array([i["current_cat"] for i in train_inst])
+    test_strata  = np.array([i["current_cat"] for i in test_inst])
+    val_strata   = np.array([i["current_cat"] for i in val_inst])
 
     # ── Stage: Preprocessing ──────────────────────────────────────────────────
-    stage_key = f"fold{fold_id:02d}_preprocessing"
-    if ckpt.is_done("preprocessing"):
-        logger.info(f"[skip] {fold_label} preprocessing already complete.")
-        preprocessor, train_inst, val_inst, test_inst = ckpt.load("preprocessing")
-    else:
-        with timed(f"{fold_label}: Preprocessing", timing):
-            preprocessor = create_preprocessing_pipeline(features, config.BINARY_FEATURES)
+    # Not checkpointed as a full round-trip — the transform itself (~3-4 min
+    # at 6M+ instances) is cheap next to what pickling three post-transform
+    # instance lists used to cost (~10-20 min just to save, as long again
+    # to load back). The fitted scaler IS still persisted — it's small and
+    # Predictor needs it.
+    with timed(f"{fold_label}: Preprocessing", timing):
+        preprocessor = create_preprocessing_pipeline(features, config.BINARY_FEATURES)
 
-            # Fit on training loans only — never touch val/test distributions
-            X_train_raw = [i["features"] for i in train_inst]
-            preprocessor.fit(X_train_raw)
+        # Fit on training loans only — never touch val/test distributions
+        X_train_raw = [i["features"] for i in train_inst]
+        preprocessor.fit(X_train_raw)
 
-            for split_name, split in [("Train", train_inst), ("Val", val_inst), ("Test", test_inst)]:
-                logger.info(f"  Transforming {split_name} ({len(split):,} instances)…")
-                if not split:
-                    continue
-                X_raw    = [i["features"] for i in split]
-                X_scaled = preprocessor.transform(X_raw)
-                for inst, x in zip(split, X_scaled):
-                    inst["features"] = x
+        for split_name, split in [("Train", train_inst), ("Val", val_inst), ("Test", test_inst)]:
+            logger.info(f"  Transforming {split_name} ({len(split):,} instances)…")
+            if not split:
+                continue
+            X_raw    = [i["features"] for i in split]
+            X_scaled = preprocessor.transform(X_raw)
+            for inst, x in zip(split, X_scaled):
+                inst["features"] = x
 
-        joblib.dump(preprocessor, fold_dir / "scaler.pkl")
-        ckpt.save("preprocessing", (preprocessor, train_inst, val_inst, test_inst))
-        ckpt.mark_done("preprocessing")
+    joblib.dump(preprocessor, fold_dir / "scaler.pkl")
+
+    # ── Aggregate once, shared by every arm ───────────────────────────────────
+    # aggregate_features is the expensive step (a full pass over every
+    # loan); computing it here ONCE per split and passing arrays to each
+    # arm avoids each of the 4 arms (5-6 counting the deployed-arm re-eval)
+    # redundantly re-deriving the identical matrix from train_inst/val_inst/
+    # test_inst.
+    with timed(f"{fold_label}: Aggregate features", timing):
+        X_train, y_train = aggregate_features(train_inst)
+        X_val,   y_val    = aggregate_features(val_inst)  if val_inst  else (None, None)
+        X_test,  y_test   = aggregate_features(test_inst) if test_inst else (None, None)
 
     # ── Stage: Model arms (XGBoost on aggregated features) ───────────────────
     # Each arm trains, calibrates on the customer-disjoint val, and is
@@ -240,6 +250,8 @@ def train_single_fold(
     arms_results: dict = {}
     arm_objects: dict = {}
     arm_calibrators: dict = {}
+    arm_test_probs: dict = {}   # cached so the deployed-arm section below
+                                 # doesn't re-run predict_proba redundantly
 
     arms_to_run = list(config.MODEL_ARMS)
     if not test_inst:
@@ -255,28 +267,29 @@ def train_single_fold(
         stage = f"arm_{arm_name}"
         if ckpt.is_done(stage):
             logger.info(f"[skip] {fold_label} arm '{arm_name}' already complete.")
-            arm, arm_cal, arm_metrics = ckpt.load(stage)
+            arm, arm_cal, arm_metrics, test_probs = ckpt.load(stage)
         else:
             with timed(f"{fold_label}: Arm '{arm_name}'", timing):
                 arm = ARM_BUILDERS[arm_name]()
-                arm.train(train_inst, val_inst)
+                arm.train(X_train, y_train, train_strata, X_val, y_val, val_strata)
 
                 arm_cal = None
-                if val_inst:
-                    val_probs, y_val_a = arm.predict_proba(val_inst)
+                if X_val is not None and len(X_val):
+                    val_probs = arm.predict_proba(X_val, val_strata)
                     # Binary arm calibrates against the binary event
-                    y_fit = (y_val_a if arm.full_distribution
-                             else (y_val_a == config.NUM_CLASSES - 1).astype(np.int32))
+                    y_fit = (y_val if arm.full_distribution
+                             else (y_val == config.NUM_CLASSES - 1).astype(np.int32))
                     arm_cal = StratifiedCalibrator(
                         min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
                     ).fit(val_probs, y_fit, val_strata)
 
                 arm_metrics = {}
-                if test_inst:
-                    test_probs, y_test_a = arm.predict_proba(test_inst)
+                test_probs = None
+                if X_test is not None and len(X_test):
+                    test_probs = arm.predict_proba(X_test, test_strata)
                     if arm.full_distribution:
                         arm_metrics = full_evaluation(
-                            y_test_a, test_probs,
+                            y_test, test_probs,
                             strata=test_strata, calibrator=arm_cal,
                         )
                         sev = arm_metrics.pop("_probs_cal")[:, -1]
@@ -286,18 +299,19 @@ def train_single_fold(
                                      if arm_cal is not None else test_probs)
                         sev = probs_cal[:, -1]
                         arm_metrics = {"ranking": ranking_metrics(
-                            y_test_a, sev, strata=test_strata)}
+                            y_test, sev, strata=test_strata)}
 
                     # Capture-curve data (carved population) for the plot
                     keep = test_strata < config.CARVE_CURRENT_CAT_GE
-                    arm_metrics["capture_curve"] = capture_curve(y_test_a[keep], sev[keep])
+                    arm_metrics["capture_curve"] = capture_curve(y_test[keep], sev[keep])
 
-            ckpt.save(stage, (arm, arm_cal, arm_metrics))
+            ckpt.save(stage, (arm, arm_cal, arm_metrics, test_probs))
             ckpt.mark_done(stage, {"ranking_ap": arm_metrics.get("ranking", {}).get("pr_auc")})
 
         arms_results[arm_name]    = arm_metrics
         arm_objects[arm_name]     = arm
         arm_calibrators[arm_name] = arm_cal
+        arm_test_probs[arm_name]  = test_probs
 
     # ── Legacy neural arm (DeepSets encoder + XGB meta-learner) ──────────────
     ds_history = {}
@@ -323,6 +337,11 @@ def train_single_fold(
         )
     else:
         deploy_name = config.DEPLOY_ARM
+        if not ARM_BUILDERS[deploy_name].full_distribution:
+            raise ValueError(
+                f"DEPLOY_ARM='{deploy_name}' has no per-class distribution "
+                f"(it's a ranking-only diagnostic) and cannot be deployed."
+            )
         logger.info(f"{fold_label} | Deployed arm (configured): '{deploy_name}'")
 
     final_metrics = arms_results.get(deploy_name, {})
@@ -340,8 +359,10 @@ def train_single_fold(
             arms_results[deploy_name] = final_metrics
         else:
             with timed(f"{fold_label}: Deployed-arm CI + plots", timing):
-                arm, arm_cal = arm_objects[deploy_name], arm_calibrators[deploy_name]
-                probs_test, y_test = arm.predict_proba(test_inst)
+                arm_cal = arm_calibrators[deploy_name]
+                # Reuse the raw probs already computed for this arm in the
+                # arms loop above — no need to re-run predict_proba.
+                probs_test = arm_test_probs[deploy_name]
                 fe = full_evaluation(
                     y_test, probs_test, strata=test_strata, calibrator=arm_cal
                 )
@@ -617,19 +638,17 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
     pipeline_log = {"run_dir": str(run_dir), "started": _now_str(), "stages": {}}
 
     # ── Stage 1: Load data ────────────────────────────────────────────────────
-    if ckpt.is_done("load_data"):
-        logger.info("[skip] Stage 'load_data' already complete — loading from cache.")
-        instances, features = ckpt.load("load_data")
-    else:
-        with timed("Stage 1: Load & group data", timing):
-            dl = DataLoader()
-            instances, features = dl.load_train_portfolios(use_cache=True)
-        if not instances:
-            logger.error("No instances loaded. Exiting.")
-            return
-        ckpt.save("load_data", (instances, features))
-        ckpt.mark_done("load_data", {"n_instances": len(instances), "n_features": len(features)})
-
+    # Deliberately NOT checkpointed via joblib: the NPZ cache
+    # (train_portfolios_cache.npz) already makes this call fast (~30-60s).
+    # Pickling 10M+ per-instance dicts here used to cost 15-30+ MINUTES to
+    # save (and as long again to load back on --resume) — strictly worse
+    # than just recomputing every time.
+    with timed("Stage 1: Load & group data", timing):
+        dl = DataLoader()
+        instances, features = dl.load_train_portfolios(use_cache=True)
+    if not instances:
+        logger.error("No instances loaded. Exiting.")
+        return
     logger.info(f"Loaded {len(instances):,} portfolio instances, {len(features)} features.")
 
     # ── Stage 2: Split (single) or generate folds (walk-forward) ─────────────
@@ -637,7 +656,7 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
 
     if final_fit:
         _run_single_split(
-            instances, features, run_dir, device, timing, ckpt, pipeline_log,
+            instances, features, run_dir, device, timing,
             fold_results, final_fit=True,
         )
         aggregated = {}
@@ -656,7 +675,7 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
                     "falling back to single static split."
                 )
                 _run_single_split(
-                    instances, features, run_dir, device, timing, ckpt, pipeline_log, fold_results
+                    instances, features, run_dir, device, timing, fold_results
                 )
             else:
                 # Load any previously completed folds
@@ -716,7 +735,7 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
     else:
         # ── Single static temporal split (original behaviour) ─────────────────
         _run_single_split(
-            instances, features, run_dir, device, timing, ckpt, pipeline_log, fold_results
+            instances, features, run_dir, device, timing, fold_results
         )
         aggregated = {}
 
@@ -751,23 +770,15 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
     logger.info("=" * 60)
 
 
-def _run_single_split(instances, features, run_dir, device, timing, ckpt,
-                      pipeline_log, fold_results, final_fit: bool = False):
+def _run_single_split(instances, features, run_dir, device, timing,
+                      fold_results, final_fit: bool = False):
     """Helper: run the original single-split flow and append the result to fold_results."""
-    if ckpt.is_done("split"):
-        logger.info("[skip] Stage 'split' already complete.")
-        train_inst, val_inst, test_inst = ckpt.load("split")
-    else:
-        with timed("Stage 2: Temporal split", timing):
-            split_fn = split_for_final_fit if final_fit else split_by_time
-            train_inst, val_inst, test_inst = split_fn(instances)
-        ckpt.save("split", (train_inst, val_inst, test_inst))
-        ckpt.mark_done("split", {
-            "n_train": len(train_inst),
-            "n_val":   len(val_inst),
-            "n_test":  len(test_inst),
-            "final_fit": final_fit,
-        })
+    # Not checkpointed — same reasoning as Stage 1: recompute (~seconds,
+    # pure in-memory partitioning) is far cheaper than a joblib round-trip
+    # of the instance lists.
+    with timed("Stage 2: Temporal split", timing):
+        split_fn = split_for_final_fit if final_fit else split_by_time
+        train_inst, val_inst, test_inst = split_fn(instances)
 
     fold_dir = run_dir / "fold_01"
     fold_dir.mkdir(parents=True, exist_ok=True)
