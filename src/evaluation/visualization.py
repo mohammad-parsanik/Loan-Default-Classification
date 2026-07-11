@@ -5,7 +5,6 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import umap
 from sklearn.metrics import auc, confusion_matrix, roc_curve
 
 import project_config as config
@@ -58,6 +57,8 @@ def plot_embeddings_umap(
     sample_size: int = 5000,
 ):
     """Project embedding_dim → 2D via UMAP for visual cluster inspection."""
+    import umap   # lazy: only the legacy DeepSets arm uses this plot
+
     if len(embeddings) > sample_size:
         idx = np.random.choice(len(embeddings), sample_size, replace=False)
         embeddings, labels = embeddings[idx], labels[idx]
@@ -122,6 +123,31 @@ def plot_training_curves(
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
+    _save_or_show(save_path)
+
+
+def plot_capture_curves(curves: dict, save_path: Optional[Path] = None):
+    """
+    Cumulative-gains comparison of the model arms on the ranked API queue.
+    curves: {arm_name: {"hours": [...], "recall": [...]}} from
+    ranking.capture_curve. Vertical lines mark the reference call windows.
+    """
+    plt.figure(figsize=(9, 6))
+    for name, cc in curves.items():
+        plt.plot(cc["hours"], cc["recall"], label=name, linewidth=1.6)
+
+    for w_name, hours in config.RANKING_REF_WINDOWS.items():
+        plt.axvline(hours, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
+        plt.text(hours, 0.02, w_name, rotation=90, fontsize=8,
+                 va="bottom", ha="right", color="gray")
+
+    plt.xscale("log")
+    plt.xlabel(f"Hours of API calling at {config.API_RATE_PER_HOUR}/h (log scale)")
+    plt.ylabel("Recall of future-severe customers")
+    plt.title("Capture curves — ranked queue, carved population")
+    plt.ylim(0, 1.02)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="lower right")
     _save_or_show(save_path)
 
 

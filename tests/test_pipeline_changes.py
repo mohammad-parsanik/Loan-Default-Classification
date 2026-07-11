@@ -592,3 +592,80 @@ def test_apply_queue_flags_ttl_and_disabled_knob(monkeypatch):
     df = _queue_df().iloc[[0, 1, 2]]
     flags2 = apply_queue_flags(df, multi_snapshot=False, called_log=None)
     assert flags2.tolist() == ["ALREADY_SEVERE", "", ""]
+
+
+# ── model arms (July 10 architecture switch) ────────────────────────────────────
+
+def _arm_instances(n, seed):
+    rng_l = np.random.default_rng(seed)
+    out = []
+    for i in range(n):
+        cat = int(rng_l.choice([0, 1, 2, 3], p=[.55, .25, .12, .08]))
+        label = min(cat + int(rng_l.choice([0, 0, 1, 2])), config.NUM_CLASSES - 1)
+        feats = rng_l.normal(size=(1, 6)).astype(np.float32)
+        feats[0, 0] = label + rng_l.normal(0, .8)
+        out.append({"national_code": f"c{seed}_{i}", "snapshot_date": 20250101.0,
+                    "n_loans": 1, "features": feats, "label": label,
+                    "current_cat": cat})
+    return out
+
+
+def test_ordinal_arm_produces_valid_distribution():
+    from src.baselines.aggregated_xgboost import OrdinalXGBArm
+
+    train, test = _arm_instances(1500, 1), _arm_instances(400, 2)
+    arm = OrdinalXGBArm()
+    arm.train(train)
+    probs, y = arm.predict_proba(test)
+
+    assert probs.shape == (400, config.NUM_CLASSES)
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
+    assert (probs >= 0).all()
+    assert len(y) == 400
+
+
+def test_per_cat_arm_is_natively_monotone_and_handles_missing_classes():
+    from src.baselines.aggregated_xgboost import PerCatXGBArm
+
+    # Stratum 0 never reaches class 3 in training (the XGB classes_ mapping
+    # regression: predicted columns must land on the classes actually seen)
+    train = [i for i in _arm_instances(2000, 3)
+             if not (i["current_cat"] == 0 and i["label"] == 3)]
+    test = _arm_instances(500, 4)
+
+    arm = PerCatXGBArm()
+    arm.train(train)
+    probs, y = arm.predict_proba(test)
+
+    assert probs.shape == (500, config.NUM_CLASSES)
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
+    strata = np.array([i["current_cat"] for i in test])
+    for c in range(1, config.NUM_CLASSES):
+        # No probability mass below the current category — by construction
+        assert probs[strata == c][:, :c].max() <= 1e-12
+    # Already-severe stratum gets the point mass
+    assert np.allclose(probs[strata == 3][:, 3], 1.0)
+
+
+def test_binary_arm_two_columns_for_calibrator_reuse():
+    from src.baselines.aggregated_xgboost import BinarySevereBaseline
+
+    train, test = _arm_instances(1500, 5), _arm_instances(300, 6)
+    arm = BinarySevereBaseline()
+    arm.train(train)
+    probs, y = arm.predict_proba(test)
+
+    assert probs.shape == (300, 2)
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
+    sev, y2 = arm.severity_scores(test)
+    assert np.allclose(sev, probs[:, 1]) and (y2 == y).all()
+    assert not arm.full_distribution        # never deployable
+
+
+def test_arm_builders_registry_matches_config():
+    from src.baselines.aggregated_xgboost import ARM_BUILDERS
+
+    for name in config.MODEL_ARMS:
+        assert name in ARM_BUILDERS, f"config arm '{name}' has no builder"
+    deployable = [n for n in config.MODEL_ARMS if ARM_BUILDERS[n].full_distribution]
+    assert deployable, "at least one full-distribution arm must be configured"

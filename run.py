@@ -50,10 +50,7 @@ from src.data.temporal_split import (
     generate_walk_forward_folds,
     build_fold_instances,
 )
-from src.baselines.aggregated_xgboost import (
-    AggregatedXGBoostBaseline,
-    BinarySevereBaseline,
-)
+from src.baselines.aggregated_xgboost import ARM_BUILDERS
 from src.evaluation.fold_aggregator import (
     aggregate_fold_metrics,
     log_fold_summary,
@@ -62,11 +59,11 @@ from src.evaluation.fold_aggregator import (
 from src.evaluation.calibration import StratifiedCalibrator
 from src.evaluation.metrics import (
     bootstrap_confidence_intervals,
-    compute_metrics,
     full_evaluation,
 )
-from src.evaluation.ranking import ranking_metrics
+from src.evaluation.ranking import capture_curve, ranking_metrics
 from src.evaluation.visualization import (
+    plot_capture_curves,
     plot_confusion_matrix,
     plot_embeddings_umap,
     plot_roc_curves,
@@ -75,7 +72,6 @@ from src.evaluation.visualization import (
 from src.inference.predictor import Predictor
 from src.model.deep_sets import DeepSets
 from src.model.losses import CostSensitiveFocalLoss
-from src.model.meta_learner import XGBoostMetaLearner
 from src.model.trainer import TransformerTrainer
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -237,59 +233,174 @@ def train_single_fold(
         ckpt.save("preprocessing", (preprocessor, train_inst, val_inst, test_inst))
         ckpt.mark_done("preprocessing")
 
-    # ── Stage: Baseline ───────────────────────────────────────────────────────
-    if ckpt.is_done("baseline"):
-        logger.info(f"[skip] {fold_label} baseline already complete.")
-        baseline_metrics = ckpt.load("baseline")
-    elif not test_inst:
-        logger.info(f"[skip] {fold_label} baseline skipped (final fit — no test set to compare on).")
-        baseline_metrics = {}
-    else:
-        with timed(f"{fold_label}: Aggregated XGBoost baseline", timing):
-            baseline = AggregatedXGBoostBaseline()
-            baseline.train(train_inst, val_inst)
+    # ── Stage: Model arms (XGBoost on aggregated features) ───────────────────
+    # Each arm trains, calibrates on the customer-disjoint val, and is
+    # evaluated through the same full_evaluation path. The binary arm is a
+    # ranking-ceiling diagnostic (no class distribution → never deployed).
+    arms_results: dict = {}
+    arm_objects: dict = {}
+    arm_calibrators: dict = {}
 
-            # Calibrate on val (if any), then evaluate under the SAME
-            # decision policy as the DeepSets+XGB model (full_evaluation).
-            bl_calibrator = None
-            if val_inst:
-                val_probs, y_val_bl = baseline.predict_proba(val_inst)
-                bl_calibrator = StratifiedCalibrator(
-                    min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
-                ).fit(val_probs, y_val_bl, val_strata)
-                joblib.dump(bl_calibrator, fold_dir / "baseline_calibrator.pkl")
-
-            test_probs, y_test_bl = baseline.predict_proba(test_inst)
-            baseline_metrics = full_evaluation(
-                y_test_bl, test_probs, strata=test_strata, calibrator=bl_calibrator
+    arms_to_run = list(config.MODEL_ARMS)
+    if not test_inst:
+        # Final fit: nothing to compare on — train only the deployment arm.
+        if config.DEPLOY_ARM == "auto":
+            raise ValueError(
+                "Final fit requires an explicit DEPLOY_ARM in project_config "
+                "(\"auto\" needs a test set to pick a winner)."
             )
-            baseline_metrics.pop("_cost_preds", None)
-            baseline_metrics.pop("_probs_cal", None)
+        arms_to_run = [config.DEPLOY_ARM]
 
-            # Binary severe-event comparator: same features, direct binary
-            # target — does the multiclass detour cost ranking quality?
-            comparator = BinarySevereBaseline()
-            comparator.train(train_inst)
-            comp_scores, comp_y = comparator.severity_scores(test_inst)
-            baseline_metrics["binary_ranking"] = ranking_metrics(
-                comp_y, comp_scores, strata=test_strata
-            )
-        ckpt.save("baseline", baseline_metrics)
-        ckpt.mark_done("baseline", {"macro_f1": baseline_metrics["macro_f1"]})
+    for arm_name in arms_to_run:
+        stage = f"arm_{arm_name}"
+        if ckpt.is_done(stage):
+            logger.info(f"[skip] {fold_label} arm '{arm_name}' already complete.")
+            arm, arm_cal, arm_metrics = ckpt.load(stage)
+        else:
+            with timed(f"{fold_label}: Arm '{arm_name}'", timing):
+                arm = ARM_BUILDERS[arm_name]()
+                arm.train(train_inst, val_inst)
 
-    if baseline_metrics:
-        logger.info(
-            f"{fold_label} | Baseline → Macro F1: {baseline_metrics['macro_f1']:.4f}, "
-            f"QWK: {baseline_metrics['qwk']:.4f}"
+                arm_cal = None
+                if val_inst:
+                    val_probs, y_val_a = arm.predict_proba(val_inst)
+                    # Binary arm calibrates against the binary event
+                    y_fit = (y_val_a if arm.full_distribution
+                             else (y_val_a == config.NUM_CLASSES - 1).astype(np.int32))
+                    arm_cal = StratifiedCalibrator(
+                        min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
+                    ).fit(val_probs, y_fit, val_strata)
+
+                arm_metrics = {}
+                if test_inst:
+                    test_probs, y_test_a = arm.predict_proba(test_inst)
+                    if arm.full_distribution:
+                        arm_metrics = full_evaluation(
+                            y_test_a, test_probs,
+                            strata=test_strata, calibrator=arm_cal,
+                        )
+                        sev = arm_metrics.pop("_probs_cal")[:, -1]
+                        arm_metrics.pop("_cost_preds", None)
+                    else:
+                        probs_cal = (arm_cal.transform(test_probs, test_strata)
+                                     if arm_cal is not None else test_probs)
+                        sev = probs_cal[:, -1]
+                        arm_metrics = {"ranking": ranking_metrics(
+                            y_test_a, sev, strata=test_strata)}
+
+                    # Capture-curve data (carved population) for the plot
+                    keep = test_strata < config.CARVE_CURRENT_CAT_GE
+                    arm_metrics["capture_curve"] = capture_curve(y_test_a[keep], sev[keep])
+
+            ckpt.save(stage, (arm, arm_cal, arm_metrics))
+            ckpt.mark_done(stage, {"ranking_ap": arm_metrics.get("ranking", {}).get("pr_auc")})
+
+        arms_results[arm_name]    = arm_metrics
+        arm_objects[arm_name]     = arm
+        arm_calibrators[arm_name] = arm_cal
+
+    # ── Legacy neural arm (DeepSets encoder + XGB meta-learner) ──────────────
+    ds_history = {}
+    if config.DEEPSETS_ENABLED:
+        ds_metrics, ds_history = _train_deepsets_legacy(
+            fold_label, train_inst, val_inst, test_inst, features,
+            fold_dir, plots_dir, device, timing, ckpt, max_loans,
+            val_strata, test_strata, preprocessor,
         )
-        if "cost_rule" in baseline_metrics:
-            logger.info(
-                f"{fold_label} | Baseline (cost rule) → "
-                f"Macro F1: {baseline_metrics['cost_rule']['macro_f1']:.4f}, "
-                f"Cat-2 Recall: {baseline_metrics['cost_rule']['recall_class_2']:.4f}, "
-                f"Cat-3 Recall: {baseline_metrics['cost_rule']['recall_class_3']:.4f}, "
-                f"Avg Cost: {baseline_metrics['cost_rule']['avg_cost']:.4f}"
-            )
+        arms_results["deepsets"] = ds_metrics
+
+    # ── Deployed-arm selection ────────────────────────────────────────────────
+    full_dist_arms = [n for n in arms_to_run if ARM_BUILDERS[n].full_distribution]
+    if config.DEPLOY_ARM == "auto":
+        deploy_name = max(
+            full_dist_arms,
+            key=lambda n: arms_results[n].get("ranking", {}).get("pr_auc", float("-inf")),
+        )
+        logger.info(
+            f"{fold_label} | Deployed arm (auto, best pooled ranking AP): "
+            f"'{deploy_name}' "
+            f"(AP={arms_results[deploy_name].get('ranking', {}).get('pr_auc', float('nan')):.4f})"
+        )
+    else:
+        deploy_name = config.DEPLOY_ARM
+        logger.info(f"{fold_label} | Deployed arm (configured): '{deploy_name}'")
+
+    final_metrics = arms_results.get(deploy_name, {})
+
+    # Deployment artifacts for the Predictor (aggregated-features path)
+    joblib.dump(arm_objects[deploy_name], fold_dir / "model_arm.pkl")
+    if arm_calibrators[deploy_name] is not None:
+        joblib.dump(arm_calibrators[deploy_name], fold_dir / "calibrator.pkl")
+
+    # ── Deployed-arm CI + plots ───────────────────────────────────────────────
+    if test_inst:
+        if ckpt.is_done("deployed_eval"):
+            logger.info(f"[skip] {fold_label} deployed-arm evaluation already complete.")
+            final_metrics = ckpt.load("deployed_eval") or final_metrics
+            arms_results[deploy_name] = final_metrics
+        else:
+            with timed(f"{fold_label}: Deployed-arm CI + plots", timing):
+                arm, arm_cal = arm_objects[deploy_name], arm_calibrators[deploy_name]
+                probs_test, y_test = arm.predict_proba(test_inst)
+                fe = full_evaluation(
+                    y_test, probs_test, strata=test_strata, calibrator=arm_cal
+                )
+                y_pred     = fe.pop("_cost_preds")
+                y_prob_cal = fe.pop("_probs_cal")
+                final_metrics["bootstrap_ci"] = bootstrap_confidence_intervals(
+                    y_test, y_pred, y_prob_cal, n_iterations=500
+                )
+                arms_results[deploy_name] = final_metrics
+
+                plot_confusion_matrix(y_test, y_pred, save_path=plots_dir / "confusion_matrix.png")
+                plot_roc_curves(y_test, y_prob_cal,  save_path=plots_dir / "roc_curves.png")
+                plot_capture_curves(
+                    {n: m["capture_curve"] for n, m in arms_results.items()
+                     if "capture_curve" in m},
+                    save_path=plots_dir / "capture_curves.png",
+                )
+            ckpt.save("deployed_eval", final_metrics)
+            ckpt.mark_done("deployed_eval")
+
+        logger.info(f"{fold_label} | Deployed arm '{deploy_name}' test metrics logged below.")
+
+        # Full metrics (minus bulky curves) for offline analysis
+        (fold_dir / "arms_metrics.json").write_text(json.dumps(_to_json_safe({
+            n: {k: v for k, v in m.items() if k != "capture_curve"}
+            for n, m in arms_results.items()
+        }), indent=2))
+
+    if final_metrics:
+        logger.info(
+            f"{fold_label} DONE | deployed arm '{deploy_name}' "
+            f"ranking AP: {final_metrics.get('ranking', {}).get('pr_auc', float('nan')):.4f}  "
+            f"Macro F1: {final_metrics.get('macro_f1', float('nan')):.4f}"
+        )
+    else:
+        logger.info(f"{fold_label} FINAL FIT DONE — deployment artifacts ready "
+                    f"(arm '{deploy_name}').")
+
+    return {
+        "baseline_metrics": arms_results.get("multiclass", {}),
+        "final_metrics":    final_metrics,
+        "arms":             arms_results,
+        "deployed_arm":     deploy_name,
+        "ds_history":       ds_history,
+    }
+
+
+def _train_deepsets_legacy(
+    fold_label, train_inst, val_inst, test_inst, features,
+    fold_dir, plots_dir, device, timing, ckpt, max_loans,
+    val_strata, test_strata, preprocessor,
+):
+    """
+    The pre-July-10 pipeline: DeepSets encoder → XGB meta-learner →
+    calibrated evaluation → legacy deployment bundle. Lost the Run-5
+    ranking shootout on every slice; kept behind config.DEEPSETS_ENABLED
+    for reproducibility. Returns (final_metrics, ds_history).
+    """
+    from src.model.meta_learner import XGBoostMetaLearner  # lazy: needs optuna
 
     # ── Stage: DataLoaders ────────────────────────────────────────────────────
     with timed(f"{fold_label}: Build DataLoaders", timing):
@@ -400,8 +511,8 @@ def train_single_fold(
                 calibrator = StratifiedCalibrator(
                     min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
                 ).fit(val_probs_m, y_val_m, val_strata)
-                joblib.dump(calibrator, fold_dir / "calibrator.pkl")
-                logger.info(f"{fold_label} | Stratified calibrator fitted on val and saved.")
+                joblib.dump(calibrator, fold_dir / "deepsets_calibrator.pkl")
+                logger.info(f"{fold_label} | DeepSets stratified calibrator fitted on val and saved.")
 
             if test_inst:
                 _, X_test_emb, y_test, y_prob = meta_learner.evaluate(test_dl)
@@ -428,9 +539,9 @@ def train_single_fold(
             np.save(fold_dir / "test_embeddings.npy", X_test_emb)
             np.save(fold_dir / "test_labels.npy", y_test)
 
-            with timed(f"{fold_label}: Plots", timing):
-                plot_confusion_matrix(y_test, y_pred,    save_path=plots_dir / "confusion_matrix.png")
-                plot_roc_curves(y_test, y_prob,          save_path=plots_dir / "roc_curves.png")
+            with timed(f"{fold_label}: DeepSets plots", timing):
+                plot_confusion_matrix(y_test, y_pred,    save_path=plots_dir / "deepsets_confusion_matrix.png")
+                plot_roc_curves(y_test, y_prob,          save_path=plots_dir / "deepsets_roc_curves.png")
                 plot_embeddings_umap(X_test_emb, y_test, save_path=plots_dir / "embedding_umap.png")
 
     # ── Single-file deployment bundle ─────────────────────────────────────────
@@ -444,7 +555,7 @@ def train_single_fold(
     bundle_raw_state = (
         model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
     )
-    cal_path = fold_dir / "calibrator.pkl"
+    cal_path = fold_dir / "deepsets_calibrator.pkl"
     bundle_calibrator = joblib.load(cal_path) if cal_path.exists() else None
     bundle = {
         "metadata": {
@@ -465,23 +576,9 @@ def train_single_fold(
         "calibrator": bundle_calibrator,
     }
     joblib.dump(bundle, fold_dir / "model_bundle.pkl")
-    logger.info(f"{fold_label} | Deployment bundle saved to {fold_dir / 'model_bundle.pkl'}")
+    logger.info(f"{fold_label} | Legacy DeepSets bundle saved to {fold_dir / 'model_bundle.pkl'}")
 
-    if final_metrics and baseline_metrics:
-        logger.info(
-            f"{fold_label} DONE | "
-            f"Baseline Macro F1: {baseline_metrics['macro_f1']:.4f}  "
-            f"Model Macro F1: {final_metrics['macro_f1']:.4f}  "
-            f"Delta: {final_metrics['macro_f1'] - baseline_metrics['macro_f1']:+.4f}"
-        )
-    else:
-        logger.info(f"{fold_label} FINAL FIT DONE — deployment bundle ready.")
-
-    return {
-        "baseline_metrics": baseline_metrics,
-        "final_metrics":    final_metrics,
-        "ds_history":       ds_history,
-    }
+    return final_metrics, ds_history
 
 
 # ── Training pipeline ─────────────────────────────────────────────────────────
@@ -635,9 +732,18 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info(f"  Pipeline complete  →  {run_dir}")
-    if fold_results:
-        best = max(fold_results, key=lambda r: r["final_metrics"]["macro_f1"])
-        logger.info(f"  Best Model Macro F1: {best['final_metrics']['macro_f1']:.4f}")
+    scored = [r for r in fold_results if r.get("final_metrics")]
+    if scored:
+        best = max(
+            scored,
+            key=lambda r: r["final_metrics"].get("ranking", {}).get("pr_auc", float("-inf")),
+        )
+        rk = best["final_metrics"].get("ranking", {})
+        logger.info(
+            f"  Deployed arm '{best.get('deployed_arm', '?')}' | "
+            f"ranking AP: {rk.get('pr_auc', float('nan')):.4f}  "
+            f"Macro F1: {best['final_metrics'].get('macro_f1', float('nan')):.4f}"
+        )
         if aggregated:
             m = aggregated["model"]["macro_f1"]
             logger.info(f"  Mean Macro F1 (all folds): {m['mean']:.4f} ± {m['std']:.4f}")
@@ -685,15 +791,9 @@ def _run_single_split(instances, features, run_dir, device, timing, ckpt,
     fold_results.append(result)
 
     # Log summary for single split
-    bm = result["baseline_metrics"]
-    fm = result["final_metrics"]
-    if not fm:
+    if not result["final_metrics"]:
         return   # final fit — nothing to compare
-    logger.info(f"  Baseline  Macro F1: {bm['macro_f1']:.4f}")
-    logger.info(f"  DeepSets+XGB Macro F1: {fm['macro_f1']:.4f}")
-    logger.info(f"  Cat-2 Recall: {fm.get('recall_class_2', float('nan')):.4f}")
-    logger.info(f"  Cat-3 Recall: {fm.get('recall_class_3', float('nan')):.4f}")
-    _log_policy_comparison(bm, fm)
+    _log_arms_comparison(result["arms"], result["deployed_arm"])
 
 
 def _log_ranking_line(name: str, rk: dict):
@@ -711,36 +811,29 @@ def _log_ranking_line(name: str, rk: dict):
     )
 
 
-def _log_policy_comparison(bm: dict, fm: dict):
-    """Same-decision-policy comparison + per-current-category slices."""
-    # ── THE headline: ranked API queue quality (P(severe), carved pop.) ──
-    if "ranking" in fm:
-        logger.info("  ── Ranking (API queue): recall of future-severe in top K-hours ──")
-        _log_ranking_line("Baseline (multiclass P3)", bm.get("ranking"))
-        _log_ranking_line("Binary comparator", bm.get("binary_ranking"))
-        _log_ranking_line("DeepSets+XGB (P3)", fm.get("ranking"))
-        for slice_name, sub in fm["ranking"].get("by_current_cat", {}).items():
-            _log_ranking_line(f"DeepSets+XGB [{slice_name}]", sub)
+def _log_arms_comparison(arms: dict, deploy_name: str):
+    """All arms, pooled AND per-stratum (the Run-5 log only showed one arm's slices)."""
+    logger.info("  ── Ranking (API queue): recall of future-severe in top K-hours ──")
+    for name, m in arms.items():
+        tag = f"{name}*" if name == deploy_name else name
+        _log_ranking_line(tag, m.get("ranking"))
+        for slice_name, sub in m.get("ranking", {}).get("by_current_cat", {}).items():
+            _log_ranking_line(f"  {tag} [{slice_name}]", sub)
+    logger.info("  (* = deployed arm; queue sorting uses its calibrated+masked P3)")
 
-    if "cost_rule" in bm and "cost_rule" in fm:
-        b, f = bm["cost_rule"], fm["cost_rule"]
-        logger.info("  ── Cost-rule (deployed policy) comparison ──")
+    logger.info("  ── Classification (full-distribution arms, cost-rule decisions) ──")
+    for name, m in arms.items():
+        cr = m.get("cost_rule")
+        if not cr:
+            continue
         logger.info(
-            f"  Baseline     | F1: {b['macro_f1']:.4f}  "
-            f"Cat-2 Rec: {b['recall_class_2']:.4f}  Cat-3 Rec: {b['recall_class_3']:.4f}  "
-            f"Cost: {b['avg_cost']:.4f}"
+            f"  {name:12s} | F1: {cr['macro_f1']:.4f}  QWK: {cr['qwk']:.4f}  "
+            f"Cat-2 Rec: {cr['recall_class_2']:.4f}  "
+            f"Cat-3 Rec: {cr['recall_class_3']:.4f}  Cost: {cr['avg_cost']:.4f}"
         )
-        logger.info(
-            f"  DeepSets+XGB | F1: {f['macro_f1']:.4f}  "
-            f"Cat-2 Rec: {f['recall_class_2']:.4f}  Cat-3 Rec: {f['recall_class_3']:.4f}  "
-            f"Cost: {f['avg_cost']:.4f}"
-        )
-    for name, m in [("Baseline", bm), ("DeepSets+XGB", fm)]:
         for slice_name, sm in m.get("by_current_cat", {}).items():
             logger.info(
-                f"  {name} [{slice_name}, n={sm['n']:,}] | "
-                f"F1: {sm['macro_f1']:.4f}  "
-                f"Cat-2 Rec: {sm.get('recall_class_2', float('nan')):.4f}  "
+                f"    {name} [{slice_name}, n={sm['n']:,}] | F1: {sm['macro_f1']:.4f}  "
                 f"Cat-3 Rec: {sm.get('recall_class_3', float('nan')):.4f}  "
                 f"Cost: {sm['avg_cost']:.4f}"
             )

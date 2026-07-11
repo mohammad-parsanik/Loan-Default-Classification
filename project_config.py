@@ -82,9 +82,35 @@ OPTIMIZE_ON_VALIDATION = True
 VAL_SPLIT_MODE        = "customer"
 CUSTOMER_VAL_FRACTION = 0.20   # share of customers held out for validation
 
-# Train the aggregated-XGBoost baseline with cost-informed sample weights
-# (inverse class frequency x cost-matrix row sum) instead of frequency only.
-BASELINE_COST_WEIGHTS = True
+# Train the multiclass arm with cost-informed sample weights (inverse class
+# frequency x cost-matrix row sum). Default OFF since the July-8 reframe:
+# the headline is cost-free ranking, the cost values are guesses, and less
+# training-time distortion leaves the calibrator less to undo. (Run 5's
+# binary comparator — no cost machinery at all — beat the cost-loss-trained
+# DeepSets pipeline on every ranking slice.)
+BASELINE_COST_WEIGHTS = False
+
+# ── Model arms (July 10 architecture switch) ─────────────
+# Run-5 verdict: XGBoost on the 257 aggregated features beats DeepSets+XGB
+# on every ranking slice. Evaluation runs train and compare these arms:
+#   "multiclass" — one multi:softprob model; full class distribution
+#   "ordinal"    — cumulative binaries P(y>k); full distribution via
+#                  differences; exploits the ordered target
+#   "per_cat"    — one model per current_cat stratum over its REACHABLE
+#                  classes {c..3}; natively monotone full distribution
+#   "binary"     — direct P(severe); ranking-ceiling diagnostic ONLY (no
+#                  per-class probabilities, so never deployed)
+MODEL_ARMS = ["multiclass", "binary", "ordinal", "per_cat"]
+
+# Deployed arm: "auto" = best pooled ranking PR-AUC among full-distribution
+# arms (business needs the per-class probabilities; sorting stays on P3).
+DEPLOY_ARM = "auto"
+
+# Legacy neural arm (DeepSets encoder + XGB meta-learner). Lost the Run-5
+# shootout on every slice; kept behind this flag for reproducibility.
+# If ever re-enabled: fix the LR schedule first (CosineAnnealingWarmRestarts
+# restarted at epoch 10 and ate the fine-tuning phase — use plain cosine).
+DEEPSETS_ENABLED = False
 
 # At predict time, refresh the probability calibrator on the most recent
 # snapshot whose labels have matured (requires train-table/cache access).

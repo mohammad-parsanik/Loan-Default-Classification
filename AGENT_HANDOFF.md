@@ -379,10 +379,28 @@ Business answers received (2026-07-08 follow-up):
 
 Still open: real cost numbers if the cost rule is ever promoted again.
 
-## 13. What's Next (Prioritized)
+## 13. Run 5 Verdict: Architecture Switch (July 10, 2026)
 
-1. **Run 5 on the server:** cache rebuilds automatically (v1.2 key + 18 snapshots ⇒ ~11M instances, expect roughly 2× Run-4 load/RAM). `python run.py train` → first numbers for the ranking headline: recall@1-day/1-week/1-month of future-severe, DeepSets-P3 vs baseline-P3 vs binary comparator, per-stratum. Also verify the 2025-12 labels were ETL-computed after 2026-06 closed (maturity filter checks dates only, not label freshness).
-2. **Re-run `explore_iv_woe.py`** after the rebuild (true IVs for the formerly-zeroed features, now 4-class OvR).
-3. **Decisions gated on Run 5:** (a) architecture — compare on the ranking block + cat_0 slice; if binary comparator ≈ DeepSets-P3, big simplification available; (b) walk-forward — if drift worry persists, 3-4 quarterly folds ≈ 6-9h; (c) carve-out threshold for near-boundary cat-2.
-4. **Deployment:** `python run.py train --final` → bundle trained through 2025-12 → `python run.py predict` (queue defaults to newest immature snapshot rows only, deduped) → hand the top of `predictions_*.csv` to the API caller at 240/h.
-5. **Reduce horizon (if business allows):** 6 → 3 months halves the gap requirements.
+Run 5 (results_5/, 18 snapshots, 12.5M instances, test=2025-12, 8.3h wall) was the first run with the ranking headline — and it settled the architecture question **against** the neural pipeline:
+
+| Arm | pooled AP | R@1w | cat_0 AP | cat_0 R@1d |
+|---|---|---|---|---|
+| Binary XGB comparator (~6 min, untuned) | **0.574** | 0.500 | 0.176 | 0.258 |
+| Multiclass XGB baseline | 0.567 | **0.501** | **0.179** | **0.262** |
+| DeepSets+XGB (~7h incl. 5.7h Optuna) | 0.541 | 0.483 | 0.127 | 0.197 |
+
+Per-stratum verification (`inspect_fold_metrics.py`, results_5/inspect_fold_matrix.txt): the trees win **every slice** — no hidden DeepSets advantage anywhere. Diagnosis: (a) the 64-d embedding is an information bottleneck between the 257 raw features and the meta-learner; (b) the cost-sensitive focal loss shapes embeddings for coarse boundary-drawing, not fine risk ordering (the cost-free binary arm winning is the natural ablation evidence); (c) minor: the warm-restart LR schedule reset at epoch 10 and ate the fine-tuning phase (training-curve image in results_5/). Multiclass ≈ binary (multiclass wins 2 of 3 strata) — and the business requires per-class probabilities, so full-distribution arms are the deployable ones.
+
+Other Run-5 findings: calibration+masking gain +3.1 F1 (argmax_cal 0.699 vs raw 0.667), Brier 0.113→0.103; val→test gap shrank to ~3.7pts (more history helps, "obsolete data" concern not supported); current-cat-2 base rate into severe = 45.8% (strong evidence for the certainty band — day-one calls mostly confirm near-certainties); cat_0 (true early warning) base 1.5%, AP ~0.18, one week of budget in-stratum catches ~80% (multiclass).
+
+**IV re-run (results_5/explore_iv.csv, 4-class, matured-only, fixed binning):** the formerly-"dead" flags are real and strong (IS_DETERIORATING 3.26, HAS_EVER_BEEN_PRENPL 2.87, HAS_EVER_BEEN_NPL 2.34) — they were always model inputs; only the old report was wrong. **Suspected ETL bug:** `IS_IN_WARNING_ZONE` and `HAS_EVER_BEEN_NPL` have byte-identical IVs across all 4 OvRs ⇒ likely identical columns; check `SELECT COUNT(*) FROM D_ANALYTICS.DPD_SAMPLE1 WHERE IS_IN_WARNING_ZONE <> HAS_EVER_BEEN_NPL` (0 ⇒ one is a copy bug and a real feature is missing). `MATURED_INST_CNT` ≈ `CONTRACT_AGE_MONTH` likewise near-identical (plausibly legitimate for monthly installments).
+
+**Implemented (July 10, tested locally — 32 tests + synthetic end-to-end fold run):** run.py now trains `MODEL_ARMS` = multiclass / binary / ordinal (cumulative P(y>k) → full distribution) / per_cat (Mohammad's idea: one model per current_cat over its reachable classes) — all on the 257 aggregated features, identical hyperparams (`XGB_DEFAULTS`), per-arm stratified calibration, per-arm+per-slice ranking logs (closing the Run-5 logging gap), all-arm capture-curve plot, `arms_metrics.json`, deployed-arm auto-selection by pooled ranking AP (binary excluded — no class distribution), deployment artifacts `model_arm.pkl` + `calibrator.pkl`. DeepSets is legacy behind `DEEPSETS_ENABLED=False` (`_train_deepsets_legacy`). Walk-forward remains implemented and compatible with the arms flow, still disabled. **Phase C pending: Predictor/ModelLoader still expect DeepSets artifacts — `predict` is broken for arm artifacts until reworked (after Run 6).**
+
+## 14. What's Next (Prioritized)
+
+1. **Run 6 on the server** (`python run.py train`, cache already v1.2 → no rebuild): the four-arm shootout, ~1-2h total. Winner (best pooled AP among full-distribution arms) is auto-selected and logged; check the cat_0 slice and the capture-curve plot before accepting it.
+2. **Phase C (Mac, after Run 6):** rework Predictor/ModelLoader/bundle for the winning arm (aggregate features → arm → stratified calibration → mask → queue); keep legacy loading for old bundles.
+3. **Walk-forward** (now ~40 min/fold): 3 quarterly folds to confirm ranking stability across 2025 — recommended before deployment since it's cheap now.
+4. **Deployment:** set `DEPLOY_ARM=<winner>` → `python run.py train --final` (trained through 2025-12) → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h.
+5. **Business items:** certainty threshold (Run-5 evidence: 88% of day-one calls confirm near-certainties), the IS_IN_WARNING_ZONE SQL check above, real cost numbers if the cost rule is ever promoted.
