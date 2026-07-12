@@ -69,6 +69,7 @@ from src.evaluation.visualization import (
     plot_roc_curves,
     plot_training_curves,
 )
+from src.inference.model_loader import build_arm_bundle
 from src.inference.predictor import Predictor
 from src.model.deep_sets import DeepSets
 from src.model.losses import CostSensitiveFocalLoss
@@ -270,7 +271,24 @@ def train_single_fold(
             arm, arm_cal, arm_metrics, test_probs = ckpt.load(stage)
         else:
             with timed(f"{fold_label}: Arm '{arm_name}'", timing):
-                arm = ARM_BUILDERS[arm_name]()
+                # Optuna tunes only the arm(s) that could actually deploy
+                # (full-distribution + matching DEPLOY_ARM, or all full-dist
+                # under "auto"); diagnostics always use XGB_DEFAULTS.
+                params = None
+                could_deploy = ARM_BUILDERS[arm_name].full_distribution and (
+                    config.DEPLOY_ARM in ("auto", arm_name)
+                )
+                if config.ARM_OPTUNA_TRIALS > 0 and could_deploy and X_val is not None:
+                    from src.baselines.aggregated_xgboost import tune_arm_params
+                    logger.info(f"{fold_label} | Optuna: tuning '{arm_name}' "
+                                f"({config.ARM_OPTUNA_TRIALS} trials, val PR-AUC of P(severe))…")
+                    params = tune_arm_params(
+                        arm_name, X_train, y_train, train_strata,
+                        X_val, y_val, val_strata,
+                        n_trials=config.ARM_OPTUNA_TRIALS,
+                        random_state=config.RANDOM_SEED,
+                    )
+                arm = ARM_BUILDERS[arm_name](params=params)
                 arm.train(X_train, y_train, train_strata, X_val, y_val, val_strata)
 
                 arm_cal = None
@@ -346,10 +364,21 @@ def train_single_fold(
 
     final_metrics = arms_results.get(deploy_name, {})
 
-    # Deployment artifacts for the Predictor (aggregated-features path)
+    # Deployment artifacts for the Predictor (aggregated-features path):
+    # per-file (directory) artifacts + a single-file bundle so the whole
+    # model can be shipped as one file (see DEPLOYMENT.md).
     joblib.dump(arm_objects[deploy_name], fold_dir / "model_arm.pkl")
     if arm_calibrators[deploy_name] is not None:
         joblib.dump(arm_calibrators[deploy_name], fold_dir / "calibrator.pkl")
+    joblib.dump(
+        build_arm_bundle(
+            preprocessor, arm_objects[deploy_name], arm_calibrators[deploy_name],
+            max_loans, features,
+        ),
+        fold_dir / "model_bundle.pkl",
+    )
+    logger.info(f"{fold_label} | Deployment bundle (arm '{deploy_name}') "
+                f"→ {fold_dir / 'model_bundle.pkl'}")
 
     # ── Deployed-arm CI + plots ───────────────────────────────────────────────
     if test_inst:
@@ -596,8 +625,8 @@ def _train_deepsets_legacy(
         "xgb_model_raw": meta_learner.xgb_model.get_booster().save_raw(raw_format="json"),
         "calibrator": bundle_calibrator,
     }
-    joblib.dump(bundle, fold_dir / "model_bundle.pkl")
-    logger.info(f"{fold_label} | Legacy DeepSets bundle saved to {fold_dir / 'model_bundle.pkl'}")
+    joblib.dump(bundle, fold_dir / "deepsets_bundle.pkl")
+    logger.info(f"{fold_label} | Legacy DeepSets bundle saved to {fold_dir / 'deepsets_bundle.pkl'}")
 
     return final_metrics, ds_history
 
@@ -722,12 +751,13 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
             log_fold_summary(aggregated)
             save_fold_summary(aggregated, run_dir / "walk_forward_summary.json")
 
-            # Surface best fold
-            best_fold = max(fold_results, key=lambda r: r["final_metrics"]["macro_f1"])
+            # Surface best fold by ranking AP (the deliverable metric)
+            def _fold_ap(r):
+                return r["final_metrics"].get("ranking", {}).get("pr_auc", float("-inf"))
+            best_fold = max(fold_results, key=_fold_ap)
             logger.info(
                 f"Best fold: Fold {best_fold['fold_id']:02d}  "
-                f"(test={best_fold['test_snap']})  "
-                f"Macro F1: {best_fold['final_metrics']['macro_f1']:.4f}"
+                f"(test={best_fold['test_snap']})  Ranking AP: {_fold_ap(best_fold):.4f}"
             )
         else:
             aggregated = {}
@@ -764,8 +794,8 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
             f"Macro F1: {best['final_metrics'].get('macro_f1', float('nan')):.4f}"
         )
         if aggregated:
-            m = aggregated["model"]["macro_f1"]
-            logger.info(f"  Mean Macro F1 (all folds): {m['mean']:.4f} ± {m['std']:.4f}")
+            ap = aggregated["aggregate"]["ranking_ap"]
+            logger.info(f"  Mean ranking AP (all folds): {ap['mean']:.4f} ± {ap['std']:.4f}")
     logger.info(f"  Total wall time: {sum(timing.values()):.0f}s")
     logger.info("=" * 60)
 

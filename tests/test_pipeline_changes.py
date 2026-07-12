@@ -348,14 +348,14 @@ def test_bundle_round_trip(tmp_path):
     import joblib
     import torch
     import xgboost as xgb
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
 
+    from src.data.preprocessing import create_preprocessing_pipeline
     from src.inference.model_loader import load_bundle
     from src.model.deep_sets import DeepSets
 
     rng = np.random.default_rng(0)
     n_features = 5
+    feat_names = [f"f{i}" for i in range(n_features)]
 
     torch.manual_seed(0)
     model = DeepSets(n_features=n_features, hidden_dim=8, embedding_dim=4,
@@ -366,23 +366,32 @@ def test_bundle_round_trip(tmp_path):
     X = rng.normal(size=(50, n_features)).astype(np.float32)
     y = rng.integers(0, config.NUM_CLASSES, 50)
 
-    scaler = Pipeline([("scale", StandardScaler())]).fit(X)
+    # Real preprocessing pipeline (accepts list[(n_loans, F)] like production)
+    scaler = create_preprocessing_pipeline(feat_names, config.BINARY_FEATURES)
+    scaler.fit([row.reshape(1, -1) for row in X])
+
+    # The legacy XGB is a META-learner on DeepSets embeddings (dim=4), not
+    # raw features — fit it on embeddings so the scorer round-trips.
+    feat_t = torch.from_numpy(X.reshape(50, 1, n_features))
+    mask_t = torch.zeros(50, 1, dtype=torch.bool)
+    with torch.no_grad():
+        emb = model.extract_embeddings(feat_t, mask_t).numpy()
 
     xgb_model = xgb.XGBClassifier(
         n_estimators=5, max_depth=2, num_class=config.NUM_CLASSES,
         objective="multi:softprob",
     )
-    xgb_model.fit(X, y)
+    xgb_model.fit(emb, y)
     xgb_raw = xgb_model.get_booster().save_raw(raw_format="json")
 
-    probs = xgb_model.predict_proba(X)
+    probs = xgb_model.predict_proba(emb)
     calibrator = PerClassIsotonicCalibrator().fit(probs, y)
 
     bundle = {
         "metadata": {
             "feature_count": n_features,
             "max_loans_per_customer_99th": 2,
-            "features": [f"f{i}" for i in range(n_features)],
+            "features": feat_names,
         },
         "scaler": scaler,
         "deep_sets_state_dict": state_dict,
@@ -393,25 +402,28 @@ def test_bundle_round_trip(tmp_path):
         "xgb_model_raw": xgb_raw,
         "calibrator": calibrator,
     }
-    bundle_path = tmp_path / "model_bundle.pkl"
+    bundle_path = tmp_path / "deepsets_bundle.pkl"
     joblib.dump(bundle, bundle_path)
 
-    (loaded_scaler, loaded_model, loaded_xgb,
-     loaded_cal, max_loans, features) = load_bundle(bundle_path, device="cpu")
+    # New contract: load_bundle → (scorer, calibrator, features). A legacy
+    # (kind-less) bundle yields a DeepSetsScorer.
+    from src.inference.model_loader import DeepSetsScorer
+    scorer, loaded_cal, features = load_bundle(bundle_path, device="cpu")
 
-    assert max_loans == 2
-    assert features == [f"f{i}" for i in range(n_features)]
-    assert np.allclose(loaded_scaler.transform(X), scaler.transform(X))
-    assert np.allclose(loaded_xgb.predict_proba(X), xgb_model.predict_proba(X))
+    assert isinstance(scorer, DeepSetsScorer)
+    assert scorer.max_loans == 2
+    assert features == feat_names
     assert np.allclose(loaded_cal.transform(probs), calibrator.transform(probs))
 
-    # DeepSets round-trips: identical output on a fixed input
-    feat_t = torch.from_numpy(rng.normal(size=(3, 2, n_features)).astype(np.float32))
-    mask_t = torch.zeros(3, 2, dtype=torch.bool)
-    with torch.no_grad():
-        orig_emb   = model(feat_t, mask_t)[1]
-        loaded_emb = loaded_model(feat_t, mask_t)[1]
-    assert torch.allclose(orig_emb, loaded_emb)
+    # The legacy scorer produces a valid class distribution end-to-end
+    insts = [
+        {"features": rng.normal(size=(1, n_features)).astype(np.float32),
+         "n_loans": 1, "current_cat": int(rng.integers(config.NUM_CLASSES))}
+        for _ in range(6)
+    ]
+    out = scorer.raw_probs(insts)
+    assert out.shape == (6, config.NUM_CLASSES)
+    assert np.allclose(out.sum(axis=1), 1.0, atol=1e-5)
 
 
 def test_model_loader_dispatches_to_bundle_when_path_is_a_file(tmp_path, monkeypatch):
@@ -698,3 +710,87 @@ def test_arm_builders_registry_matches_config():
         assert name in ARM_BUILDERS, f"config arm '{name}' has no builder"
     deployable = [n for n in config.MODEL_ARMS if ARM_BUILDERS[n].full_distribution]
     assert deployable, "at least one full-distribution arm must be configured"
+
+
+# ── Phase C: arm scorer / bundle / ranking-aware aggregator (July 11) ──────────
+
+def _fit_arm_and_scaler(seed=1):
+    """Train a multiclass arm the way run.py does; return (scaler, arm, cal, pred_raw)."""
+    from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
+    from src.evaluation.calibration import StratifiedCalibrator
+    from src.data.preprocessing import create_preprocessing_pipeline
+
+    train = _arm_instances(3000, seed)
+    val   = _arm_instances(1000, seed + 1)
+    pred  = _arm_instances(400, seed + 2)          # keeps RAW features
+    feats = ["DPD_DAYS"] + [f"F{j}" for j in range(5)]
+
+    scaler = create_preprocessing_pipeline(feats, config.BINARY_FEATURES)
+    scaler.fit([i["features"] for i in train])
+    for split in (train, val):
+        for inst, x in zip(split, scaler.transform([i["features"] for i in split])):
+            inst["features"] = x
+
+    X_tr, y_tr = aggregate_features(train)
+    X_v,  y_v  = aggregate_features(val)
+    cat_tr = np.array([i["current_cat"] for i in train])
+    cat_v  = np.array([i["current_cat"] for i in val])
+    arm = ARM_BUILDERS["multiclass"]()
+    arm.train(X_tr, y_tr, cat_tr, X_v, y_v, cat_v)
+    cal = StratifiedCalibrator(min_stratum_n=200).fit(arm.predict_proba(X_v, cat_v), y_v, cat_v)
+    return scaler, arm, cal, feats, pred
+
+
+def test_arm_scorer_bundle_and_dir_roundtrip(tmp_path):
+    import joblib
+    from src.inference.model_loader import build_arm_bundle, ModelLoader, ArmScorer
+
+    scaler, arm, cal, feats, pred = _fit_arm_and_scaler()
+    ref = ArmScorer(scaler, arm, max_loans=2).raw_probs(pred)
+
+    # Bundle round-trip
+    joblib.dump(build_arm_bundle(scaler, arm, cal, 2, feats), tmp_path / "model_bundle.pkl")
+    scorer_b, cal_b, feats_b = ModelLoader(tmp_path / "model_bundle.pkl").load_pipeline()
+    assert np.allclose(ref, scorer_b.raw_probs(pred), atol=1e-6)
+    assert feats_b == feats and cal_b is not None
+    assert ref.shape == (400, config.NUM_CLASSES) and np.allclose(ref.sum(1), 1.0, atol=1e-5)
+
+    # Directory round-trip (prefers model_arm.pkl over legacy deepsets)
+    import json
+    d = tmp_path / "dir"
+    d.mkdir()
+    joblib.dump(arm, d / "model_arm.pkl")
+    joblib.dump(scaler, d / "scaler.pkl")
+    joblib.dump(cal, d / "calibrator.pkl")
+    (d / "metadata.json").write_text(json.dumps(
+        {"feature_count": 6, "max_loans_per_customer_99th": 2, "features": feats}))
+    scorer_d, _, _ = ModelLoader(d).load_pipeline()
+    assert np.allclose(ref, scorer_d.raw_probs(pred), atol=1e-6)
+
+
+def test_fold_aggregator_summarizes_ranking(monkeypatch):
+    from src.evaluation.fold_aggregator import aggregate_fold_metrics
+
+    monkeypatch.setattr(config, "RANKING_REF_WINDOWS", {"1_day": 24, "1_week": 168})
+
+    def fold(fid, ap, r_week):
+        return {"fold_id": fid, "test_snap": 20250000 + fid, "deployed_arm": "multiclass",
+                "final_metrics": {"macro_f1": 0.6, "ranking": {
+                    "pr_auc": ap,
+                    "at_1_day": {"recall": 0.1},
+                    "at_1_week": {"recall": r_week}}}}
+
+    agg = aggregate_fold_metrics([fold(1, 0.55, 0.50), fold(2, 0.57, 0.52), fold(3, 0.53, 0.48)])
+    assert agg["n_folds"] == 3
+    assert abs(agg["aggregate"]["ranking_ap"]["mean"] - 0.55) < 1e-9
+    assert agg["aggregate"]["ranking_ap"]["min"] == 0.53
+    assert abs(agg["aggregate"]["recall_1_week"]["mean"] - 0.50) < 1e-9
+    assert agg["aggregate"]["ranking_ap"]["n"] == 3
+
+
+def test_arm_accepts_tuned_params_override():
+    from src.baselines.aggregated_xgboost import AggregatedXGBoostBaseline, XGB_DEFAULTS
+
+    arm = AggregatedXGBoostBaseline(params={"max_depth": 9, "n_estimators": 111})
+    assert arm.params["max_depth"] == 9 and arm.params["n_estimators"] == 111
+    assert arm.params["subsample"] == XGB_DEFAULTS["subsample"]   # unspecified keys keep defaults

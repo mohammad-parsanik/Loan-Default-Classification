@@ -89,8 +89,10 @@ class AggregatedXGBoostBaseline:
     name = "multiclass"
     full_distribution = True
 
-    def __init__(self, random_state: int = 42):
+    def __init__(self, random_state: int = 42, params: Optional[dict] = None):
         self.random_state = random_state
+        # params overrides XGB_DEFAULTS (e.g. Optuna-tuned); None = defaults
+        self.params = {**XGB_DEFAULTS, **(params or {})}
         self.model: Optional[xgb.XGBClassifier] = None
 
     @staticmethod
@@ -118,7 +120,7 @@ class AggregatedXGBoostBaseline:
             objective="multi:softprob",
             num_class=config.NUM_CLASSES,
             random_state=self.random_state,
-            **XGB_DEFAULTS,
+            **self.params,
         )
         self.model.fit(
             X_train, y_train,
@@ -156,7 +158,7 @@ class BinarySevereBaseline(AggregatedXGBoostBaseline):
             objective="binary:logistic",
             scale_pos_weight=(len(y_bin) - n_pos) / n_pos,
             random_state=self.random_state,
-            **XGB_DEFAULTS,
+            **self.params,
         )
         self.model.fit(X_train, y_bin, verbose=False)
         logger.info("Binary arm training complete.")
@@ -191,7 +193,7 @@ class OrdinalXGBArm(AggregatedXGBoostBaseline):
                 objective="binary:logistic",
                 scale_pos_weight=(len(y_gt) - n_pos) / n_pos,
                 random_state=self.random_state,
-                **XGB_DEFAULTS,
+                **self.params,
             )
             mdl.fit(X_train, y_gt, verbose=False)
             self.models.append(mdl)
@@ -246,12 +248,12 @@ class PerCatXGBArm(AggregatedXGBoostBaseline):
             if len(observed) == 2:
                 mdl = xgb.XGBClassifier(
                     objective="binary:logistic",
-                    random_state=self.random_state, **XGB_DEFAULTS,
+                    random_state=self.random_state, **self.params,
                 )
             else:
                 mdl = xgb.XGBClassifier(
                     objective="multi:softprob",
-                    random_state=self.random_state, **XGB_DEFAULTS,
+                    random_state=self.random_state, **self.params,
                 )
             mdl.fit(X_train[mask], y_shift, verbose=False)
             self.models[c] = mdl
@@ -292,6 +294,53 @@ ARM_BUILDERS = {
     "ordinal":    OrdinalXGBArm,
     "per_cat":    PerCatXGBArm,
 }
+
+
+def tune_arm_params(
+    arm_name: str,
+    X_train, y_train, cat_train,
+    X_val, y_val, cat_val,
+    n_trials: int,
+    random_state: int = 42,
+) -> dict:
+    """
+    Optuna search over XGBoost hyperparameters for `arm_name`, maximising
+    PR-AUC of P(severe) on the validation set — the actual deliverable
+    objective (NOT macro F1; Run 5 tuned the wrong number and wasted 5.7h).
+
+    Returns the best-params dict to pass into the arm's constructor. Only
+    meaningful for full-distribution arms; the binary arm is a diagnostic
+    and is not tuned. optuna is imported lazily (server-only dependency).
+    """
+    import optuna
+    from sklearn.metrics import average_precision_score
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    builder = ARM_BUILDERS[arm_name]
+    severe = config.NUM_CLASSES - 1
+    y_val_bin = (y_val == severe).astype(np.int32)
+
+    def objective(trial):
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 900, step=100),
+            "max_depth":        trial.suggest_int("max_depth", 3, 8),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            "n_jobs":           -1,
+        }
+        arm = builder(random_state=random_state, params=params)
+        arm.train(X_train, y_train, cat_train)
+        p_sev = arm.predict_proba(X_val, cat_val)[:, -1]
+        return average_precision_score(y_val_bin, p_sev)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    logger.info(f"Optuna[{arm_name}]: best val PR-AUC(severe) = {study.best_value:.4f}")
+    logger.info(f"Optuna[{arm_name}]: best params = {study.best_params}")
+    return {**study.best_params, "n_jobs": -1}
 
 
 if __name__ == "__main__":

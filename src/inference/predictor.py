@@ -1,5 +1,7 @@
 """
-End-to-end scoring pipeline using the trained DeepSets + XGBoost pipeline.
+End-to-end scoring pipeline. The model itself (XGBoost arm, or legacy
+DeepSets) is abstracted behind a Scorer loaded by ModelLoader; this module
+only turns raw probabilities into the deliverable.
 
 Output is the ranked API queue: customers not yet severe, ordered by
 calibrated+masked P(entering the severe class), consumed at
@@ -20,8 +22,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import torch
-from tqdm import tqdm
 
 import project_config as config
 from src.data.data_loader import DataLoader
@@ -84,43 +84,15 @@ class Predictor:
 
     def __init__(self, artifact_dir):
         self.loader = ModelLoader(Path(artifact_dir))
-        (self.scaler, self.model, self.xgb_model,
-         self.calibrator, self.max_loans, _) = self.loader.load_pipeline()
-        self.device = self.loader.device
+        self.scorer, self.calibrator, _ = self.loader.load_pipeline()
+        self.max_loans = self.scorer.max_loans
         self.data_loader = DataLoader()
 
     # ── Internal scoring path (shared by predict & recalibration) ────────────
 
     def _predict_probs(self, instances: list[dict]) -> np.ndarray:
-        """instances → preprocess → DeepSets embeddings → raw XGBoost probs."""
-        X_raw    = [inst["features"] for inst in instances]
-        X_scaled = self.scaler.transform(X_raw)
-
-        batch_size  = 512
-        n_features  = X_scaled[0].shape[1]
-        all_embeddings = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for i in tqdm(range(0, len(X_scaled), batch_size), desc="Embedding batches"):
-                batch_X = X_scaled[i : i + batch_size]
-                n = len(batch_X)
-
-                padded = np.zeros((n, self.max_loans, n_features), dtype=np.float32)
-                mask   = np.ones((n, self.max_loans), dtype=bool)
-
-                for j, arr in enumerate(batch_X):
-                    seq_len = min(len(arr), self.max_loans)
-                    padded[j, :seq_len] = arr[:seq_len]
-                    mask[j, :seq_len]   = False
-
-                t_feat = torch.from_numpy(padded).to(self.device)
-                t_mask = torch.from_numpy(mask).to(self.device)
-
-                emb = self.model.extract_embeddings(t_feat, t_mask)
-                all_embeddings.append(emb.cpu().numpy())
-
-        return self.xgb_model.predict_proba(np.vstack(all_embeddings))
+        """instances → raw (uncalibrated) class probabilities via the scorer."""
+        return self.scorer.raw_probs(instances)
 
     # ── Calibration refresh ───────────────────────────────────────────────────
 

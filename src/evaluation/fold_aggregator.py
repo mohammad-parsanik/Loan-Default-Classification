@@ -1,170 +1,109 @@
 """
 Fold metric aggregation for Walk-Forward Validation.
 
-Collects per-fold results and produces:
-  - A fold-by-fold comparison table (logged + saved as JSON)
-  - Aggregate statistics: mean, std, min, max across folds
+Summarises the DEPLOYED arm's performance across folds — the headline is
+the ranking block (pooled PR-AUC of P(severe) + recall at each API budget
+window), since that is the deliverable. Macro F1 is kept as a secondary
+classification check. Walk-forward grades the *recipe* (mean ± std across
+time); the shipped model is a separate `train --final` fit on all data.
 """
 
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 import numpy as np
 
+import project_config as config
+
 logger = logging.getLogger(__name__)
 
-# Metrics tracked across folds
-_TRACKED_METRICS = [
-    "macro_f1",
-    "qwk",
-    "accuracy",
-    "recall_class_0",
-    "recall_class_1",
-    "recall_class_2",
-    "recall_class_3",
-    "brier_score",
-    "avg_cost",
-]
 
-_BASELINE_TRACKED = ["macro_f1", "qwk", "brier_score"]
+def _fold_ranking_row(fm: dict) -> dict:
+    """Flatten a fold's deployed-arm metrics into scalar columns."""
+    rk = fm.get("ranking", {})
+    row = {
+        "ranking_ap": float(rk.get("pr_auc", float("nan"))),
+        "macro_f1":   float(fm.get("macro_f1", float("nan"))),
+    }
+    for w in config.RANKING_REF_WINDOWS:
+        block = rk.get(f"at_{w}", {})
+        row[f"recall_{w}"] = float(block.get("recall", float("nan")))
+    return row
 
 
-def aggregate_fold_metrics(
-    fold_results: List[Dict],
-) -> Dict:
+def _stats(values: list) -> dict:
+    arr = np.array([v for v in values if v == v], dtype=float)   # drop nan
+    if len(arr) == 0:
+        return {"mean": float("nan"), "std": float("nan"),
+                "min": float("nan"), "max": float("nan"), "n": 0}
+    return {"mean": float(arr.mean()), "std": float(arr.std()),
+            "min": float(arr.min()), "max": float(arr.max()), "n": int(len(arr))}
+
+
+def aggregate_fold_metrics(fold_results: List[Dict]) -> Dict:
     """
-    Aggregate per-fold metrics into summary statistics.
+    Aggregate per-fold deployed-arm metrics into summary statistics.
 
-    Parameters
-    ----------
-    fold_results : list[dict]
-        Each element must contain:
-          - "fold_id"          : int
-          - "train_snaps"      : list
-          - "val_snap"         : comparable
-          - "test_snap"        : comparable
-          - "final_metrics"    : dict  (DeepSets+XGBoost metrics on test)
-          - "baseline_metrics" : dict  (Aggregated XGBoost baseline metrics)
-
-    Returns
-    -------
-    dict with keys:
-      "folds"     : list[dict]  — per-fold summary rows
-      "model"     : dict        — aggregate stats for DeepSets+XGBoost
-      "baseline"  : dict        — aggregate stats for baseline
+    Each fold_result needs "fold_id", "test_snap", "deployed_arm" and
+    "final_metrics" (the deployed arm's full_evaluation dict).
     """
     if not fold_results:
         return {}
 
+    metric_cols = ["ranking_ap", "macro_f1"] + [f"recall_{w}" for w in config.RANKING_REF_WINDOWS]
     per_fold_rows = []
     for r in fold_results:
         row = {
-            "fold_id":     r["fold_id"],
-            "train_snaps": sorted(r["train_snaps"]),
-            "val_snap":    r["val_snap"],
-            "test_snap":   r["test_snap"],
+            "fold_id":      r["fold_id"],
+            "test_snap":    r.get("test_snap"),
+            "deployed_arm": r.get("deployed_arm"),
+            **_fold_ranking_row(r.get("final_metrics", {})),
         }
-        fm = r.get("final_metrics", {})
-        bm = r.get("baseline_metrics", {})
-        for m in _TRACKED_METRICS:
-            row[f"model_{m}"]    = float(fm.get(m, float("nan")))
-            row[f"baseline_{m}"] = float(bm.get(m, float("nan")))
         per_fold_rows.append(row)
 
-    def _stats(values: list) -> dict:
-        arr = np.array([v for v in values if not np.isnan(v)], dtype=float)
-        if len(arr) == 0:
-            return {"mean": float("nan"), "std": float("nan"),
-                    "min": float("nan"), "max": float("nan"), "n": 0}
-        return {
-            "mean": float(np.mean(arr)),
-            "std":  float(np.std(arr)),
-            "min":  float(np.min(arr)),
-            "max":  float(np.max(arr)),
-            "n":    int(len(arr)),
-        }
-
-    model_agg    = {m: _stats([r[f"model_{m}"]    for r in per_fold_rows]) for m in _TRACKED_METRICS}
-    baseline_agg = {m: _stats([r[f"baseline_{m}"] for r in per_fold_rows]) for m in _TRACKED_METRICS}
-
-    return {
-        "n_folds":  len(fold_results),
-        "folds":    per_fold_rows,
-        "model":    model_agg,
-        "baseline": baseline_agg,
-    }
+    agg = {m: _stats([row[m] for row in per_fold_rows]) for m in metric_cols}
+    return {"n_folds": len(fold_results), "folds": per_fold_rows, "aggregate": agg}
 
 
 def log_fold_summary(aggregated: Dict) -> None:
-    """
-    Pretty-print a fold-by-fold and aggregate summary table to the logger.
-    """
     if not aggregated:
         logger.warning("No fold results to summarise.")
         return
 
     n = aggregated["n_folds"]
+    week_key = "recall_1_week" if "recall_1_week" in aggregated["aggregate"] else None
     logger.info("=" * 70)
-    logger.info(f"  Walk-Forward Summary  ({n} fold{'s' if n != 1 else ''})")
+    logger.info(f"  Walk-Forward Summary  ({n} fold{'s' if n != 1 else ''}) — deployed arm, ranking headline")
     logger.info("=" * 70)
-
-    # Per-fold rows
-    logger.info(f"  {'Fold':>4}  {'Test Snap':>12}  {'Baseline F1':>11}  {'Model F1':>8}  {'Delta':>7}")
-    logger.info("  " + "-" * 52)
+    logger.info(f"  {'Fold':>4}  {'Test Snap':>12}  {'Arm':>10}  {'Ranking AP':>10}  {'R@1week':>8}")
+    logger.info("  " + "-" * 54)
     for row in aggregated["folds"]:
-        b_f1 = row.get("baseline_macro_f1", float("nan"))
-        m_f1 = row.get("model_macro_f1",    float("nan"))
-        delta = m_f1 - b_f1 if not (np.isnan(b_f1) or np.isnan(m_f1)) else float("nan")
-        delta_str = f"{delta:+.4f}" if not np.isnan(delta) else "   N/A"
         logger.info(
             f"  {row['fold_id']:>4}  {str(row['test_snap']):>12}  "
-            f"{b_f1:>11.4f}  {m_f1:>8.4f}  {delta_str:>7}"
+            f"{str(row['deployed_arm']):>10}  {row['ranking_ap']:>10.4f}  "
+            f"{row.get('recall_1_week', float('nan')):>8.4f}"
         )
 
-    # Aggregate stats
-    logger.info("  " + "-" * 52)
-    m_stats = aggregated["model"]["macro_f1"]
-    b_stats = aggregated["baseline"]["macro_f1"]
-    logger.info(f"  {'Mean':>4}  {'':>12}  {b_stats['mean']:>11.4f}  {m_stats['mean']:>8.4f}")
-    logger.info(f"  {'Std':>4}  {'':>12}  {b_stats['std']:>11.4f}  {m_stats['std']:>8.4f}")
-    logger.info(f"  {'Min':>4}  {'':>12}  {b_stats['min']:>11.4f}  {m_stats['min']:>8.4f}")
-    logger.info(f"  {'Max':>4}  {'':>12}  {b_stats['max']:>11.4f}  {m_stats['max']:>8.4f}")
-
-    # Key metrics summary
-    logger.info("  " + "-" * 52)
-    logger.info("  Key metrics (mean ± std across folds):")
-    for metric in ["macro_f1", "qwk", "recall_class_2", "recall_class_3", "brier_score"]:
-        ms = aggregated["model"].get(metric, {})
-        if ms:
+    logger.info("  " + "-" * 54)
+    logger.info("  Across folds (mean ± std [min – max]):")
+    for metric, s in aggregated["aggregate"].items():
+        if s["n"]:
             logger.info(
-                f"    {metric:<20}: {ms['mean']:.4f} ± {ms['std']:.4f}  "
-                f"[{ms['min']:.4f} – {ms['max']:.4f}]"
+                f"    {metric:<16}: {s['mean']:.4f} ± {s['std']:.4f}  "
+                f"[{s['min']:.4f} – {s['max']:.4f}]"
             )
     logger.info("=" * 70)
 
 
-def save_fold_summary(
-    aggregated: Dict,
-    save_path: Path,
-) -> None:
-    """
-    Serialise the aggregated fold results to a JSON file.
-
-    Parameters
-    ----------
-    aggregated : dict
-        Output from aggregate_fold_metrics().
-    save_path : Path
-        Destination file (e.g. run_dir / "walk_forward_summary.json").
-    """
+def save_fold_summary(aggregated: Dict, save_path: Path) -> None:
     def _safe(obj):
         if isinstance(obj, dict):
             return {k: _safe(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
             return [_safe(v) for v in obj]
-        if isinstance(obj, float) and np.isnan(obj):
+        if isinstance(obj, float) and obj != obj:
             return None
         if isinstance(obj, (np.integer,)):
             return int(obj)

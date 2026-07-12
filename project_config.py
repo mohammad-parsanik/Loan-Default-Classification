@@ -104,7 +104,17 @@ MODEL_ARMS = ["multiclass", "binary", "ordinal", "per_cat"]
 
 # Deployed arm: "auto" = best pooled ranking PR-AUC among full-distribution
 # arms (business needs the per-class probabilities; sorting stays on P3).
-DEPLOY_ARM = "auto"
+# Locked to "multiclass" after the Run-6 shootout (all four arms within
+# ~1pt AP; multiclass best pooled AND best on the cat_0 early-warning
+# slice). Re-run with "auto" to re-open the comparison in a few months.
+DEPLOY_ARM = "multiclass"
+
+# Optuna trials for tuning the DEPLOYED arm's XGBoost hyperparameters on
+# the customer-disjoint val set, maximising PR-AUC of P(severe) — the
+# actual deliverable objective (Run 5 wasted 5.7h tuning macro F1, the
+# wrong number). 0 = disabled (arms use XGB_DEFAULTS). Only the arm(s)
+# that could deploy are tuned; diagnostic arms always use defaults.
+ARM_OPTUNA_TRIALS = 0
 
 # Legacy neural arm (DeepSets encoder + XGB meta-learner). Lost the Run-5
 # shootout on every slice; kept behind this flag for reproducibility.

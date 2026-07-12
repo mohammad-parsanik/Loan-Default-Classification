@@ -411,10 +411,29 @@ Second, compounding issue found by inspection: the arms refactor called the (alr
 
 **Net effect:** a run that was on track for 2+ hours (checkpoint tax already paid + ~4 arms × redundant aggregation + real fit time) should now complete in roughly the real compute time alone — order ~1h for the four-arm shootout at current data scale.
 
-## 15. What's Next (Prioritized)
+## 15. Run 6 Verdict + Ship-Readiness (July 11, 2026)
 
-1. **Run 6 on the server** (`python run.py train`, cache already v1.2 → no rebuild): the four-arm shootout should now take roughly the sum of the arms' actual XGBoost fit times, without the pickling/redundant-aggregation tax. Winner (best pooled AP among full-distribution arms) is auto-selected and logged; check the cat_0 slice and the capture-curve plot before accepting it.
-2. **Phase C (Mac, after Run 6):** rework Predictor/ModelLoader/bundle for the winning arm (aggregate features → arm → stratified calibration → mask → queue); keep legacy loading for old bundles.
-3. **Walk-forward** (now cheap): 3 quarterly folds to confirm ranking stability across 2025 — recommended before deployment.
-4. **Deployment:** set `DEPLOY_ARM=<winner>` → `python run.py train --final` (trained through 2025-12) → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h.
-5. **Business items:** certainty threshold (Run-5 evidence: 88% of day-one calls confirm near-certainties), the IS_IN_WARNING_ZONE SQL check above, real cost numbers if the cost rule is ever promoted.
+Run 6 (results_6/, 54 min vs Run-5's 8.3h) ran the four-arm shootout on the same split (test 2025-12). All four arms within ~1pt pooled AP — the decomposition barely matters once it's boosted trees + stratified calibration + masking:
+
+| Arm | pooled AP | cat_0 AP | cat_1 AP | cat_2 AP |
+|---|---|---|---|---|
+| **multiclass** (deployed) | **0.5761** | **0.1737** | 0.3281 | 0.7442 |
+| per_cat | 0.5759 | 0.1604 | 0.3295 | 0.7441 |
+| binary (diagnostic) | 0.5700 | 0.1704 | 0.3165 | 0.7373 |
+| ordinal | 0.5660 | 0.1705 | 0.3188 | 0.7379 |
+
+Multiclass wins pooled AND the cat_0 early-warning slice — auto-selected, now **locked** (`DEPLOY_ARM="multiclass"`). Notable: per_cat (Mohammad's per-category idea) ties overall but is *worst* on cat_0 (0.160) — the specialist can't borrow deterioration signal from other strata, while the pooled model + masking + per-stratum calibration + `LOAN_CATEGORY` feature already capture the conditional structure. Dropping cost weights (BASELINE_COST_WEIGHTS=False) lifted multiclass +1pt AP vs Run 5 (0.5665→0.5761). `IS_IN_WARNING_ZONE == HAS_EVER_BEEN_NPL` confirmed identical *by definition* (not an ETL bug) — a harmless redundant column.
+
+**Implemented July 11 (36 tests + synthetic end-to-end fold & deploy round-trip):**
+- **Phase C DONE** — `predict` now works with arm artifacts. `ModelLoader.load_pipeline()` → `(scorer, calibrator, features)`; `Scorer` abstraction (`ArmScorer`: scale → `aggregate_features` → `arm.predict_proba`, no torch; `DeepSetsScorer` legacy). `Predictor` uses `scorer.raw_probs`. Directory loader prefers `model_arm.pkl`; single-file `model_bundle.pkl` (kind="arm") is the shippable artifact; legacy bundle renamed `deepsets_bundle.pkl`.
+- **`DEPLOY_ARM="multiclass"` locked**; `ARM_OPTUNA_TRIALS` (default 0) tunes the deployed arm on val PR-AUC of P(severe) via `tune_arm_params` (lazy optuna) — objective is the deliverable, not macro F1.
+- **Fold aggregator reworked** for the ranking headline (mean±std of pooled AP + recall@windows across folds); WF best-fold now by AP. Walk-forward stays implemented, still disabled.
+- **`DEPLOYMENT.md`** — the train → (walk-forward check) → `--final` → move `model_bundle.pkl` → `predict` runbook with output-column reference and the call-ledger format.
+
+## 16. What's Next (Prioritized)
+
+1. **Quick temp run (optional, Mac/server):** with `WALK_FORWARD_ENABLED=False`, `ARM_OPTUNA_TRIALS=0` — a fast `python run.py train` sanity pass on the new arm-only + Phase-C code before the real runs.
+2. **Walk-forward stability check** (`DEPLOYMENT.md` step 2): `WALK_FORWARD_ENABLED=True`, `MODEL_ARMS=["multiclass","binary"]`, ~40 min/fold → `walk_forward_summary.json` mean±std of ranking AP across 2025. Revert both settings after.
+3. **Optuna** (optional): set `ARM_OPTUNA_TRIALS=20` for a tuned `--final` fit — headroom likely small given how tightly the arms cluster.
+4. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order).
+5. **Business items (non-blocking):** `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted; survivorship in the ETL sample remains the main open data question.
