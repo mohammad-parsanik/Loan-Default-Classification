@@ -63,22 +63,48 @@ single-file bundle. Output dir is `artifacts/<timestamp>_final/fold_01/`.
 
 ## 4. Hand off the model
 
-The one file production needs:
+`model_bundle.pkl` (fitted scaler + XGBoost arm + stratified calibrator +
+metadata) is the **data** — the trained parameters. It is NOT a standalone
+program: unpickling it requires this project's Python class definitions
+(the scaler/arm/calibrator classes are custom objects referenced by module
+path) plus matching `numpy`/`scikit-learn`/`xgboost` versions. Two handoff
+patterns depending on the recipient:
 
+**A. They'll run this repo** (simplest — same team, or comfortable with the
+full project): copy the whole repo plus the bundle; they run
+`python run.py predict --artifact_dir model_bundle.pkl` same as you do.
+
+**B. They're plugging scoring into another system** (a service, a different
+codebase, no interest in the training pipeline): build a minimal standalone
+package — no torch, no optuna, no DB driver, no training code:
+
+```bash
+python build_scoring_package.py --bundle artifacts/<ts>_final/fold_01/model_bundle.pkl \
+                                --output scoring_package/
 ```
-artifacts/<timestamp>_final/fold_01/model_bundle.pkl
+
+This copies the ~16 source files scoring actually needs (not `run.py`, not
+`src/model/*` DeepSets code, not the evaluation/plotting modules) plus the
+bundle, a `requirements-scoring.txt` (`numpy`, `pandas`, `scikit-learn`,
+`xgboost`, `joblib` — nothing else), and a `README_SCORING.md` into one
+folder. Hand that folder to the other team; they call:
+
+```python
+from src.inference.predictor import score_dataframe
+queue = score_dataframe(df, "model_bundle.pkl")   # df: same columns as TRAIN_TABLE
 ```
 
-It is self-contained: fitted scaler + XGBoost arm + stratified calibrator +
-metadata (feature list, MAX_LOANS, num_classes). Copy it wherever scoring
-runs. No torch, no DeepSets, no separate files required.
+No database access, no `run.py`, no knowledge of this project's training
+code required — verified by an automated test that scores in a subprocess
+with this repo removed from `sys.path` and `torch`/`optuna` blocked at
+import time (`tests/test_pipeline_changes.py::test_build_scoring_package_runs_standalone`).
 
-> The same directory also holds the unbundled artifacts (`model_arm.pkl`,
-> `scaler.pkl`, `calibrator.pkl`, `metadata.json`); the `Predictor` can load
-> from either the directory **or** the bundle file — pass whichever path to
-> `--artifact_dir`.
+> The fold directory (not just the bundle) also holds the unbundled
+> artifacts (`model_arm.pkl`, `scaler.pkl`, `calibrator.pkl`,
+> `metadata.json`); `Predictor`/`ModelLoader` accept either the directory
+> **or** the single bundle file.
 
-## 5. Generate the queue
+## 5. Generate the queue (from this repo, pattern A)
 
 ```bash
 python run.py predict --artifact_dir artifacts/<ts>_final/fold_01/model_bundle.pkl \

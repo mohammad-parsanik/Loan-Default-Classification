@@ -13,6 +13,7 @@ Tests for the leakage/evaluation changes (July 2026):
 """
 
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -794,3 +795,138 @@ def test_arm_accepts_tuned_params_override():
     arm = AggregatedXGBoostBaseline(params={"max_depth": 9, "n_estimators": 111})
     assert arm.params["max_depth"] == 9 and arm.params["n_estimators"] == 111
     assert arm.params["subsample"] == XGB_DEFAULTS["subsample"]   # unspecified keys keep defaults
+
+
+# ── standalone scoring package (July 11) ────────────────────────────────────────
+
+def _synth_score_df(n, seed, with_target=True):
+    rng_l = np.random.default_rng(seed)
+    cat = rng_l.choice([0, 1, 2, 3], n, p=[.55, .25, .12, .08]).astype(float)
+    label = np.minimum(cat + rng_l.choice([0, 0, 1, 2], n), 3)
+    d = {
+        "LOAN_ID": np.arange(n), "CONTRACT_NUMBER": [f"c{seed}_{i}" for i in range(n)],
+        "NATIONAL_CODE": [f"n{seed}_{i}" for i in range(n)],
+        "SNAPSHOT_DATE": [20250101.0] * n,
+        "DPD_DAYS": label + rng_l.normal(0, .8, n),
+        "LOAN_CATEGORY": cat,
+        "F1": rng_l.normal(size=n), "F2": rng_l.normal(size=n),
+        "F3": rng_l.normal(size=n), "F4": rng_l.normal(size=n),
+    }
+    if with_target:
+        d["WORST_FUTURE_DPD"] = np.zeros(n)
+        d["WORST_FUTURE_CAT"] = label
+    return pd.DataFrame(d)
+
+
+def _fit_bundle_via_dataframe(tmp_path):
+    """Train scaler+arm+calibrator the way the real pipeline does: raw df ->
+    process_raw_data -> aggregate_features -> arm.train. Returns bundle_path."""
+    import joblib
+    from src.data.data_loader import DataLoader
+    from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
+    from src.evaluation.calibration import StratifiedCalibrator
+    from src.data.preprocessing import create_preprocessing_pipeline
+    from src.inference.model_loader import build_arm_bundle
+
+    dl = DataLoader()
+    train_inst, feats = dl.process_raw_data(_synth_score_df(1500, 1), max_loans=2)
+    val_inst, _        = dl.process_raw_data(_synth_score_df(600, 2), max_loans=2)
+
+    scaler = create_preprocessing_pipeline(feats, config.BINARY_FEATURES)
+    scaler.fit([i["features"] for i in train_inst])
+    for split in (train_inst, val_inst):
+        for inst, x in zip(split, scaler.transform([i["features"] for i in split])):
+            inst["features"] = x
+
+    Xtr, ytr = aggregate_features(train_inst)
+    Xv, yv   = aggregate_features(val_inst)
+    cattr = np.array([i["current_cat"] for i in train_inst])
+    catv  = np.array([i["current_cat"] for i in val_inst])
+    arm = ARM_BUILDERS["multiclass"]()
+    arm.train(Xtr, ytr, cattr, Xv, yv, catv)
+    cal = StratifiedCalibrator(min_stratum_n=100).fit(arm.predict_proba(Xv, catv), yv, catv)
+
+    bundle_path = tmp_path / "model_bundle.pkl"
+    joblib.dump(build_arm_bundle(scaler, arm, cal, 2, feats), bundle_path)
+    return bundle_path
+
+
+def test_score_dataframe_matches_predictor_shape(tmp_path):
+    from src.inference.predictor import score_dataframe
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)
+    pred_df = _synth_score_df(30, 9, with_target=False)
+    q = score_dataframe(pred_df, bundle_path)
+
+    assert len(q) == 30
+    for col in ["RISK_RANK", "RISK_SCORE", "RULE_FLAG", "CURRENT_CAT",
+               "P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE"]:
+        assert col in q.columns
+    probs = q[["P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE"]].to_numpy()
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-4)
+    # Ranked rows come first, sorted by RISK_SCORE descending
+    ranked = q[q["RULE_FLAG"] == ""]
+    assert (ranked["RISK_SCORE"].diff().dropna() <= 1e-9).all()
+
+
+def test_score_dataframe_calibration_refresh(tmp_path):
+    from src.inference.predictor import score_dataframe
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)
+    pred_df = _synth_score_df(20, 11, with_target=False)
+    cal_df  = _synth_score_df(500, 12, with_target=True)   # matured, labeled
+
+    q = score_dataframe(pred_df, bundle_path, calibration_df=cal_df)
+    assert len(q) == 20
+    probs = q[["P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE"]].to_numpy()
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-4)
+
+
+def test_build_scoring_package_runs_standalone(tmp_path):
+    """
+    The real proof: package the model, then score in a SEPARATE process with
+    this repo removed from sys.path and torch/optuna/umap/pyodbc blocked at
+    import time. If the package secretly depended on any of them, this fails.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)
+    pkg_out = tmp_path / "scoring_package"
+    repo_root = Path(__file__).resolve().parent.parent
+
+    r = subprocess.run(
+        [sys.executable, str(repo_root / "build_scoring_package.py"),
+         "--bundle", str(bundle_path), "--output", str(pkg_out)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert (pkg_out / "model_bundle.pkl").exists()
+    assert (pkg_out / "requirements-scoring.txt").exists()
+    assert (pkg_out / "README_SCORING.md").exists()
+
+    pred_csv = tmp_path / "score_input.csv"
+    _synth_score_df(15, 20, with_target=False).to_csv(pred_csv, index=False)
+
+    script = textwrap.dedent(f"""
+        import sys
+        sys.path = [p for p in sys.path if {str(repo_root)!r} not in p]
+        sys.path.insert(0, {str(pkg_out)!r})
+
+        class _Blocked:
+            def find_module(self, name, path=None):
+                if name.split(".")[0] in ("torch", "optuna", "umap", "pyodbc"):
+                    raise ImportError(f"BLOCKED: {{name}}")
+        sys.meta_path.insert(0, _Blocked())
+
+        import pandas as pd
+        from src.inference.predictor import score_dataframe
+        df = pd.read_csv({str(pred_csv)!r})
+        q = score_dataframe(df, {str(pkg_out / "model_bundle.pkl")!r})
+        assert len(q) == 15
+        print("OK")
+    """)
+    r2 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stderr
+    assert "OK" in r2.stdout

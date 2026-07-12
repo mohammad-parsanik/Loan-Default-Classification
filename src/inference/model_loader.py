@@ -139,8 +139,13 @@ class ModelLoader:
 
     def __init__(self, artifact_dir: Path):
         self.artifact_dir = Path(artifact_dir)
-        import torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # torch is only needed for the legacy DeepSets path — don't force it
+        # as a hard dependency for arm-only (torch-free) deployments.
+        try:
+            import torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            self.device = "cpu"
 
     def _load_calibrator(self):
         cal_path = self.artifact_dir / "calibrator.pkl"

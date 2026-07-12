@@ -14,6 +14,15 @@ acting on a stale score wastes budget).
 With config.RECALIBRATE_ON_PREDICT = True, the calibrator is refreshed at
 scoring time on the newest snapshot whose labels have matured, so
 probability thresholds in the downstream rule system track base-rate drift.
+
+Two entry points:
+  - Predictor.predict()  — fetches snapshot(s) from TRAIN_TABLE via this
+                           project's DB connector (the CLI / server path).
+  - score_dataframe()    — scores a caller-supplied DataFrame directly, no
+                           DB. This is the integration point for embedding
+                           scoring in another system — see build_scoring_
+                           package.py for a minimal standalone dependency
+                           set (no torch, no DB driver required).
 """
 
 import logging
@@ -77,6 +86,121 @@ def apply_queue_flags(
         flags[(flags == "") & recently] = "RECENTLY_CALLED"
 
     return flags
+
+
+def score_instances(
+    instances: list[dict],
+    scorer,
+    calibrator=None,
+    called_log: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    Core scoring transform shared by Predictor.predict() and
+    score_dataframe(): instances -> calibrated+masked probabilities ->
+    ranked queue DataFrame. Pure function of its arguments — no DB, no
+    project-specific data access — so it's the safe reuse point for a
+    standalone deployment.
+    """
+    if not instances:
+        return pd.DataFrame()
+
+    strata    = np.array([i["current_cat"] for i in instances])
+    probs_raw = scorer.raw_probs(instances)
+
+    if isinstance(calibrator, StratifiedCalibrator):
+        probs = calibrator.transform(probs_raw, strata)
+    elif calibrator is not None:
+        probs = calibrator.transform(probs_raw)
+    else:
+        probs = probs_raw
+    # label >= current_cat always — zero the impossible mass
+    probs = mask_monotone(probs, strata)
+
+    results = pd.DataFrame({
+        "SNAPSHOT_DATE":        [i["snapshot_date"]  for i in instances],
+        "NATIONAL_CODE":        [i["national_code"]  for i in instances],
+        "N_LOANS_IN_PORTFOLIO": [i["n_loans"]        for i in instances],
+        "CURRENT_CAT":          strata,
+        "P_NO_DELAY":           probs[:, 0],
+        "P_CURRENT":            probs[:, 1],
+        "P_PAST_DUE":           probs[:, 2],
+        "P_SEVERE_PAST_DUE":    probs[:, 3],
+        # Minimum-expected-cost class under the business cost matrix
+        "PREDICTED_CLASS":      cost_decisions(probs),
+        # THE queue ranking score: calibrated P(entering severe)
+        "RISK_SCORE":           severity_scores(probs),
+        # Secondary/diagnostic: expected cost of taking no action
+        "EXPECTED_COST":        risk_scores(probs),
+    })
+
+    multi_snapshot = results["SNAPSHOT_DATE"].nunique() > 1
+    results["RULE_FLAG"] = apply_queue_flags(
+        results, multi_snapshot=multi_snapshot, called_log=called_log
+    )
+
+    # Queue rows first (by risk), flagged rows after; rank only the queue
+    results["_flagged"] = results["RULE_FLAG"] != ""
+    results = (
+        results.sort_values(["_flagged", "RISK_SCORE"], ascending=[True, False])
+        .drop(columns="_flagged")
+        .reset_index(drop=True)
+    )
+    n_queue = int((results["RULE_FLAG"] == "").sum())
+    rank = np.full(len(results), np.nan)
+    rank[:n_queue] = np.arange(1, n_queue + 1)
+    results.insert(0, "RISK_RANK", rank)
+
+    flag_counts = results.loc[results["RULE_FLAG"] != "", "RULE_FLAG"].value_counts()
+    flag_str = " | ".join(f"{int(v):,} {k}" for k, v in flag_counts.items()) or "none flagged"
+    logger.info(
+        f"Queue: {n_queue:,} ranked | {flag_str}. "
+        f"At {config.API_RATE_PER_HOUR}/h the full queue takes "
+        f"{n_queue / config.API_RATE_PER_HOUR:.0f}h to call."
+    )
+    return results
+
+
+def score_dataframe(
+    df: pd.DataFrame,
+    artifact_dir,
+    calibration_df: Optional[pd.DataFrame] = None,
+    called_log_path: Optional[str] = None,
+    max_loans: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Score a caller-supplied DataFrame directly — no database access.
+
+    `df` must have the same columns as TRAIN_TABLE (see column_changes.md),
+    minus WORST_FUTURE_CAT/WORST_FUTURE_DPD (this is prediction time — if
+    present they're ignored). Multiple snapshots may be mixed in one call;
+    dedup/supersede logic applies exactly as in Predictor.predict().
+
+    `calibration_df` (optional): a DataFrame of a single MATURED snapshot
+    WITH WORST_FUTURE_CAT populated, used to refresh the calibrator before
+    scoring — the DB-free equivalent of Predictor's RECALIBRATE_ON_PREDICT.
+    Omit to use the calibrator shipped in the bundle unchanged.
+    """
+    from src.data.data_loader import DataLoader   # local: keeps this function's
+                                                    # dependency footprint explicit
+    loader = ModelLoader(Path(artifact_dir))
+    scorer, calibrator, _ = loader.load_pipeline()
+    dl = DataLoader()
+
+    if calibration_df is not None:
+        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.max_loans)
+        cal_inst = [i for i in cal_inst if i["label"] >= 0]
+        if cal_inst:
+            probs  = scorer.raw_probs(cal_inst)
+            y      = np.array([i["label"] for i in cal_inst])
+            strata = np.array([i["current_cat"] for i in cal_inst])
+            calibrator = StratifiedCalibrator(
+                min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
+            ).fit(probs, y, strata)
+            logger.info(f"Calibrator refreshed on {len(cal_inst):,} supplied instances.")
+
+    instances, _ = dl.process_raw_data(df, max_loans or scorer.max_loans)
+    called_log = Predictor._load_called_log(called_log_path)
+    return score_instances(instances, scorer, calibrator, called_log)
 
 
 class Predictor:
@@ -182,59 +306,7 @@ class Predictor:
             logger.warning("No data found to predict.")
             return pd.DataFrame()
 
-        strata    = np.array([i["current_cat"] for i in instances])
-        probs_raw = self._predict_probs(instances)
-
-        if isinstance(self.calibrator, StratifiedCalibrator):
-            probs = self.calibrator.transform(probs_raw, strata)
-        elif self.calibrator is not None:
-            probs = self.calibrator.transform(probs_raw)
-        else:
-            probs = probs_raw
-        # label >= current_cat always — zero the impossible mass
-        probs = mask_monotone(probs, strata)
-
-        results = pd.DataFrame({
-            "SNAPSHOT_DATE":        [i["snapshot_date"]  for i in instances],
-            "NATIONAL_CODE":        [i["national_code"]  for i in instances],
-            "N_LOANS_IN_PORTFOLIO": [i["n_loans"]        for i in instances],
-            "CURRENT_CAT":          strata,
-            "P_NO_DELAY":           probs[:, 0],
-            "P_CURRENT":            probs[:, 1],
-            "P_PAST_DUE":           probs[:, 2],
-            "P_SEVERE_PAST_DUE":    probs[:, 3],
-            # Minimum-expected-cost class under the business cost matrix
-            "PREDICTED_CLASS":      cost_decisions(probs),
-            # THE queue ranking score: calibrated P(entering severe)
-            "RISK_SCORE":           severity_scores(probs),
-            # Secondary/diagnostic: expected cost of taking no action
-            "EXPECTED_COST":        risk_scores(probs),
-        })
-
-        # ── Rule flags: who does NOT compete for API budget ──────────────
-        results["RULE_FLAG"] = apply_queue_flags(
-            results, multi_snapshot=len(resolved) > 1, called_log=called_log
-        )
-
-        # Queue rows first (by risk), flagged rows after; rank only the queue
-        results["_flagged"] = results["RULE_FLAG"] != ""
-        results = (
-            results.sort_values(["_flagged", "RISK_SCORE"], ascending=[True, False])
-            .drop(columns="_flagged")
-            .reset_index(drop=True)
-        )
-        n_queue = int((results["RULE_FLAG"] == "").sum())
-        rank = np.full(len(results), np.nan)
-        rank[:n_queue] = np.arange(1, n_queue + 1)
-        results.insert(0, "RISK_RANK", rank)
-
-        flag_counts = results.loc[results["RULE_FLAG"] != "", "RULE_FLAG"].value_counts()
-        flag_str = " | ".join(f"{int(v):,} {k}" for k, v in flag_counts.items()) or "none flagged"
-        logger.info(
-            f"Queue: {n_queue:,} ranked | {flag_str}. "
-            f"At {config.API_RATE_PER_HOUR}/h the full queue takes "
-            f"{n_queue / config.API_RATE_PER_HOUR:.0f}h to call."
-        )
+        results = score_instances(instances, self.scorer, self.calibrator, called_log)
 
         if output_path is None:
             output_path = self._default_output_path(resolved)
