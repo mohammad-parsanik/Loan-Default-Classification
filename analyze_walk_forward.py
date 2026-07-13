@@ -101,10 +101,13 @@ def deployed_arm_table(fold_results: list[dict]) -> pd.DataFrame:
     rows = []
     for r in fold_results:
         fm = r.get("final_metrics", {})
+        train_snaps = sorted(r.get("train_snaps", []))
         rows.append({
             "fold_id": r["fold_id"],
             "test_snap": r.get("test_snap"),
-            "n_train_snaps": len(r.get("train_snaps", [])),
+            "val_snap": r.get("val_snap"),
+            "n_train_snaps": len(train_snaps),
+            "train_snaps": train_snaps,
             "deployed_arm": r.get("deployed_arm"),
             "pooled_AP": _pooled_ap(fm),
             "cat0_AP": _cat0_ap(fm),
@@ -114,6 +117,25 @@ def deployed_arm_table(fold_results: list[dict]) -> pd.DataFrame:
             "macro_f1": fm.get("macro_f1", float("nan")),
         })
     return pd.DataFrame(rows).sort_values("fold_id").reset_index(drop=True)
+
+
+def per_fold_arm_comparison(fold_results: list[dict]) -> pd.DataFrame:
+    """
+    Pooled AP for EVERY trained arm, side by side, per fold — reveals
+    whether an instability is arm-specific (only multiclass collapses) or
+    shared (the fold/data itself is the problem, every arm struggles).
+    """
+    all_arms = sorted({name for r in fold_results for name in r.get("arms", {})})
+    rows = []
+    for r in sorted(fold_results, key=lambda r: r["fold_id"]):
+        row = {"fold_id": r["fold_id"], "test_snap": r.get("test_snap"),
+               "val_snap": r.get("val_snap"),
+               "n_train_snaps": len(r.get("train_snaps", []))}
+        for arm in all_arms:
+            row[f"{arm}_AP"] = (_pooled_ap(r["arms"][arm]) if arm in r.get("arms", {})
+                                else float("nan"))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def per_arm_stability_table(fold_results: list[dict]) -> pd.DataFrame:
@@ -150,11 +172,21 @@ def per_arm_stability_table(fold_results: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("mean_AP", ascending=False).reset_index(drop=True)
 
 
-def print_conclusion(deployed_df: pd.DataFrame, arm_df: pd.DataFrame) -> None:
+def print_conclusion(deployed_df: pd.DataFrame, arm_df: pd.DataFrame,
+                     arm_compare_df: pd.DataFrame = None) -> None:
     print("\n" + "=" * 78)
     print("  DEPLOYED-ARM RESULTS PER FOLD")
     print("=" * 78)
-    print(deployed_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    cols = [c for c in deployed_df.columns if c != "train_snaps"]
+    print(deployed_df[cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+    unstable = deployed_df[deployed_df["pooled_AP"] < 0.45]
+    if len(unstable):
+        print("\n  UNSTABLE FOLDS (pooled_AP < 0.45) — val_snap and exact training snapshots:")
+        for _, row in unstable.iterrows():
+            print(f"    fold {row['fold_id']:>2} | test={row['test_snap']} "
+                  f"val={row['val_snap']} train={row['train_snaps']} "
+                  f"| AP={row['pooled_AP']:.4f}")
 
     print("\n" + "=" * 78)
     print("  DEPLOYED-ARM STABILITY ACROSS FOLDS")
@@ -170,7 +202,19 @@ def print_conclusion(deployed_df: pd.DataFrame, arm_df: pd.DataFrame) -> None:
     print("=" * 78)
     print(arm_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
+    if arm_compare_df is not None and len(arm_compare_df.columns) > 4:
+        print("\n" + "=" * 78)
+        print("  PER-FOLD ARM COMPARISON (is instability shared or arm-specific?)")
+        print("=" * 78)
+        print(arm_compare_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
     print("\n" + "-" * 78)
+    print("  CAVEAT: walk-forward folds assign validation as one entire calendar")
+    print("  snapshot (build_fold_instances), NOT the customer-disjoint carve-out")
+    print("  used by the single-split/--final path (VAL_SPLIT_MODE='customer').")
+    print("  Folds with very few training snapshots are especially sensitive to")
+    print("  which single month got used for calibration/early-stopping — this")
+    print("  harness has not been updated to match the current split design.")
     top = arm_df.iloc[0]
     consistent = top["fold_win_rate"] >= 0.6
     print(
@@ -241,10 +285,12 @@ def main():
 
     deployed_df = deployed_arm_table(fold_results)
     arm_df = per_arm_stability_table(fold_results)
-    print_conclusion(deployed_df, arm_df)
+    arm_compare_df = per_fold_arm_comparison(fold_results)
+    print_conclusion(deployed_df, arm_df, arm_compare_df)
 
     deployed_df.to_csv(out_dir / "wf_deployed_arm_per_fold.csv", index=False)
     arm_df.to_csv(out_dir / "wf_arm_stability.csv", index=False)
+    arm_compare_df.to_csv(out_dir / "wf_per_fold_arm_comparison.csv", index=False)
     plot_stability(fold_results, deployed_df, out_dir / "wf_arm_stability.png")
     print(f"\nCSVs + plot written to {out_dir.resolve()}")
 
