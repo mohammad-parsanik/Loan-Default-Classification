@@ -9,6 +9,11 @@ ordered by calibrated P(entering severe) within 6 months, to be enriched by
 the external API at **240 requests/hour**. Already-severe customers are
 rule-flagged, never ranked.
 
+**Related references:** [`README.md`](README.md) for the architecture and
+data flow; [`CONFIG_REFERENCE.md`](CONFIG_REFERENCE.md) for every config
+setting; [`MODEL_EVALUATION.md`](MODEL_EVALUATION.md) for how to tell if a
+trained model is actually good before shipping it.
+
 ---
 
 ## 0. One-time config check (`project_config.py`)
@@ -61,6 +66,39 @@ Trains `DEPLOY_ARM` on **all** mature snapshots (no test hold-out), carves a
 customer-disjoint validation slice for the calibrator, and writes the
 single-file bundle. Output dir is `artifacts/<timestamp>_final/fold_01/`.
 
+**`DEPLOY_ARM` must be an explicit arm name** (e.g. `"multiclass"`), not
+`"auto"` — auto-selection needs a test set to compare arms on, which
+`--final` deliberately doesn't have.
+
+**Timing:** roughly the time of training one arm on the full dataset —
+for reference, a single `multiclass` arm on ~6M training instances took
+~15 minutes in Run 6 (excludes the evaluation-only stages below, which
+`--final` skips). Expect longer with more mature snapshots or `ARM_OPTUNA_TRIALS > 0`.
+
+**What gets written** (`artifacts/<ts>_final/fold_01/`):
+
+| File | What it is |
+|---|---|
+| `metadata.json` | Feature list, `MAX_LOANS_PER_CUSTOMER`. |
+| `scaler.pkl` | Fitted preprocessing pipeline. |
+| `model_arm.pkl` | The trained arm object. |
+| `calibrator.pkl` | Stratified isotonic calibrator, fit on the customer-disjoint validation slice. |
+| `model_bundle.pkl` | **The one file to ship** — all four of the above packed together (§4). |
+
+**No metrics are written.** There's no test set in a final fit, so
+`arms_metrics.json`, the plots, and bootstrap CIs — all gated on having a
+test set in the code — simply don't appear. This is expected, not a
+failure. **Judge the recipe from your most recent evaluation run (`python
+run.py train`, no `--final`) before committing to a `--final` fit** — see
+`MODEL_EVALUATION.md`. `--final` re-applies an already-graded recipe to
+more data; it doesn't re-grade it.
+
+**Verify it succeeded** before moving on: confirm the log ends with
+`Deployed arm '<name>' | Deployment bundle → .../model_bundle.pkl` (no
+stack trace above it), and that `model_bundle.pkl` exists and is
+non-trivial in size (a few MB, not a few KB — an XGBoost model with 200+
+trees over 257 features isn't tiny).
+
 ## 4. Hand off the model
 
 `model_bundle.pkl` (fitted scaler + XGBoost arm + stratified calibrator +
@@ -87,7 +125,34 @@ This copies the ~18 source files scoring actually needs (not `run.py`, not
 `src/model/*` DeepSets code, not the evaluation/plotting modules) plus the
 bundle, a `requirements-scoring.txt` (`numpy`, `pandas`, `scikit-learn`,
 `xgboost`, `joblib` — nothing else), and a `README_SCORING.md` into one
-folder. Hand that folder to the other team; they call either:
+folder. Hand that folder to the other team.
+
+**The input `df` they build:** one row per **loan** (not per customer — a
+customer with 2 open loans contributes 2 rows), with the same columns as
+`TRAIN_TABLE` (`column_changes.md` has the full feature dictionary), minus
+`WORST_FUTURE_CAT`/`WORST_FUTURE_DPD` (this is prediction time — those
+don't exist yet). At minimum: `NATIONAL_CODE`, `SNAPSHOT_DATE`,
+`LOAN_CATEGORY`, `DPD_DAYS`, plus the rest of the ~64 feature columns. A
+minimal illustrative example (real feature values, not just the ID
+columns, obviously required in practice):
+
+```python
+import pandas as pd
+
+df = pd.DataFrame([
+    {"NATIONAL_CODE": "1234567890", "LOAN_ID": 555001, "CONTRACT_NUMBER": "C-555001",
+     "SNAPSHOT_DATE": 20260621.0, "LOAN_CATEGORY": 0.0, "DPD_DAYS": 0.0, "...": "...other features..."},
+    {"NATIONAL_CODE": "1234567890", "LOAN_ID": 555002, "CONTRACT_NUMBER": "C-555002",
+     "SNAPSHOT_DATE": 20260621.0, "LOAN_CATEGORY": 1.0, "DPD_DAYS": 12.0, "...": "...other features..."},
+    # ... one row per loan across all customers you want scored
+])
+```
+
+Both loans above belong to the same customer (`NATIONAL_CODE` repeats) —
+they get grouped into one portfolio, truncated to `MAX_LOANS_PER_CUSTOMER`
+(currently 2, kept by current `DPD_DAYS` — never by a future label), and
+produce **one row of output** for that customer. With `df` built, they
+call either:
 
 ```python
 # Quick one-off, silent config defaults:
@@ -156,4 +221,5 @@ Re-run steps 3–5 when new snapshots mature (monthly). `DATA_VERSION` in
 `project_config.py` invalidates the NPZ cache when the ETL changes; bump it to
 force a rebuild. Re-open the arm comparison (`DEPLOY_ARM = "auto"`, full
 `MODEL_ARMS`, an evaluation run) periodically to confirm `multiclass` still
-wins.
+wins — see [`MODEL_EVALUATION.md`](MODEL_EVALUATION.md) for how to read
+that comparison and what "still winning" should look like.

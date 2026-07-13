@@ -12,7 +12,12 @@ excluded by rule — they're a known risk, not a ranking question.
 >    tried, what worked, what didn't, and why. This is the authoritative record.
 > 3. **[CLAUDE.md](CLAUDE.md)** — terse day-to-day reference (commands, config
 >    flags, gotchas) for whoever is actively coding.
-> 4. **[DEPLOYMENT.md](DEPLOYMENT.md)** — how to ship a trained model to production.
+> 4. **[DEPLOYMENT.md](DEPLOYMENT.md)** — how to train the production model,
+>    package it, and generate predictions from it.
+> 5. **[MODEL_EVALUATION.md](MODEL_EVALUATION.md)** — how to tell if a trained
+>    model is actually good (what to read, what "normal" numbers look like).
+> 6. **[CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)** — every setting in
+>    `project_config.py` explained.
 
 ---
 
@@ -78,6 +83,55 @@ Ranked queue (src/inference/predictor.py)
      sort by P(severe); flag ALREADY_SEVERE / SUPERSEDED / RECENTLY_CALLED /
      PREDICTED_SEVERE; rank the rest → predictions_<snapshot>.csv
 ```
+
+### The model, precisely
+
+**Feature aggregation:** ~64 raw per-loan features → 4 summary statistics
+each (min, max, mean, std) across a customer's loans, plus a loan count →
+**257 features per customer** (`4 × 64 + 1`). This is what every model
+candidate below actually trains on — not the raw per-loan rows.
+
+**Model candidates ("arms", `src/baselines/aggregated_xgboost.py`)** — all
+XGBoost, all on the same 257 features, all with identical hyperparameters
+(`n_estimators=200, max_depth=5, learning_rate=0.05, subsample=0.8,
+colsample_bytree=0.8`) so comparisons isolate the objective, not tuning
+luck:
+
+| Arm | What it fits | Deployable? |
+|---|---|---|
+| **`multiclass`** (deployed) | One `multi:softprob` model over all 4 classes directly. | Yes — full class distribution. |
+| `ordinal` | `NUM_CLASSES-1` cumulative binaries `P(label > k)`; the full distribution is recovered by differencing consecutive cumulative probabilities. | Yes, but didn't win. |
+| `per_cat` | One model per `current_cat` stratum, trained only over that stratum's *reachable* classes (a cat-1 customer can only end at 1/2/3). Natively monotone by construction. | Yes, but didn't win — see `AGENT_HANDOFF.md` §15 for why the per-stratum specialist underperforms the pooled model on the hardest slice. |
+| `binary` | Direct `P(label == severe)`. | **No** — no per-class distribution, so it can't produce the required `P_NO_DELAY`/`P_CURRENT`/`P_PAST_DUE` columns. Kept only as a ranking-ceiling diagnostic. |
+
+An earlier, much more complex candidate — **DeepSets** (a permutation-invariant
+neural set encoder feeding an XGBoost meta-learner on 64-dim embeddings) —
+lost a controlled shootout to plain `multiclass` on every ranking slice.
+Its code still exists (`src/model/`, `DEEPSETS_ENABLED=False`) but isn't
+maintained as a live candidate.
+
+**Calibration (`src/evaluation/calibration.py`):** raw XGBoost probabilities
+aren't honest frequencies once class weighting or an ordered-target
+decomposition is involved. A separate isotonic regression curve is fit
+per class, per `current_cat` stratum (falling back to a pooled curve when
+a stratum has too few validation samples — `CALIBRATION_MIN_STRATUM_N`),
+on a validation slice the model never trained on. This matters because
+P(severe) means something very different for a currently-clean customer
+(rare event) than for one already at cat-2 (common event) — pooling them
+would systematically miscalibrate one relative to the other, which
+directly corrupts the ranking since the queue mixes strata.
+
+**Monotonicity masking (`src/evaluation/decision.py::mask_monotone`):**
+since `label >= current_cat` always, any predicted probability mass on a
+class below the customer's current category is provably impossible. That
+mass is zeroed and the remaining probabilities renormalized — this
+sharpens the calibrated distribution for free, using a constraint that
+costs nothing to enforce.
+
+**Ranking score:** `RISK_SCORE` = the calibrated, masked `P(class == 3)`
+for that customer. That's the entire sort key — no cost matrix, no
+learned ranking objective, just the class-3 probability from whichever
+arm is deployed.
 
 ## Major decisions (why it looks like this)
 
@@ -146,10 +200,15 @@ src/
   inference/
     model_loader.py         Scorer abstraction (ArmScorer / legacy DeepSetsScorer)
     predictor.py             Queue construction: score_instances(), score_dataframe(), Predictor
+    scoring.py               run_scoring() — manager-code integration entry point
+    scoring_params.py        ScoringParams — explicit, per-call-overridable business knobs
 
 explore_iv_woe.py, explore_umap.py, explore_shap.py   Standalone diagnostics (see EXPLORATION.md)
 tests/                  Unit + integration tests (pytest; also runnable without it, see below)
 ```
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) §4 for when to use `score_dataframe()`
+vs. `run_scoring()`/`ScoringParams` vs. the `run.py predict` CLI.
 
 ## Commands
 
@@ -171,6 +230,8 @@ python build_scoring_package.py --bundle <model_bundle.pkl> --output scoring_pac
 pytest tests/
 ```
 
-See `python run.py --help` and [CLAUDE.md](CLAUDE.md) for the config flags that
-change this behavior (`MODEL_ARMS`, `DEPLOY_ARM`, `CARVE_CURRENT_CAT_GE`,
-`API_RATE_PER_HOUR`, `CERTAINTY_ACT_THRESHOLD`, ...).
+See [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) for every config flag that
+changes this behavior (`MODEL_ARMS`, `DEPLOY_ARM`, `CARVE_CURRENT_CAT_GE`,
+`API_RATE_PER_HOUR`, `CERTAINTY_ACT_THRESHOLD`, ...), and
+[MODEL_EVALUATION.md](MODEL_EVALUATION.md) for how to judge a training
+run's output once you have one.
