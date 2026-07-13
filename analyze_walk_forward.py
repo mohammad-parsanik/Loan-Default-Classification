@@ -172,6 +172,23 @@ def per_arm_stability_table(fold_results: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("mean_AP", ascending=False).reset_index(drop=True)
 
 
+def filter_by_min_train_snaps(fold_results: list[dict], min_n: int) -> list[dict]:
+    """
+    Folds with very few training snapshots (early in the WF sequence, before
+    much history existed) are a fundamentally different — and unrealistic —
+    regime from production (which always trains on ALL mature snapshots).
+    Averaging across them with mature-data folds understates the winning
+    arm's real advantage. Use this to see the verdict restricted to folds
+    with at least `min_n` training snapshots.
+    """
+    kept = [r for r in fold_results if len(r.get("train_snaps", [])) >= min_n]
+    dropped = [r["fold_id"] for r in fold_results if r not in kept]
+    if dropped:
+        print(f"  (--min_train_snaps {min_n}: dropped fold(s) {dropped} "
+              f"— fewer than {min_n} training snapshots)")
+    return kept
+
+
 def print_conclusion(deployed_df: pd.DataFrame, arm_df: pd.DataFrame,
                      arm_compare_df: pd.DataFrame = None) -> None:
     print("\n" + "=" * 78)
@@ -265,6 +282,12 @@ def main():
                         help="Reconstruct from per-fold arms_metrics.json instead of the run-level pickle")
     parser.add_argument("--output_dir", type=Path, default=None,
                         help="Where to write CSVs/plot (default: alongside the input)")
+    parser.add_argument("--min_train_snaps", type=int, default=3,
+                        help="Also print a verdict restricted to folds with at least this "
+                            "many training snapshots (default: 3). Early walk-forward folds "
+                            "trained on 1-2 snapshots are a thinner-than-production regime "
+                            "and can skew a naive mean across all folds — see the printed "
+                            "comparison. Pass 0 to disable this second verdict.")
     args = parser.parse_args()
 
     run_dir = args.path if args.path.is_dir() else args.path.parent.parent
@@ -293,6 +316,26 @@ def main():
     arm_compare_df.to_csv(out_dir / "wf_per_fold_arm_comparison.csv", index=False)
     plot_stability(fold_results, deployed_df, out_dir / "wf_arm_stability.png")
     print(f"\nCSVs + plot written to {out_dir.resolve()}")
+
+    if args.min_train_snaps > 0:
+        print("\n" + "#" * 78)
+        print(f"  VERDICT RESTRICTED TO FOLDS WITH >= {args.min_train_snaps} TRAINING SNAPSHOTS")
+        print("  (the naive all-fold mean above is skewed by thin early folds that")
+        print("   are not representative of production, which trains on ALL mature")
+        print("   snapshots — this is the number that actually matters for shipping)")
+        print("#" * 78)
+        mature = filter_by_min_train_snaps(fold_results, args.min_train_snaps)
+        if mature:
+            mature_deployed_df = deployed_arm_table(mature)
+            mature_arm_df = per_arm_stability_table(mature)
+            print(mature_deployed_df[[c for c in mature_deployed_df.columns if c != "train_snaps"]]
+                  .to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+            print()
+            print(mature_arm_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+            mature_deployed_df.to_csv(out_dir / "wf_mature_folds_deployed_arm.csv", index=False)
+            mature_arm_df.to_csv(out_dir / "wf_mature_folds_arm_stability.csv", index=False)
+        else:
+            print(f"  No folds have >= {args.min_train_snaps} training snapshots.")
 
     # Also try the project's own aggregator/logger for a second, independently
     # -derived cross-check of the deployed-arm summary.
