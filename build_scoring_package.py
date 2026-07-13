@@ -82,9 +82,10 @@ queue.to_csv("queue.csv", index=False)
 **B. Manager/orchestration code** — `run_scoring()` + `ScoringParams`, the
 recommended integration point when several data sources or call sites need
 different (or per-call-overridable) business knobs. Any field left unset
-falls back to `project_config.py`, and a single `logger.warning(...)` names
-exactly which fields defaulted — so a caller that forgot a parameter sees
-it in the logs instead of it silently happening:
+(`None`) falls back to `project_config.py`, and a single `logger.warning(...)`
+names exactly which fields defaulted — so a caller that forgot a parameter
+sees it in the logs instead of it silently happening. `bundle_path` is the
+only required field:
 
 ```python
 import pandas as pd
@@ -92,11 +93,36 @@ from src.inference.scoring import run_scoring
 from src.inference.scoring_params import ScoringParams
 
 df = pd.read_csv("customers_to_score.csv")
+
+# Minimal — everything but bundle_path defaults from project_config.py:
+params = ScoringParams(bundle_path="model_bundle.pkl", output_path="queue.csv")
+queue = run_scoring(df, params)
+```
+
+Every field, spelled out (pass what you need to override, omit — or leave
+`None` — the rest):
+
+```python
 params = ScoringParams(
-    bundle_path="model_bundle.pkl",
-    output_path="queue.csv",             # optional — omit to just get the DataFrame back
-    called_log_path="calls.csv",         # optional
-    certainty_act_threshold=0.9,         # optional per-call override
+    bundle_path="model_bundle.pkl",   # REQUIRED — which trained model to score with
+
+    # Data inputs — no config equivalent, never defaulted/warned:
+    output_path="queue.csv",          # None = return the DataFrame only, don't write a CSV
+    calibration_df=None,              # a matured, labelled snapshot (WORST_FUTURE_CAT
+                                       # populated) to refresh calibration before scoring;
+                                       # None = use the calibrator already in the bundle
+
+    # Business knobs — override per call; omit/None = use project_config's value.
+    called_log_path="calls.csv",      # NATIONAL_CODE,CALLED_AT ledger; falls back to API_CALL_LOG
+    certainty_act_threshold=0.9,      # flag near-certain rows PREDICTED_SEVERE instead of
+                                       # ranking them; falls back to CERTAINTY_ACT_THRESHOLD
+                                       # (None = off — confirm with the business before setting)
+    carve_current_cat_ge=3,           # current_cat at/above this = ALREADY_SEVERE, never ranked
+    calibration_min_stratum_n=5000,   # only used when calibration_df is given
+    api_data_ttl_days=30,             # enrichment freshness window for called_log_path
+    pred_dedup_latest=True,           # keep only each customer's newest row when df mixes snapshots
+    cost_matrix=None,                 # falls back to COST_MATRIX; drives PREDICTED_CLASS/
+                                       # EXPECTED_COST only — never RISK_SCORE/the ranking
 )
 queue = run_scoring(df, params)
 ```

@@ -162,7 +162,7 @@ queue = score_dataframe(df, "model_bundle.pkl")   # df: same columns as TRAIN_TA
 
 ```python
 # Manager/orchestration code with several data sources or per-call knobs —
-# recommended integration point. Any field left unset on ScoringParams
+# recommended integration point. Any field left unset (None) on ScoringParams
 # falls back to project_config.py, with a warning naming which ones did.
 from src.inference.scoring import run_scoring
 from src.inference.scoring_params import ScoringParams
@@ -171,12 +171,55 @@ params = ScoringParams(bundle_path="model_bundle.pkl", output_path="queue.csv")
 queue = run_scoring(df, params)
 ```
 
+`bundle_path` is the only field you're required to pass — everything else
+defaults from `project_config.py` (with a warning listing exactly which
+fields defaulted, so a forgotten parameter is visible in the logs rather
+than silently applied). Pass a field explicitly to override that default
+for this call only, without touching `project_config.py` or affecting
+other callers. Every field, spelled out:
+
+```python
+params = ScoringParams(
+    bundle_path="model_bundle.pkl",   # REQUIRED — no project-wide default makes
+                                       # sense for "which trained model to use"
+
+    # Data inputs — no config equivalent; a None here is a deliberate
+    # choice, not a missing parameter, so these are never defaulted/warned.
+    output_path="queue.csv",          # None = return the DataFrame only, don't write a CSV
+    calibration_df=None,              # a matured, labelled snapshot (WORST_FUTURE_CAT
+                                       # populated) to refresh calibration before scoring;
+                                       # None = use the calibrator already in the bundle
+
+    # Business knobs — override per call; omit (None) to use project_config's value.
+    called_log_path="calls.csv",      # NATIONAL_CODE,CALLED_AT ledger; falls back to API_CALL_LOG
+    certainty_act_threshold=None,     # e.g. 0.9 to flag near-certain rows PREDICTED_SEVERE
+                                       # instead of ranking them; falls back to
+                                       # CERTAINTY_ACT_THRESHOLD (None = off, pending business sign-off)
+    carve_current_cat_ge=3,           # current_cat at/above this = ALREADY_SEVERE, never ranked;
+                                       # falls back to CARVE_CURRENT_CAT_GE
+    calibration_min_stratum_n=5000,   # only used when calibration_df is given; falls back to
+                                       # CALIBRATION_MIN_STRATUM_N
+    api_data_ttl_days=30,             # enrichment freshness window for called_log_path;
+                                       # falls back to API_DATA_TTL_DAYS
+    pred_dedup_latest=True,           # keep only each customer's newest row when df mixes
+                                       # snapshots; falls back to PRED_DEDUP_LATEST
+    cost_matrix=None,                 # falls back to COST_MATRIX; drives PREDICTED_CLASS/
+                                       # EXPECTED_COST only — never RISK_SCORE/the ranking
+)
+queue = run_scoring(df, params)
+```
+
+Passing a field's project-default value explicitly (as most of the example
+above does) is equivalent to omitting it, just without the "defaulted"
+warning — useful when you want the call site to document its assumptions
+even though they happen to match the current config.
+
 No database access, no `run.py`, no knowledge of this project's training
 code required — verified by an automated test that scores in a subprocess
 with this repo removed from `sys.path` and `torch`/`optuna` blocked at
 import time (`tests/test_pipeline_changes.py::test_build_scoring_package_runs_standalone`).
-See `scoring_package/README_SCORING.md` (generated) for the full
-`ScoringParams` field reference.
+See `scoring_package/README_SCORING.md` (generated) for the field-by-field
+default-source table.
 
 > The fold directory (not just the bundle) also holds the unbundled
 > artifacts (`model_arm.pkl`, `scaler.pkl`, `calibrator.pkl`,
