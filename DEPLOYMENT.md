@@ -83,21 +83,35 @@ python build_scoring_package.py --bundle artifacts/<ts>_final/fold_01/model_bund
                                 --output scoring_package/
 ```
 
-This copies the ~16 source files scoring actually needs (not `run.py`, not
+This copies the ~18 source files scoring actually needs (not `run.py`, not
 `src/model/*` DeepSets code, not the evaluation/plotting modules) plus the
 bundle, a `requirements-scoring.txt` (`numpy`, `pandas`, `scikit-learn`,
 `xgboost`, `joblib` — nothing else), and a `README_SCORING.md` into one
-folder. Hand that folder to the other team; they call:
+folder. Hand that folder to the other team; they call either:
 
 ```python
+# Quick one-off, silent config defaults:
 from src.inference.predictor import score_dataframe
 queue = score_dataframe(df, "model_bundle.pkl")   # df: same columns as TRAIN_TABLE
+```
+
+```python
+# Manager/orchestration code with several data sources or per-call knobs —
+# recommended integration point. Any field left unset on ScoringParams
+# falls back to project_config.py, with a warning naming which ones did.
+from src.inference.scoring import run_scoring
+from src.inference.scoring_params import ScoringParams
+
+params = ScoringParams(bundle_path="model_bundle.pkl", output_path="queue.csv")
+queue = run_scoring(df, params)
 ```
 
 No database access, no `run.py`, no knowledge of this project's training
 code required — verified by an automated test that scores in a subprocess
 with this repo removed from `sys.path` and `torch`/`optuna` blocked at
 import time (`tests/test_pipeline_changes.py::test_build_scoring_package_runs_standalone`).
+See `scoring_package/README_SCORING.md` (generated) for the full
+`ScoringParams` field reference.
 
 > The fold directory (not just the bundle) also holds the unbundled
 > artifacts (`model_arm.pkl`, `scaler.pkl`, `calibrator.pkl`,

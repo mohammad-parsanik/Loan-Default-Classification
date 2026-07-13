@@ -997,3 +997,157 @@ def test_explore_shap_rejects_multi_model_arms(tmp_path):
     except SystemExit:
         raised = True
     assert raised, "load_from_bundle should reject multi-model arms (ordinal/per_cat)"
+
+
+# ── ScoringParams + run_scoring (July 13) ───────────────────────────────────────
+
+def test_scoring_params_resolve_fills_from_config_and_warns(caplog):
+    from src.inference.scoring_params import ScoringParams
+
+    with caplog.at_level("WARNING", logger="src.inference.scoring_params"):
+        p = ScoringParams(bundle_path="x.pkl")
+        r = p.resolve()
+
+    assert r.carve_current_cat_ge == config.CARVE_CURRENT_CAT_GE
+    assert r.cost_matrix == config.COST_MATRIX
+    assert r.api_data_ttl_days == config.API_DATA_TTL_DAYS
+    # calibration_df/output_path have no config equivalent — never defaulted/warned
+    assert r.calibration_df is None and r.output_path is None
+    assert any("not passed explicitly" in rec.message for rec in caplog.records)
+
+
+def test_scoring_params_explicit_values_are_not_overridden():
+    from src.inference.scoring_params import ScoringParams
+
+    p = ScoringParams(bundle_path="x.pkl", carve_current_cat_ge=99,
+                      cost_matrix=[[1, 2], [3, 4]])
+    r = p.resolve()
+    assert r.carve_current_cat_ge == 99
+    assert r.cost_matrix == [[1, 2], [3, 4]]
+    # untouched fields still default
+    assert r.api_data_ttl_days == config.API_DATA_TTL_DAYS
+
+    # Idempotent: resolving twice doesn't clobber explicit values
+    r2 = r.resolve()
+    assert r2.carve_current_cat_ge == 99
+
+
+def test_scoring_params_requires_bundle_path():
+    from src.inference.scoring_params import ScoringParams
+
+    for bad in ("", None):
+        try:
+            ScoringParams(bundle_path=bad).resolve()
+            raise AssertionError("expected ValueError")
+        except ValueError:
+            pass
+
+
+def test_decision_cost_matrix_override_changes_output():
+    from src.evaluation.decision import cost_decisions, expected_costs, risk_scores
+
+    probs = np.array([[0.45, 0.20, 0.30, 0.05]])
+    default_decision = cost_decisions(probs)
+    # A cost matrix with a huge penalty for predicting 0 when true class is 1
+    # forces a different argmin than the default matrix.
+    alt = [[0, 100, 100, 100], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    alt_decision = cost_decisions(probs, cost_matrix=alt)
+    # Default matrix argmin'd to class 2; the alt matrix's huge penalty for
+    # predicting anything but 0 given probs[0]=0.45 flips it to class 0.
+    assert default_decision[0] == 2
+    assert alt_decision[0] == 0
+    assert np.allclose(expected_costs(probs, cost_matrix=alt), probs @ np.asarray(alt, dtype=float))
+    assert np.allclose(risk_scores(probs, cost_matrix=alt), (probs @ np.asarray(alt, dtype=float))[:, 0])
+    # Omitting cost_matrix still uses the module default (unchanged behaviour)
+    assert np.array_equal(cost_decisions(probs), default_decision)
+
+
+def test_run_scoring_end_to_end_with_overrides(tmp_path):
+    from src.inference.scoring import run_scoring
+    from src.inference.scoring_params import ScoringParams
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)
+    pred_df = _synth_score_df(30, 21, with_target=False)
+    out_csv = tmp_path / "queue.csv"
+
+    params = ScoringParams(bundle_path=str(bundle_path), output_path=str(out_csv))
+    q = run_scoring(pred_df, params)
+
+    assert len(q) == 30 and out_csv.exists()
+    assert list(pd.read_csv(out_csv).columns) == list(q.columns)
+    probs = q[["P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE"]].to_numpy()
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-4)
+
+    # Per-call override actually changes behaviour: carve everyone out ->
+    # nobody flagged ALREADY_SEVERE, nobody ranked either way is fine, but
+    # specifically current_cat>=99 should never trigger with a real dataset,
+    # so instead verify carve_current_cat_ge=0 flags EVERYONE as ALREADY_SEVERE.
+    params2 = ScoringParams(bundle_path=str(bundle_path), carve_current_cat_ge=0)
+    q2 = run_scoring(pred_df, params2)
+    assert (q2["RULE_FLAG"] == "ALREADY_SEVERE").all()
+    assert q2["RISK_RANK"].isna().all()   # nobody in the queue
+
+
+def test_run_scoring_calibration_df_refresh(tmp_path):
+    from src.inference.scoring import run_scoring
+    from src.inference.scoring_params import ScoringParams
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)
+    pred_df = _synth_score_df(15, 22, with_target=False)
+    cal_df  = _synth_score_df(400, 23, with_target=True)
+
+    params = ScoringParams(bundle_path=str(bundle_path), calibration_df=cal_df)
+    q = run_scoring(pred_df, params)
+    assert len(q) == 15
+    probs = q[["P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE"]].to_numpy()
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-4)
+
+
+def test_scoring_package_includes_manager_code_modules(tmp_path):
+    """build_scoring_package.py must ship scoring_params.py + scoring.py,
+    and run_scoring must work standalone (repo off sys.path, torch/optuna
+    blocked) exactly like score_dataframe does."""
+    import subprocess
+    import sys
+    import textwrap
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)
+    pkg_out = tmp_path / "scoring_package"
+    repo_root = Path(__file__).resolve().parent.parent
+
+    r = subprocess.run(
+        [sys.executable, str(repo_root / "build_scoring_package.py"),
+         "--bundle", str(bundle_path), "--output", str(pkg_out)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert (pkg_out / "src/inference/scoring.py").exists()
+    assert (pkg_out / "src/inference/scoring_params.py").exists()
+
+    pred_csv = tmp_path / "score_input2.csv"
+    _synth_score_df(10, 30, with_target=False).to_csv(pred_csv, index=False)
+
+    script = textwrap.dedent(f"""
+        import sys
+        sys.path = [p for p in sys.path if {str(repo_root)!r} not in p]
+        sys.path.insert(0, {str(pkg_out)!r})
+
+        class _Blocked:
+            def find_module(self, name, path=None):
+                if name.split(".")[0] in ("torch", "optuna", "umap", "pyodbc"):
+                    raise ImportError(f"BLOCKED: {{name}}")
+        sys.meta_path.insert(0, _Blocked())
+
+        import pandas as pd
+        from src.inference.scoring import run_scoring
+        from src.inference.scoring_params import ScoringParams
+
+        df = pd.read_csv({str(pred_csv)!r})
+        params = ScoringParams(bundle_path={str(pkg_out / "model_bundle.pkl")!r})
+        q = run_scoring(df, params)
+        assert len(q) == 10
+        print("OK")
+    """)
+    r2 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stderr
+    assert "OK" in r2.stdout

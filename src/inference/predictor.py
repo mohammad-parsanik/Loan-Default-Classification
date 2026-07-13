@@ -51,36 +51,54 @@ def apply_queue_flags(
     results: pd.DataFrame,
     multi_snapshot: bool,
     called_log: Optional[pd.DataFrame] = None,
+    *,
+    carve_current_cat_ge: Optional[int] = None,
+    certainty_act_threshold: Optional[float] = None,
+    api_data_ttl_days: Optional[int] = None,
+    pred_dedup_latest: Optional[bool] = None,
 ) -> np.ndarray:
     """
     RULE_FLAG per row. Priority (first match wins):
-      ALREADY_SEVERE   — current_cat >= CARVE_CURRENT_CAT_GE: known risk, no API
+      ALREADY_SEVERE   — current_cat >= carve_current_cat_ge: known risk, no API
       SUPERSEDED       — an older snapshot row of a customer whose newer row
                          carries the decision (only when several snapshots
-                         were scored and PRED_DEDUP_LATEST is on)
-      PREDICTED_SEVERE — RISK_SCORE >= CERTAINTY_ACT_THRESHOLD (when set):
+                         were scored and pred_dedup_latest is on)
+      PREDICTED_SEVERE — RISK_SCORE >= certainty_act_threshold (when set):
                          certain enough to act on directly, API adds nothing
-      RECENTLY_CALLED  — last API call fresher than API_DATA_TTL_DAYS:
+      RECENTLY_CALLED  — last API call fresher than api_data_ttl_days:
                          re-calling buys no new information yet
       ""               — competes for API budget in the ranked queue
+
+    Keyword-only knobs default to project_config when omitted (the
+    Predictor.predict()/score_dataframe() call sites); a caller that has
+    already resolved a ScoringParams (run_scoring) passes them explicitly
+    instead, so nothing here needs to re-read config at all in that path.
     """
+    if carve_current_cat_ge is None:
+        carve_current_cat_ge = config.CARVE_CURRENT_CAT_GE
+    if pred_dedup_latest is None:
+        pred_dedup_latest = getattr(config, "PRED_DEDUP_LATEST", True)
+    if certainty_act_threshold is None:
+        certainty_act_threshold = getattr(config, "CERTAINTY_ACT_THRESHOLD", None)
+    if api_data_ttl_days is None:
+        api_data_ttl_days = config.API_DATA_TTL_DAYS
+
     flags = np.full(len(results), "", dtype=object)
 
     strata = results["CURRENT_CAT"].to_numpy()
-    flags[strata >= config.CARVE_CURRENT_CAT_GE] = "ALREADY_SEVERE"
+    flags[strata >= carve_current_cat_ge] = "ALREADY_SEVERE"
 
-    if multi_snapshot and getattr(config, "PRED_DEDUP_LATEST", True):
+    if multi_snapshot and pred_dedup_latest:
         latest = results.groupby("NATIONAL_CODE")["SNAPSHOT_DATE"].transform("max")
         stale = (results["SNAPSHOT_DATE"] < latest).to_numpy()
         flags[(flags == "") & stale] = "SUPERSEDED"
 
-    threshold = getattr(config, "CERTAINTY_ACT_THRESHOLD", None)
-    if threshold is not None:
-        certain = results["RISK_SCORE"].to_numpy() >= threshold
+    if certainty_act_threshold is not None:
+        certain = results["RISK_SCORE"].to_numpy() >= certainty_act_threshold
         flags[(flags == "") & certain] = "PREDICTED_SEVERE"
 
     if called_log is not None and len(called_log):
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=config.API_DATA_TTL_DAYS)
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=api_data_ttl_days)
         fresh_calls = called_log[pd.to_datetime(called_log["CALLED_AT"]) >= cutoff]
         recently = results["NATIONAL_CODE"].isin(set(fresh_calls["NATIONAL_CODE"])).to_numpy()
         flags[(flags == "") & recently] = "RECENTLY_CALLED"
@@ -93,13 +111,23 @@ def score_instances(
     scorer,
     calibrator=None,
     called_log: Optional[pd.DataFrame] = None,
+    *,
+    cost_matrix=None,
+    carve_current_cat_ge: Optional[int] = None,
+    certainty_act_threshold: Optional[float] = None,
+    api_data_ttl_days: Optional[int] = None,
+    pred_dedup_latest: Optional[bool] = None,
 ) -> pd.DataFrame:
     """
-    Core scoring transform shared by Predictor.predict() and
-    score_dataframe(): instances -> calibrated+masked probabilities ->
+    Core scoring transform shared by Predictor.predict(), score_dataframe(),
+    and run_scoring(): instances -> calibrated+masked probabilities ->
     ranked queue DataFrame. Pure function of its arguments — no DB, no
     project-specific data access — so it's the safe reuse point for a
     standalone deployment.
+
+    The keyword-only knobs default to project_config when omitted (as
+    before); run_scoring() passes an already-resolved ScoringParams'
+    values explicitly instead.
     """
     if not instances:
         return pd.DataFrame()
@@ -126,16 +154,20 @@ def score_instances(
         "P_PAST_DUE":           probs[:, 2],
         "P_SEVERE_PAST_DUE":    probs[:, 3],
         # Minimum-expected-cost class under the business cost matrix
-        "PREDICTED_CLASS":      cost_decisions(probs),
+        "PREDICTED_CLASS":      cost_decisions(probs, cost_matrix),
         # THE queue ranking score: calibrated P(entering severe)
         "RISK_SCORE":           severity_scores(probs),
         # Secondary/diagnostic: expected cost of taking no action
-        "EXPECTED_COST":        risk_scores(probs),
+        "EXPECTED_COST":        risk_scores(probs, cost_matrix),
     })
 
     multi_snapshot = results["SNAPSHOT_DATE"].nunique() > 1
     results["RULE_FLAG"] = apply_queue_flags(
-        results, multi_snapshot=multi_snapshot, called_log=called_log
+        results, multi_snapshot=multi_snapshot, called_log=called_log,
+        carve_current_cat_ge=carve_current_cat_ge,
+        certainty_act_threshold=certainty_act_threshold,
+        api_data_ttl_days=api_data_ttl_days,
+        pred_dedup_latest=pred_dedup_latest,
     )
 
     # Queue rows first (by risk), flagged rows after; rank only the queue

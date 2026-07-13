@@ -11,27 +11,32 @@ import numpy as np
 
 import project_config as config
 
+# Default, read once at import time. Every function below also accepts an
+# explicit `cost_matrix=` override (e.g. from a resolved ScoringParams) —
+# needed because a module-level constant can't be changed per call, which
+# blocked per-data-source cost overrides for the standalone scoring module.
 COST_MATRIX = np.asarray(config.COST_MATRIX, dtype=np.float64)
 
 
-def expected_costs(probs: np.ndarray) -> np.ndarray:
+def expected_costs(probs: np.ndarray, cost_matrix=None) -> np.ndarray:
     """(N, n_classes) probabilities → (N, n_classes) expected cost per action."""
-    return np.asarray(probs) @ COST_MATRIX
+    cm = COST_MATRIX if cost_matrix is None else np.asarray(cost_matrix, dtype=np.float64)
+    return np.asarray(probs) @ cm
 
 
-def cost_decisions(probs: np.ndarray) -> np.ndarray:
+def cost_decisions(probs: np.ndarray, cost_matrix=None) -> np.ndarray:
     """Minimum-expected-cost class prediction. (N,) int array."""
-    return expected_costs(probs).argmin(axis=1)
+    return expected_costs(probs, cost_matrix).argmin(axis=1)
 
 
-def risk_scores(probs: np.ndarray) -> np.ndarray:
+def risk_scores(probs: np.ndarray, cost_matrix=None) -> np.ndarray:
     """
     Expected cost of *doing nothing* (predicting class 0) for each customer.
     Kept as a secondary/diagnostic score — the ranked API queue uses
     severity_scores() instead, because the cost matrix values are guessed
     while P(severe) uses only the observed label.
     """
-    return expected_costs(probs)[:, 0]
+    return expected_costs(probs, cost_matrix)[:, 0]
 
 
 def severity_scores(probs: np.ndarray) -> np.ndarray:

@@ -442,9 +442,27 @@ Mohammad ran the 15-fold walk-forward check (`WALK_FORWARD_ENABLED=True`, `MODEL
 
 `analyze_walk_forward.py --min_train_snaps N` (default 3) is now a permanent tool for this: prints both the naive all-fold verdict and one restricted to folds with realistic training volume, so this mistake can't repeat silently on a future run.
 
-## 17. What's Next (Prioritized)
+## 17. Cost-Matrix / Calibration Clarification + Manager-Code Scoring Module (July 2026)
+
+Mohammad asked two clarifying questions before greenlighting a tech-team request; both surfaced small real gaps.
+
+**Q1 (cost matrix, training vs. inference):** confirmed aligned. Training-time cost weighting is OFF (`BASELINE_COST_WEIGHTS=False`; the one model with a cost-sensitive *loss*, DeepSets, is disabled entirely) because it was found to hurt ranking (§13/§15). Inference-time cost matrix drives only `PREDICTED_CLASS`/`EXPECTED_COST` (secondary columns) — never `RISK_SCORE`. **Gap found:** `decision.py`'s `COST_MATRIX` was a module-level constant frozen at import time — impossible to override per call. Fixed: `expected_costs`/`cost_decisions`/`risk_scores` now accept an optional `cost_matrix=` param.
+
+**Q2 (calibration sample grouping):** confirmed `StratifiedCalibrator` groups the fitting sample by `current_cat` ALONE, never combined with predicted class — within each stratum it fits one isotonic curve per *output* class (that's the "predicted category" axis Mohammad was recalling, but it's a per-class curve, not a second grouping dimension). This was true in code but under-documented — CLAUDE.md now states it explicitly.
+
+**Tech team request:** a module (or set of modules) importable into their manager/orchestration code — pass a DataFrame + parameters, get a ranked-queue DataFrame/CSV back, independent of data source, with base-config fallback + a warning when parameters aren't passed explicitly. Training pipeline stays as-is (run ~2x/year).
+
+Implemented:
+- `src/inference/scoring_params.py` — `ScoringParams` dataclass: `bundle_path` (required), `calibration_df`/`output_path` (no config equivalent, never warned), and 7 business knobs (`called_log_path`, `certainty_act_threshold`, `carve_current_cat_ge`, `calibration_min_stratum_n`, `api_data_ttl_days`, `pred_dedup_latest`, `cost_matrix`) that fall back to `project_config` via `.resolve()`, logging one consolidated `logger.warning` naming exactly which fields defaulted.
+- `src/inference/scoring.py` — `run_scoring(df, params)`: the manager-code entry point. Resolves params, loads the bundle, optional DB-free calibration refresh from a supplied `calibration_df`, scores via the same shared `score_instances()` transform as `Predictor`/`score_dataframe()`, optional CSV write.
+- `apply_queue_flags`/`score_instances` (`predictor.py`) gained keyword-only explicit-override params threaded from `ScoringParams`, while keeping their old config-getattr defaults for the pre-existing `Predictor.predict()`/`score_dataframe()` call sites (fully backward compatible, no new warnings on old paths).
+- `build_scoring_package.py` updated (both new files added to the manifest; README documents both entry points — `score_dataframe()` for quick one-offs, `run_scoring`/`ScoringParams` for manager code).
+
+All verified locally (new tests + full suite); see `tests/test_pipeline_changes.py`.
+
+## 18. What's Next (Prioritized)
 
 1. **Optuna** (optional): set `ARM_OPTUNA_TRIALS=20` for a tuned `--final` fit — headroom likely small given how tightly the arms cluster.
-2. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order).
+2. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order). For the tech team's manager code: `build_scoring_package.py` → `run_scoring(df, ScoringParams(...))`.
 3. **Business items (non-blocking):** `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted; survivorship in the ETL sample remains the main open data question.
 4. **Nice-to-have:** update walk-forward's `build_fold_instances` to use customer-disjoint validation, matching the single-split path — only worth it if walk-forward becomes a routine check rather than an occasional one.

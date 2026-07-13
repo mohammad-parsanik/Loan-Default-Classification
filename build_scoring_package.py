@@ -37,6 +37,8 @@ SCORING_FILES = [
     "src/inference/__init__.py",
     "src/inference/model_loader.py",
     "src/inference/predictor.py",
+    "src/inference/scoring_params.py",
+    "src/inference/scoring.py",
 ]
 
 REQUIREMENTS = """\
@@ -62,7 +64,10 @@ pipeline, no torch/optuna, no database driver required.
 pip install -r requirements-scoring.txt
 ```
 
-## Score a DataFrame
+## Two ways to score
+
+**A. Quick one-off** — `score_dataframe()`, positional/keyword args, silent
+defaults from `project_config.py`:
 
 ```python
 import pandas as pd
@@ -74,32 +79,48 @@ queue = score_dataframe(df, "model_bundle.pkl")
 queue.to_csv("queue.csv", index=False)
 ```
 
+**B. Manager/orchestration code** — `run_scoring()` + `ScoringParams`, the
+recommended integration point when several data sources or call sites need
+different (or per-call-overridable) business knobs. Any field left unset
+falls back to `project_config.py`, and a single `logger.warning(...)` names
+exactly which fields defaulted — so a caller that forgot a parameter sees
+it in the logs instead of it silently happening:
+
+```python
+import pandas as pd
+from src.inference.scoring import run_scoring
+from src.inference.scoring_params import ScoringParams
+
+df = pd.read_csv("customers_to_score.csv")
+params = ScoringParams(
+    bundle_path="model_bundle.pkl",
+    output_path="queue.csv",             # optional — omit to just get the DataFrame back
+    called_log_path="calls.csv",         # optional
+    certainty_act_threshold=0.9,         # optional per-call override
+)
+queue = run_scoring(df, params)
+```
+
 `df` needs one row per loan with the same columns as the source ETL table
 (`NATIONAL_CODE`, `SNAPSHOT_DATE`, `DPD_DAYS`, `LOAN_CATEGORY`, ... — see
 this project's `column_changes.md`). Multiple loans per customer and
 multiple snapshots are handled automatically (grouped, deduped to the
 newest snapshot per customer).
 
-### Optional: refresh calibration
+### ScoringParams fields
 
-If you have a matured, labeled snapshot (a DataFrame with
-`WORST_FUTURE_CAT` populated), pass it as `calibration_df=` to refit the
-probability calibrator before scoring — otherwise the calibrator shipped
-in the bundle is used unchanged:
-
-```python
-queue = score_dataframe(df, "model_bundle.pkl", calibration_df=matured_df)
-```
-
-### Optional: call-ledger freshness
-
-```python
-queue = score_dataframe(df, "model_bundle.pkl", called_log_path="calls.csv")
-```
-
-`calls.csv` needs `NATIONAL_CODE, CALLED_AT` columns — customers called
-within the freshness window (`API_DATA_TTL_DAYS` in `project_config.py`)
-are flagged `RECENTLY_CALLED` and excluded from the ranked queue.
+| Field | Default source | Notes |
+|---|---|---|
+| `bundle_path` | — (required) | No sensible project-wide default for "which model". |
+| `calibration_df` | none (no config equivalent) | Optional matured, labeled DataFrame (`WORST_FUTURE_CAT` populated) to refit the calibrator before scoring. Omit to use the calibrator shipped in the bundle. |
+| `output_path` | none (no config equivalent) | Omit to just get the DataFrame back without writing a CSV. |
+| `called_log_path` | `API_CALL_LOG` | CSV with `NATIONAL_CODE, CALLED_AT`; recently-called customers are excluded from the queue. |
+| `certainty_act_threshold` | `CERTAINTY_ACT_THRESHOLD` | Rows at/above this score are flagged `PREDICTED_SEVERE` instead of ranked. |
+| `carve_current_cat_ge` | `CARVE_CURRENT_CAT_GE` | Current category at/above which customers are `ALREADY_SEVERE` (rule-flagged, never ranked). |
+| `calibration_min_stratum_n` | `CALIBRATION_MIN_STRATUM_N` | Only used when `calibration_df` is given. |
+| `api_data_ttl_days` | `API_DATA_TTL_DAYS` | Freshness window for the call ledger. |
+| `pred_dedup_latest` | `PRED_DEDUP_LATEST` | When `df` mixes several snapshots, keep only each customer's newest row in the queue. |
+| `cost_matrix` | `COST_MATRIX` | Drives the secondary `PREDICTED_CLASS`/`EXPECTED_COST` columns only — never the ranking (`RISK_SCORE` is cost-matrix-free by design). |
 
 ## Output columns
 
