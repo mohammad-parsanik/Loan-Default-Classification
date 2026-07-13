@@ -154,6 +154,18 @@ they get grouped into one portfolio, truncated to `MAX_LOANS_PER_CUSTOMER`
 produce **one row of output** for that customer. With `df` built, they
 call either:
 
+> **Which snapshot gets scored?** Neither `score_dataframe()` nor
+> `run_scoring()` takes a snapshot-date argument (that's specific to the
+> DB-backed `Predictor.predict()`/`run.py predict --snapshot_date` path,
+> §5 below). Here, you control it entirely by which rows are in `df` —
+> filter your own source data to the `SNAPSHOT_DATE` you want scored
+> before calling. Mixing several snapshots in one `df` is fine; `SNAPSHOT_DATE`
+> should be a **float** formatted `YYYYMMDD` (e.g. `20260621.0`, matching
+> the DB/cache convention used everywhere else in this project), and
+> `pred_dedup_latest` (`ScoringParams` field, default `True`) keeps only
+> each customer's newest row in the ranked queue — older rows are still
+> returned, flagged `SUPERSEDED`.
+
 ```python
 # Quick one-off, silent config defaults:
 from src.inference.predictor import score_dataframe

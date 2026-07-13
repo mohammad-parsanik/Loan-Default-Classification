@@ -66,6 +66,15 @@ pip install -r requirements-scoring.txt
 
 ## Two ways to score
 
+Neither entry point below takes a snapshot-date argument — you control
+which snapshot(s) get scored entirely by which rows are in `df` (filter
+your own source data to the `SNAPSHOT_DATE` you want before calling).
+`SNAPSHOT_DATE` should be a **float** formatted `YYYYMMDD` (e.g.
+`20260621.0`). Mixing several snapshots in one `df` is fine — `df` is one
+row per loan, and `pred_dedup_latest` (default `True`) keeps only each
+customer's newest row in the ranked queue; older rows are still returned,
+flagged `SUPERSEDED`.
+
 **A. Quick one-off** — `score_dataframe()`, positional/keyword args, silent
 defaults from `project_config.py`:
 
