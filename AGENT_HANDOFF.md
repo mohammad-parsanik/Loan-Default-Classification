@@ -430,10 +430,21 @@ Multiclass wins pooled AND the cat_0 early-warning slice — auto-selected, now 
 - **Fold aggregator reworked** for the ranking headline (mean±std of pooled AP + recall@windows across folds); WF best-fold now by AP. Walk-forward stays implemented, still disabled.
 - **`DEPLOYMENT.md`** — the train → (walk-forward check) → `--final` → move `model_bundle.pkl` → `predict` runbook with output-column reference and the call-ledger format.
 
-## 16. What's Next (Prioritized)
+## 16. Walk-Forward Stability Confirmed (July 12, 2026)
 
-1. **Quick temp run (optional, Mac/server):** with `WALK_FORWARD_ENABLED=False`, `ARM_OPTUNA_TRIALS=0` — a fast `python run.py train` sanity pass on the new arm-only + Phase-C code before the real runs.
-2. **Walk-forward stability check** (`DEPLOYMENT.md` step 2): `WALK_FORWARD_ENABLED=True`, `MODEL_ARMS=["multiclass","binary"]`, ~40 min/fold → `walk_forward_summary.json` mean±std of ranking AP across 2025. Revert both settings after.
-3. **Optuna** (optional): set `ARM_OPTUNA_TRIALS=20` for a tuned `--final` fit — headroom likely small given how tightly the arms cluster.
-4. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order).
-5. **Business items (non-blocking):** `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted; survivorship in the ETL sample remains the main open data question.
+Mohammad ran the 15-fold walk-forward check (`WALK_FORWARD_ENABLED=True`, `MODEL_ARMS=["multiclass","binary"]`, test snapshots Aug–Dec 2025). The console log was lost when the session closed, but `run.py` saves `<run_dir>/stages/fold_results.pkl` after every completed fold — `analyze_walk_forward.py` (new script) reconstructed the conclusion from it.
+
+**Finding:** pooled AP swung from 0.11 to 0.66 across folds — looked alarming until broken down by `train_snaps`. Every unstable fold shares the same cause: **trained on only 1 (sometimes 2) snapshots** — `train=[20240721]` alone is unstable on every test month regardless of which one (AP 0.11–0.37). This is an artifact of walk-forward enumerating every valid `(train, val, test)` combination, including thin early ones with almost no history — a regime production never occupies (it always trains on all mature snapshots).
+
+**Restricting to the 6 folds with ≥3 training snapshots — the only ones resembling real deployment volume — results are tight and consistent: AP 0.55–0.58 across four different test months (Oct–Dec 2025), and `multiclass` wins all 6 of those folds** (the naive all-fold average had "binary winning" only because it averages in the thin-data folds, where multiclass — being more data-hungry — degrades harder than binary on scraps of data; e.g. worst fold: multiclass 0.11 vs binary 0.36). Mean AP in the mature-fold regime (~0.565) closely tracks Run 6's full-scale static-split result (0.576) — **this is the confirmation that Run 6 wasn't a lucky single snapshot; the multiclass verdict is temporally stable.**
+
+**A real gap surfaced along the way, not yet fixed:** walk-forward's `build_fold_instances` still assigns validation as one whole calendar snapshot — it was never updated to the customer-disjoint carve-out (`VAL_SPLIT_MODE="customer"`) the single-split/`--final` path has used since July 7–8. This likely amplifies the thin-fold instability (calibration/early-stopping driven by an entire separate month rather than a customer-disjoint slice of the same training data) but wasn't the root cause — data volume was. Low priority to fix given walk-forward is off by default and thin folds aren't the production regime anyway; note it if walk-forward is ever leaned on more heavily.
+
+`analyze_walk_forward.py --min_train_snaps N` (default 3) is now a permanent tool for this: prints both the naive all-fold verdict and one restricted to folds with realistic training volume, so this mistake can't repeat silently on a future run.
+
+## 17. What's Next (Prioritized)
+
+1. **Optuna** (optional): set `ARM_OPTUNA_TRIALS=20` for a tuned `--final` fit — headroom likely small given how tightly the arms cluster.
+2. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order).
+3. **Business items (non-blocking):** `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted; survivorship in the ETL sample remains the main open data question.
+4. **Nice-to-have:** update walk-forward's `build_fold_instances` to use customer-disjoint validation, matching the single-split path — only worth it if walk-forward becomes a routine check rather than an occasional one.
