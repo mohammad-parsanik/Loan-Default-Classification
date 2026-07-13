@@ -12,7 +12,7 @@ A bank early-warning system that predicts the **worst delinquency class of a cus
 
 **Read `AGENT_HANDOFF.md` first** — it is the authoritative record of decisions, run results, and the leakage analysis. `column_changes.md` is the feature dictionary; `leakage_analysis.md` explains the temporal-split constraints.
 
-**Outdated documents (historical context only, do not trust):** `README.md`, `Implementation_plan.md`, `OLD_Documentation.md`, `OLD_ETL Document — EDP Feature Tables.md` (still useful for the label/ETL SQL logic), `Walk-Forward Validation Implementation.md`. They reference Oracle/cx_Oracle and a Set-Transformer; the actual stack is MSSQL/pyodbc and DeepSets.
+**Outdated documents (historical context only, do not trust):** `Implementation_plan.md`, `OLD_Documentation.md`, `OLD_ETL Document — EDP Feature Tables.md` (still useful for the label/ETL SQL logic), `Walk-Forward Validation Implementation.md`, `optimization_implementation_plan.md` (a pre-implementation bug/action-plan doc — every item in it, e.g. the timestamp format bug, missing checkpoint/resume, missing bootstrap CI, is long since fixed; reads like an open TODO list but isn't one). They reference Oracle/cx_Oracle and a Set-Transformer; the actual stack is MSSQL/pyodbc, and the deployed model is XGBoost on aggregated features (`src/baselines/aggregated_xgboost.py`) — DeepSets is legacy, disabled by default (`DEEPSETS_ENABLED=False`). `README.md` and `EXPLORATION.md` are current as of July 2026 — trust them.
 
 ## Environment reality
 
@@ -61,7 +61,7 @@ Stage checkpointing: each stage writes `<run_dir>/stages/<stage>.done` + a pickl
 
 ## Gotchas that matter
 
-- **Active model is `src/model/deep_sets.py`.** `src/model/set_transformer.py` is dead code (never imported by run.py). Trainer class is named `TransformerTrainer` but trains DeepSets.
+- **Active model is `src/baselines/aggregated_xgboost.py`** (arm `"multiclass"`, locked in `DEPLOY_ARM`). `src/model/deep_sets.py` is the legacy neural path, dead by default (`DEEPSETS_ENABLED=False`) after losing the Run-6 arms shootout on every ranking slice; `src/model/set_transformer.py` was never live at all (dead code, never imported by `run.py`). The trainer class is named `TransformerTrainer` but only runs when DeepSets is re-enabled.
 - `MAX_LOANS_PER_CUSTOMER` resolves at runtime to **2** (99th percentile). Most customers have 1 loan — this is why DeepSets ≈ baseline and why attention was abandoned.
 - Truncation to MAX_LOANS sorts by `DPD_DAYS` desc (a prediction-time feature). It previously sorted by the label `WORST_FUTURE_DPD` — fixed July 2026; do not reintroduce label columns into `process_raw_data` sorting. The label is `max` over ALL loans while features keep only the first MAX_LOANS; each instance also carries `current_cat` (current worst category, drives stratified evaluation).
 - Temporal split usability is computed against `date.today()` (`temporal_split._get_usable_snapshots`) — the same code produces different splits as calendar time passes. Snapshot dates are floats like `20241021.0`.

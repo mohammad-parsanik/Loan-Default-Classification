@@ -930,3 +930,70 @@ def test_build_scoring_package_runs_standalone(tmp_path):
     r2 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert r2.returncode == 0, r2.stderr
     assert "OK" in r2.stdout
+
+
+# ── explore_shap.py bundle mode (July 11 doc/tooling refresh) ──────────────────
+
+def test_explore_shap_load_from_bundle_produces_named_features(tmp_path):
+    import joblib
+    from src.data.data_loader import DataLoader
+    from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
+    from src.data.preprocessing import create_preprocessing_pipeline
+    from src.inference.model_loader import build_arm_bundle
+    from explore_shap import load_from_bundle
+
+    dl = DataLoader()
+    train_inst, feats = dl.process_raw_data(_synth_score_df(800, 1), max_loans=2)
+    scaler = create_preprocessing_pipeline(feats, config.BINARY_FEATURES)
+    scaler.fit([i["features"] for i in train_inst])
+    for inst, x in zip(train_inst, scaler.transform([i["features"] for i in train_inst])):
+        inst["features"] = x
+    Xtr, ytr = aggregate_features(train_inst)
+    cattr = np.array([i["current_cat"] for i in train_inst])
+    arm = ARM_BUILDERS["multiclass"]()
+    arm.train(Xtr, ytr, cattr)
+
+    bundle_path = tmp_path / "model_bundle.pkl"
+    joblib.dump(build_arm_bundle(scaler, arm, None, 2, feats), bundle_path)
+    data_path = tmp_path / "snap.csv"
+    _synth_score_df(40, 9, with_target=False).to_csv(data_path, index=False)
+
+    model, X, y, names = load_from_bundle(bundle_path, data_path)
+
+    assert X.shape == (40, 4 * len(feats) + 1)
+    assert len(names) == X.shape[1]
+    assert names[0] == f"MIN_{feats[0]}" and names[-1] == "N_LOANS"
+    # Reloaded (deserialized) model must predict identically to the original
+    assert np.allclose(model.predict_proba(X), arm.model.predict_proba(X))
+
+
+def test_explore_shap_rejects_multi_model_arms(tmp_path):
+    import joblib
+    from src.data.data_loader import DataLoader
+    from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
+    from src.data.preprocessing import create_preprocessing_pipeline
+    from src.inference.model_loader import build_arm_bundle
+    import explore_shap
+
+    dl = DataLoader()
+    train_inst, feats = dl.process_raw_data(_synth_score_df(500, 3), max_loans=2)
+    scaler = create_preprocessing_pipeline(feats, config.BINARY_FEATURES)
+    scaler.fit([i["features"] for i in train_inst])
+    for inst, x in zip(train_inst, scaler.transform([i["features"] for i in train_inst])):
+        inst["features"] = x
+    Xtr, ytr = aggregate_features(train_inst)
+    cattr = np.array([i["current_cat"] for i in train_inst])
+    ordinal = ARM_BUILDERS["ordinal"]()
+    ordinal.train(Xtr, ytr, cattr)   # has .models (list), no single .model
+
+    bundle_path = tmp_path / "model_bundle.pkl"
+    joblib.dump(build_arm_bundle(scaler, ordinal, None, 2, feats), bundle_path)
+    data_path = tmp_path / "snap.csv"
+    _synth_score_df(10, 8, with_target=False).to_csv(data_path, index=False)
+
+    try:
+        explore_shap.load_from_bundle(bundle_path, data_path)
+        raised = False
+    except SystemExit:
+        raised = True
+    assert raised, "load_from_bundle should reject multi-model arms (ordinal/per_cat)"
