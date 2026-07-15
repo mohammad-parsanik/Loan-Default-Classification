@@ -117,6 +117,18 @@ class DataLoader:
         """
         logger.info(f"Vectorising {len(df):,} rows into customer portfolios…")
 
+        # Guard against duplicate header rows embedded in the data (e.g. a
+        # source CSV concatenated from multiple export batches/runs) — such
+        # a row has the literal column name as its CUSTOMER_COL value, which
+        # can never occur in real data, and otherwise blows up label casting.
+        header_leak = df[config.CUSTOMER_COL].astype(str) == config.CUSTOMER_COL
+        if header_leak.any():
+            logger.warning(
+                f"Dropping {int(header_leak.sum())} duplicate header row(s) "
+                "embedded in the input data."
+            )
+            df = df.loc[~header_leak].reset_index(drop=True)
+
         feature_cols = self.get_feature_columns(df)
 
         # Sort: primary by group keys, secondary by *current* DPD descending so
