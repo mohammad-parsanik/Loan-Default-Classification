@@ -4,6 +4,7 @@
 /OLD_ETL Document — EDP Feature Tables.md
 /column_changes.md
 /offline_packages
+/offline_bundle_pandas_pyarrow
 *.zip
 optimization_implementation_plan.md
 src/.DS_Store
@@ -45,6 +46,7 @@ env/
 *.sqlite
 logs/
 /results_*/
+/sample_data
 
 # IDEs
 .vscode/

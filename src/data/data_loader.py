@@ -128,8 +128,24 @@ class DataLoader:
             ascending=[True, True, False],
         ).reset_index(drop=True)
 
-        # Pre-extract numpy arrays (avoids per-group pandas overhead)
-        X_all        = df[feature_cols].values.astype(np.float32)   # (N, F)
+        # Pre-extract numpy arrays (avoids per-group pandas overhead).
+        # Coerce rather than astype: source exports occasionally contain
+        # corrupted numeric strings (e.g. a decimal point mangled into a
+        # '/' by an upstream Excel re-save). Bad cells become NaN, which
+        # DomainAwareImputer already handles, instead of crashing the run.
+        X_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
+        bad_mask = X_df.isna() & df[feature_cols].notna()
+        if bad_mask.to_numpy().any():
+            bad_cols = bad_mask.any(axis=0)
+            examples = {
+                col: df.loc[bad_mask[col], col].iloc[0]
+                for col in bad_cols[bad_cols].index
+            }
+            logger.warning(
+                f"{int(bad_mask.to_numpy().sum())} unparseable numeric values "
+                f"coerced to NaN across {len(examples)} column(s): {examples}"
+            )
+        X_all        = X_df.values.astype(np.float32)   # (N, F)
         # Prediction table has no label column — instances get label = -1
         has_target   = config.TARGET_COL in df.columns
         y_all        = df[config.TARGET_COL].values if has_target else None  # (N,)
