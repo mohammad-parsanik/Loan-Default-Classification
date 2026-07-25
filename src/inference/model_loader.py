@@ -117,6 +117,10 @@ def load_bundle(bundle_path: Path, device: str):
     features = meta.get("features", [])
     max_loans = meta["max_loans_per_customer_99th"]
 
+    if meta.get("placeholder"):
+        # make_placeholder_bundle.py output: real structure, synthetic model.
+        logger.warning("PLACEHOLDER BUNDLE — %s", meta.get("placeholder_note", ""))
+
     if bundle.get("kind") == "arm":
         scorer = ArmScorer(bundle["scaler"], bundle["arm"], max_loans)
         return scorer, bundle.get("calibrator"), features

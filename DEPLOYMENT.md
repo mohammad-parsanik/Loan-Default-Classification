@@ -238,6 +238,38 @@ default-source table.
 > `metadata.json`); `Predictor`/`ModelLoader` accept either the directory
 > **or** the single bundle file.
 
+### 4b. Placeholder bundle — integrate before the real one leaves the server
+
+The trained bundle is built on the training server and getting files off
+that server is slow/awkward, so the receiving team would otherwise sit
+idle. `make_placeholder_bundle.py` produces a **synthetic** bundle with the
+real structure, so integration can start immediately:
+
+```bash
+python make_placeholder_bundle.py --package scoring_package_placeholder
+python make_placeholder_bundle.py --self-check   # build small + score, ~5s
+```
+
+It runs the actual training path (`process_raw_data` → preprocessing →
+`aggregate_features` → the `DEPLOY_ARM` arm → `StratifiedCalibrator`) on
+randomly generated data carrying the real column schema (the 64 feature
+columns of `column_changes.md`), and writes `placeholder/model_bundle.pkl`,
+a `sample_input.csv` (500 label-free loan rows to smoke-test with) and
+`PLACEHOLDER.md`. With `--package` it also emits a complete scoring package
+with the placeholder inside — the same folder layout the real handoff has,
+so swapping is one file copy and no code change.
+
+The scores are meaningless by construction. Guards against shipping it by
+accident: `metadata["placeholder"] = True` in the bundle, and `load_bundle`
+logs a `WARNING` naming it as a placeholder every time it is loaded.
+
+Two things the placeholder cannot verify, both worth re-checking on swap:
+the **feature column order** (preprocessing is positional, and the
+placeholder uses the documented order, not necessarily the training
+table's — compare the real bundle's `metadata["features"]`), and
+**library versions** (a pickle is version-sensitive; the placeholder
+records its own build versions under `metadata["built_with"]`).
+
 ## 5. Generate the queue (from this repo, pattern A)
 
 ```bash

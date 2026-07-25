@@ -57,3 +57,6 @@ logs/
 /models/
 /artifacts/
 /explore_output
+# Generated handoff artifacts
+/placeholder/
+/scoring_package*/
