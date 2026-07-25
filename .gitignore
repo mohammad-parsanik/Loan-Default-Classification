@@ -47,6 +47,7 @@ env/
 logs/
 /results_*/
 /sample_data
+/api_exploration/
 
 # IDEs
 .vscode/
