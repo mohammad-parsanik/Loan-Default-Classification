@@ -300,6 +300,46 @@ Consume from `RISK_RANK = 1` downward at 240/hour for as many hours as the
 budget allows. After each call, append `NATIONAL_CODE, CALLED_AT` to the
 ledger so the next cycle skips still-fresh enrichments.
 
+#### `RISK_SCORE` vs. `EXPECTED_COST` — why they're not the same number
+
+`RISK_SCORE` is exactly `P_SEVERE_PAST_DUE` (`severity_scores()` in
+`src/evaluation/decision.py`) — the calibrated, masked probability of the
+worst-class outcome, and nothing else. `COST_MATRIX` never touches it.
+
+`EXPECTED_COST` is a *different* quantity: the expected cost of predicting
+"no risk" (class 0), `Σ_i P_i × COST_MATRIX[i][0]` (`risk_scores()` in
+`decision.py`, confusingly named — it feeds this column, not `RISK_SCORE`).
+Because `COST_MATRIX`'s miss-cost column is much larger than 1
+(`[0.0, 1.5, 4.0, 7.5]`), this is not a probability and can exceed 1. For a
+typical `current_cat_0` customer with probability mass concentrated on
+`P_NO_DELAY`, both numbers stay small and can look deceptively close at a
+glance — but they diverge sharply once P2/P3 mass is meaningful, because
+they're computed from different formulas.
+
+**`PREDICTED_CLASS` can disagree with `argmax(P_i)`.** It comes from
+`cost_decisions()`, a Bayes-argmin rule over `COST_MATRIX` applied *after*
+the model's probabilities are produced — it is not an XGBoost threshold and
+has nothing to do with the training objective or PR-AUC. Example: a
+`current_cat_2` customer with `P_PAST_DUE_PLUS=0.8`, `P_SEVERE_PAST_DUE=0.2`
+(P0/P1 masked to 0 by `mask_monotone`):
+
+```
+cost(predict 2) = 0.8×0.0 + 0.2×2.5 = 0.5
+cost(predict 3) = 0.8×0.5 + 0.2×0.0 = 0.4   ← lower, so PREDICTED_CLASS = 3
+```
+
+even though class 2 has the higher probability. This is intentional and
+asymmetric by design: `COST_MATRIX` makes under-predicting severity (missing
+a true class-3) far more expensive than a false alarm on class 3, so a
+modest P(severe) is enough to tip the decision.
+
+**Practical implication:** only `RISK_SCORE` should drive the call queue —
+that's already what `RISK_RANK` sorts on. `PREDICTED_CLASS` and
+`EXPECTED_COST` are diagnostic/secondary; treat them as a rough read on
+"how costly would inaction be," not as ranking or gating signals, and
+remember `COST_MATRIX`'s class-3 row/column is an unvalidated extrapolation
+(see `CONFIG_REFERENCE.md`), so don't over-trust the exact numbers.
+
 ---
 
 ## Retraining cadence

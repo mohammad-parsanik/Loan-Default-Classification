@@ -131,7 +131,10 @@ costs nothing to enforce.
 **Ranking score:** `RISK_SCORE` = the calibrated, masked `P(class == 3)`
 for that customer. That's the entire sort key — no cost matrix, no
 learned ranking objective, just the class-3 probability from whichever
-arm is deployed.
+arm is deployed. `PREDICTED_CLASS`/`EXPECTED_COST` are a separate,
+cost-matrix-driven diagnostic and can legitimately disagree with
+`argmax(P_i)` — see "`RISK_SCORE` vs. `EXPECTED_COST`" in
+[DEPLOYMENT.md](DEPLOYMENT.md) for the worked example.
 
 ## Major decisions (why it looks like this)
 
