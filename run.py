@@ -50,7 +50,7 @@ from src.data.temporal_split import (
     generate_walk_forward_folds,
     build_fold_instances,
 )
-from src.baselines.aggregated_xgboost import ARM_BUILDERS, aggregate_features
+from src.baselines.aggregated_xgboost import ARM_BUILDERS, build_features
 from src.evaluation.fold_aggregator import (
     aggregate_fold_metrics,
     log_fold_summary,
@@ -201,6 +201,9 @@ def train_single_fold(
         "feature_count": len(features),
         "max_loans_per_customer_99th": max_loans,
         "features": features,
+        # What a scored row IS — inference builds instances and features to
+        # match this, not to whatever project_config says at predict time.
+        "grain": config.PREDICTION_GRAIN,
     }))
 
     # Current-category strata for slice-level evaluation and stratified
@@ -233,16 +236,16 @@ def train_single_fold(
 
     joblib.dump(preprocessor, fold_dir / "scaler.pkl")
 
-    # ── Aggregate once, shared by every arm ───────────────────────────────────
-    # aggregate_features is the expensive step (a full pass over every
-    # loan); computing it here ONCE per split and passing arrays to each
-    # arm avoids each of the 4 arms (5-6 counting the deployed-arm re-eval)
-    # redundantly re-deriving the identical matrix from train_inst/val_inst/
-    # test_inst.
-    with timed(f"{fold_label}: Aggregate features", timing):
-        X_train, y_train = aggregate_features(train_inst)
-        X_val,   y_val    = aggregate_features(val_inst)  if val_inst  else (None, None)
-        X_test,  y_test   = aggregate_features(test_inst) if test_inst else (None, None)
+    # ── Build features once, shared by every arm ──────────────────────────────
+    # build_features is the expensive step at portfolio grain (a full pass
+    # over every loan); computing it here ONCE per split and passing arrays
+    # to each arm avoids each of the 4 arms (5-6 counting the deployed-arm
+    # re-eval) redundantly re-deriving the identical matrix from
+    # train_inst/val_inst/test_inst. At loan grain it is a cheap concatenate.
+    with timed(f"{fold_label}: Build features", timing):
+        X_train, y_train = build_features(train_inst)
+        X_val,   y_val    = build_features(val_inst)  if val_inst  else (None, None)
+        X_test,  y_test   = build_features(test_inst) if test_inst else (None, None)
 
     # ── Stage: Model arms (XGBoost on aggregated features) ───────────────────
     # Each arm trains, calibrates on the customer-disjoint val, and is
@@ -334,6 +337,12 @@ def train_single_fold(
     # ── Legacy neural arm (DeepSets encoder + XGB meta-learner) ──────────────
     ds_history = {}
     if config.DEEPSETS_ENABLED:
+        if config.PREDICTION_GRAIN != "portfolio":
+            raise ValueError(
+                "DEEPSETS_ENABLED requires PREDICTION_GRAIN='portfolio' — DeepSets "
+                "is a set encoder over a customer's loans, and at loan grain every "
+                "set holds exactly one element, which reduces it to a plain MLP."
+            )
         ds_metrics, ds_history = _train_deepsets_legacy(
             fold_label, train_inst, val_inst, test_inst, features,
             fold_dir, plots_dir, device, timing, ckpt, max_loans,

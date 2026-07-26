@@ -83,6 +83,56 @@ def aggregate_features(instances: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     return X, y
 
 
+def flat_features(instances: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Loan grain: one instance is one loan, so its (1, F) matrix IS the feature
+    row — no reduction to do. Aggregating here instead would emit 4*F+1
+    columns of which only F carry information (min == max == mean == the
+    feature, std == 0, count == 1), so this skips it: ~4x less memory and a
+    correspondingly cheaper XGBoost fit.
+    """
+    n = len(instances)
+    if n == 0:
+        return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.int32)
+
+    bad = next((i for i in instances if i["features"].shape[0] != 1), None)
+    if bad is not None:
+        raise ValueError(
+            f"loan-grain instance has {bad['features'].shape[0]} loans, expected 1 — "
+            "instances were probably built under PREDICTION_GRAIN='portfolio'"
+        )
+
+    X = np.concatenate([i["features"] for i in instances]).astype(np.float32)
+    y = np.fromiter((i["label"] for i in instances), dtype=np.int32, count=n)
+    return X, y
+
+
+def build_features(
+    instances: list[dict], grain: Optional[str] = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Grain-aware feature matrix — THE entry point; callers shouldn't branch.
+
+    Training passes no `grain` and follows config.PREDICTION_GRAIN. INFERENCE
+    passes the grain recorded in the bundle instead, so a model always sees
+    features built the way it was fit, whatever the local config now says.
+    """
+    if (grain or config.PREDICTION_GRAIN) == "loan":
+        return flat_features(instances)
+    return aggregate_features(instances)
+
+
+def build_feature_names(raw_cols: list[str], grain: Optional[str] = None) -> list[str]:
+    """Column names of build_features() output, in order, for that grain."""
+    if (grain or config.PREDICTION_GRAIN) == "loan":
+        return list(raw_cols)
+    return (
+        [f"MIN_{f}" for f in raw_cols] + [f"MAX_{f}" for f in raw_cols]
+        + [f"MEAN_{f}" for f in raw_cols] + [f"STD_{f}" for f in raw_cols]
+        + ["N_LOANS"]
+    )
+
+
 class AggregatedXGBoostBaseline:
     """The "multiclass" arm: one multi:softprob model over all 4 classes."""
 
@@ -115,7 +165,10 @@ class AggregatedXGBoostBaseline:
         sw_train = self._sample_weights(y_train)
         eval_set = [(X_val, y_val)] if X_val is not None and len(X_val) else None
 
-        logger.info(f"Training XGBoost on {X_train.shape[1]} aggregated features…")
+        logger.info(
+            f"Training XGBoost on {X_train.shape[1]} "
+            f"{config.PREDICTION_GRAIN}-grain features…"
+        )
         self.model = xgb.XGBClassifier(
             objective="multi:softprob",
             num_class=config.NUM_CLASSES,

@@ -25,6 +25,23 @@ META_COLS = [ID_COL, CONTRACT_COL, CUSTOMER_COL,
 
 NUM_CLASSES = 4  # {0: No Delay, 1: Current, 2: Past Due+, 3: Severe Past Due}
 
+# ── Prediction grain ─────────────────────────────────────────────────────
+# What one scored row IS.
+#   "loan"      — one row per (LOAN_ID, SNAPSHOT_DATE); the ETL's native
+#                 grain. WORST_FUTURE_CAT is already a per-loan label
+#                 (MAX(LABEL_DPD) GROUP BY LOAN_ID upstream), so this is
+#                 the label as the source computes it. Business asked for
+#                 per-loan risk; also lets a healthy loan stay in the queue
+#                 while a sibling loan of the same customer is carved out
+#                 as ALREADY_SEVERE.
+#   "portfolio" — one row per (NATIONAL_CODE, SNAPSHOT_DATE); loans are
+#                 collapsed with label = max(loan labels) and features
+#                 aggregated to min/max/mean/std + count. The pre-July-2026
+#                 behaviour that results_1..results_6 were measured under.
+# Kept switchable so the loan-grain run can be compared against the
+# existing benchmark; delete the portfolio path once loan grain is accepted.
+PREDICTION_GRAIN = "loan"
+
 # ── Cost matrix (single source of truth) ─────────────────
 # COST_MATRIX[true][predicted]. Used by:
 #   - losses.CostSensitiveFocalLoss (training-time nudge, DeepSets)
@@ -184,7 +201,10 @@ CERTAINTY_ACT_THRESHOLD = None
 # v1.1: truncation sort key WORST_FUTURE_DPD -> DPD_DAYS; cache adds current_cats.
 # v1.2: NUM_CLASSES 3 -> 4 (raw cats 3-4 now collapse into a new class 3
 # instead of into class 2) -- labels baked into the cache change, must rebuild.
-DATA_VERSION = "v1.2"
+# v1.3: instances carry loan_id + portfolio_n_loans, and PREDICTION_GRAIN
+# changes what an instance IS -- new NPZ arrays, must rebuild. (The grain
+# itself is also part of the cache key, so the two grains cache separately.)
+DATA_VERSION = "v1.3"
 
 # ── Model — DeepSets (CPU-optimized) ────────────────────
 MAX_LOANS_PER_CUSTOMER = None  # Computed from data (99th percentile)

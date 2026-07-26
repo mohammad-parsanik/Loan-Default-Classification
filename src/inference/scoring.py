@@ -65,7 +65,7 @@ def run_scoring(df: pd.DataFrame, params: ScoringParams) -> pd.DataFrame:
     dl = DataLoader()
 
     if params.calibration_df is not None:
-        cal_inst, _ = dl.process_raw_data(params.calibration_df, scorer.truncate_loans)
+        cal_inst, _ = dl.process_raw_data(params.calibration_df, scorer.truncate_loans, scorer.grain)
         cal_inst = [i for i in cal_inst if i["label"] >= 0]
         if cal_inst:
             probs  = scorer.raw_probs(cal_inst)
@@ -78,7 +78,7 @@ def run_scoring(df: pd.DataFrame, params: ScoringParams) -> pd.DataFrame:
         else:
             logger.warning("calibration_df had no matured/labelled rows — calibrator unchanged.")
 
-    instances, _ = dl.process_raw_data(df, scorer.truncate_loans)
+    instances, _ = dl.process_raw_data(df, scorer.truncate_loans, scorer.grain)
     called_log = _load_called_log(params.called_log_path)
 
     results = score_instances(

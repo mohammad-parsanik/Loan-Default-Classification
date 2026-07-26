@@ -6,7 +6,7 @@ can wire up the scoring package before the real, server-trained bundle can be
 exported off the training server.
 
 The placeholder is produced by running the *actual* training path
-(process_raw_data -> preprocessing pipeline -> aggregate_features ->
+(process_raw_data -> preprocessing pipeline -> build_features ->
 multiclass arm -> StratifiedCalibrator) on synthetic data that carries the
 real column schema. So it loads, scores, ranks and flags exactly like the real
 bundle — only the numbers are meaningless. Swapping in the real bundle later is
@@ -143,7 +143,7 @@ def synth_frame(n_rows: int, seed: int, snapshot: float = 20260601.0,
 # ── build ─────────────────────────────────────────────────────────────────────
 
 def build_bundle(out_path: Path, n_train: int, n_val: int, seed: int) -> Path:
-    from src.baselines.aggregated_xgboost import ARM_BUILDERS, aggregate_features
+    from src.baselines.aggregated_xgboost import ARM_BUILDERS, build_features
     from src.data.data_loader import DataLoader
     from src.data.preprocessing import create_preprocessing_pipeline
     from src.evaluation.calibration import StratifiedCalibrator
@@ -159,8 +159,8 @@ def build_bundle(out_path: Path, n_train: int, n_val: int, seed: int) -> Path:
         for inst, x in zip(split, scaler.transform([i["features"] for i in split])):
             inst["features"] = x
 
-    X_tr, y_tr = aggregate_features(train_inst)
-    X_v, y_v = aggregate_features(val_inst)
+    X_tr, y_tr = build_features(train_inst)
+    X_v, y_v = build_features(val_inst)
     cat_tr = np.array([i["current_cat"] for i in train_inst])
     cat_v = np.array([i["current_cat"] for i in val_inst])
 
@@ -204,10 +204,15 @@ def self_check(tmp_dir: Path) -> None:
     df = synth_frame(400, seed=99, snapshot=20260701.0, with_target=False)
     q = run_scoring(df, ScoringParams(bundle_path=bundle))
 
-    assert len(q) == df["NATIONAL_CODE"].nunique(), (len(q), df["NATIONAL_CODE"].nunique())
+    # One scored row per unit of prediction: a loan, or a whole customer.
+    expected_rows = (
+        len(df) if config.PREDICTION_GRAIN == "loan"
+        else df["NATIONAL_CODE"].nunique()
+    )
+    assert len(q) == expected_rows, (len(q), expected_rows)
     for col in ["RISK_RANK", "RISK_SCORE", "RULE_FLAG", "CURRENT_CAT",
                 "P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE",
-                "PREDICTED_CLASS", "EXPECTED_COST"]:
+                "PREDICTED_CLASS", "EXPECTED_COST", "CUSTOMER_MAX_RISK_SCORE"]:
         assert col in q.columns, col
     queued = q[q["RULE_FLAG"] == ""]
     assert queued["RISK_RANK"].tolist() == list(range(1, len(queued) + 1))

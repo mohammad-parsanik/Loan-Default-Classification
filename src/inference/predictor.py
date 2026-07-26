@@ -147,7 +147,12 @@ def score_instances(
     results = pd.DataFrame({
         "SNAPSHOT_DATE":        [i["snapshot_date"]  for i in instances],
         "NATIONAL_CODE":        [i["national_code"]  for i in instances],
-        "N_LOANS_IN_PORTFOLIO": [i["n_loans"]        for i in instances],
+        # Identifies the scored row at loan grain; None at portfolio grain,
+        # where a row is the whole customer rather than one loan.
+        "LOAN_ID":              [i.get("loan_id")    for i in instances],
+        # The customer's TRUE loan count, not the number of loans in this
+        # row — at loan grain every row holds exactly one.
+        "N_LOANS_IN_PORTFOLIO": [i.get("portfolio_n_loans", i["n_loans"]) for i in instances],
         "CURRENT_CAT":          strata,
         "P_NO_DELAY":           probs[:, 0],
         "P_CURRENT":            probs[:, 1],
@@ -160,6 +165,13 @@ def score_instances(
         # Secondary/diagnostic: expected cost of taking no action
         "EXPECTED_COST":        risk_scores(probs, cost_matrix),
     })
+
+    # Customer-level rollup: the worst loan the customer has. Not used for
+    # ranking (the queue is per row) — it's context for consumers that make
+    # a decision about the customer as a whole.
+    results["CUSTOMER_MAX_RISK_SCORE"] = results.groupby(
+        ["NATIONAL_CODE", "SNAPSHOT_DATE"]
+    )["RISK_SCORE"].transform("max")
 
     multi_snapshot = results["SNAPSHOT_DATE"].nunique() > 1
     results["RULE_FLAG"] = apply_queue_flags(
@@ -189,6 +201,21 @@ def score_instances(
         f"At {config.API_RATE_PER_HOUR}/h the full queue takes "
         f"{n_queue / config.API_RATE_PER_HOUR:.0f}h to call."
     )
+
+    # At loan grain two loans of one customer can both sit in the callable
+    # window, but the API is keyed by NATIONAL_CODE — they cost two queue
+    # slots and one call. That makes recall@K conservative, which is the safe
+    # direction, but the gap should stay small: log it so it can't drift
+    # unnoticed as the carve-out lets more sibling loans into the queue.
+    head = results.head(int(config.API_RATE_PER_HOUR * 24))
+    head = head[head["RULE_FLAG"] == ""]
+    dupes = len(head) - head["NATIONAL_CODE"].nunique()
+    if dupes:
+        logger.info(
+            f"Top {len(head):,} queue rows cover {head['NATIONAL_CODE'].nunique():,} "
+            f"distinct customers ({dupes:,} rows are a second loan of a customer "
+            "already in the window — one API call serves both)."
+        )
     return results
 
 
@@ -219,7 +246,7 @@ def score_dataframe(
     dl = DataLoader()
 
     if calibration_df is not None:
-        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.truncate_loans)
+        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.truncate_loans, scorer.grain)
         cal_inst = [i for i in cal_inst if i["label"] >= 0]
         if cal_inst:
             probs  = scorer.raw_probs(cal_inst)
@@ -230,7 +257,7 @@ def score_dataframe(
             ).fit(probs, y, strata)
             logger.info(f"Calibrator refreshed on {len(cal_inst):,} supplied instances.")
 
-    instances, _ = dl.process_raw_data(df, max_loans or scorer.truncate_loans)
+    instances, _ = dl.process_raw_data(df, max_loans or scorer.truncate_loans, scorer.grain)
     called_log = Predictor._load_called_log(called_log_path)
     return score_instances(instances, scorer, calibrator, called_log)
 
@@ -255,7 +282,9 @@ class Predictor:
     def _refresh_calibrator(self) -> None:
         """Refit the calibrator on the newest matured-label snapshot."""
         try:
-            instances, _ = self.data_loader.load_train_portfolios(use_cache=True)
+            instances, _ = self.data_loader.load_train_portfolios(
+                use_cache=True, grain=self.scorer.grain
+            )
         except Exception as e:
             logger.warning(f"Recalibration skipped (train data unavailable): {e}")
             return
@@ -331,7 +360,9 @@ class Predictor:
 
         instances: list[dict] = []
         for snap in resolved:
-            snap_instances, _ = self.data_loader.load_pred_portfolios(snap, self.truncate_loans)
+            snap_instances, _ = self.data_loader.load_pred_portfolios(
+                snap, self.truncate_loans, grain=self.scorer.grain
+            )
             instances.extend(snap_instances)
 
         if not instances:

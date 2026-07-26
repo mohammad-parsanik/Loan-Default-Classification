@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
-def _cache_key(extra: str = "") -> str:
+def _cache_key(extra: str = "", grain: Optional[str] = None) -> str:
     """
     Returns a short hex string that uniquely identifies the data schema.
     Changing DATA_VERSION, table name, META_COLS, or the DB name busts the cache.
@@ -44,6 +44,10 @@ def _cache_key(extra: str = "") -> str:
             "train_table": config.TRAIN_TABLE,
             "meta_cols": sorted(config.META_COLS),
             "database": config.MSSQL_DATABASE,
+            # An instance means something different per grain, so the two
+            # must never share a cache file. Taken as an argument, not read
+            # from config, so an explicit-grain caller keys its own cache.
+            "grain": grain or config.PREDICTION_GRAIN,
             "extra": extra,
         },
         sort_keys=True,
@@ -106,16 +110,31 @@ class DataLoader:
         self,
         df: pd.DataFrame,
         max_loans: Optional[int] = None,
+        grain: Optional[str] = None,
     ) -> tuple[list[dict], list[str]]:
         """
-        Convert flat DataFrame → list of customer portfolio dicts.
+        Convert flat DataFrame → list of instance dicts.
+
+        `grain` (default config.PREDICTION_GRAIN) decides what an instance is:
+          "portfolio" — one per (CUSTOMER, SNAPSHOT); loans collapsed, label
+                        = max over the customer's loans.
+          "loan"      — one per input row; label and current_cat are that
+                        loan's own, as the ETL computes them. `max_loans` is
+                        irrelevant here (nothing to truncate) and is ignored.
 
         Vectorised approach:
           1. Sort by (CUSTOMER, SNAPSHOT, DPD desc) — one sort, no per-group copies
           2. np.unique on composite key → group boundaries in O(N)
           3. Slice pre-extracted numpy arrays per group (no pandas overhead in loop)
+
+        Both grains carry `portfolio_n_loans` (the customer's true loan count
+        at that snapshot) so downstream output keeps portfolio context even
+        when scoring one loan at a time. It is NOT a model feature.
         """
-        logger.info(f"Vectorising {len(df):,} rows into customer portfolios…")
+        grain = grain or config.PREDICTION_GRAIN
+        if grain not in ("loan", "portfolio"):
+            raise ValueError(f"unknown PREDICTION_GRAIN {grain!r}")
+        logger.info(f"Vectorising {len(df):,} rows into {grain} instances…")
 
         # Guard against duplicate header rows embedded in the data (e.g. a
         # source CSV concatenated from multiple export batches/runs) — such
@@ -166,6 +185,12 @@ class DataLoader:
         cat_all      = df["LOAN_CATEGORY"].values                    # (N,)
         customers    = df[config.CUSTOMER_COL].to_numpy(dtype=object)                # (N,)
         snapshots    = df[config.SNAPSHOT_COL].to_numpy(dtype=object)                # (N,)
+        # Identifies the scored row at loan grain. A synthetic/legacy frame may
+        # not carry it; downstream output falls back to None.
+        loan_ids = (
+            df[config.ID_COL].to_numpy(dtype=object)
+            if config.ID_COL in df.columns else np.full(len(df), None, dtype=object)
+        )
 
         # Build composite group key and find group boundaries
         composite = np.char.add(
@@ -182,33 +207,55 @@ class DataLoader:
         group_sizes = group_sizes[order]
 
         instances: list[dict] = []
-        for start, size in tqdm(
-            zip(start_idx, group_sizes),
-            total=len(start_idx),
-            desc="Building portfolios",
-        ):
-            end = start + size
-            keep = min(size, max_loans) if max_loans else size
+        cap = config.NUM_CLASSES - 1
 
-            feature_matrix = X_all[start : start + keep]          # (keep, F)
-            label = (
-                int(min(int(y_all[start:end].max()), config.NUM_CLASSES - 1))
-                if has_target else -1
-            )
-            current_cat = int(min(int(cat_all[start:end].max()), config.NUM_CLASSES - 1))
+        if grain == "loan":
+            # Every row is its own instance; the group scan is only needed to
+            # attach the customer's loan count to each of their rows.
+            portfolio_sizes = np.repeat(group_sizes, group_sizes)
+            for i in tqdm(range(len(df)), desc="Building loan instances"):
+                instances.append(
+                    {
+                        "national_code":     customers[i],
+                        "snapshot_date":     snapshots[i],
+                        "loan_id":           loan_ids[i],
+                        "n_loans":           1,
+                        "portfolio_n_loans": int(portfolio_sizes[i]),
+                        "features":          X_all[i : i + 1],       # (1, F)
+                        "label":             int(min(int(y_all[i]), cap)) if has_target else -1,
+                        "current_cat":       int(min(int(cat_all[i]), cap)),
+                    }
+                )
+        else:
+            for start, size in tqdm(
+                zip(start_idx, group_sizes),
+                total=len(start_idx),
+                desc="Building portfolios",
+            ):
+                end = start + size
+                keep = min(size, max_loans) if max_loans else size
 
-            instances.append(
-                {
-                    "national_code":  customers[start],
-                    "snapshot_date":  snapshots[start],
-                    "n_loans":        int(size),
-                    "features":       feature_matrix,
-                    "label":          label,
-                    "current_cat":    current_cat,
-                }
-            )
+                feature_matrix = X_all[start : start + keep]          # (keep, F)
+                label = (
+                    int(min(int(y_all[start:end].max()), cap))
+                    if has_target else -1
+                )
+                current_cat = int(min(int(cat_all[start:end].max()), cap))
 
-        logger.info(f"Created {len(instances):,} customer portfolio instances.")
+                instances.append(
+                    {
+                        "national_code":     customers[start],
+                        "snapshot_date":     snapshots[start],
+                        "loan_id":           None,   # a portfolio is not one loan
+                        "n_loans":           int(size),
+                        "portfolio_n_loans": int(size),
+                        "features":          feature_matrix,
+                        "label":             label,
+                        "current_cat":       current_cat,
+                    }
+                )
+
+        logger.info(f"Created {len(instances):,} {grain} instances.")
         return instances, feature_cols
 
     # ── NPZ cache I/O ─────────────────────────────────────────────────────────
@@ -242,6 +289,11 @@ class DataLoader:
         n_loans = np.array([inst["n_loans"] for inst in instances], dtype=np.int32)
         national_codes = np.array([inst["national_code"] for inst in instances])
         snapshot_dates = np.array([inst["snapshot_date"] for inst in instances])
+        loan_ids = np.array([inst.get("loan_id") for inst in instances], dtype=object)
+        portfolio_n_loans = np.array(
+            [inst.get("portfolio_n_loans", inst["n_loans"]) for inst in instances],
+            dtype=np.int32,
+        )
 
         np.savez_compressed(
             cache_path,
@@ -252,6 +304,8 @@ class DataLoader:
             n_loans=n_loans,
             national_codes=national_codes,
             snapshot_dates=snapshot_dates,
+            loan_ids=loan_ids,
+            portfolio_n_loans=portfolio_n_loans,
         )
 
         _write_manifest(
@@ -272,6 +326,8 @@ class DataLoader:
             n_loans        = npz["n_loans"]
             national_codes = npz["national_codes"]
             snapshot_dates = npz["snapshot_dates"]
+            loan_ids          = npz["loan_ids"]
+            portfolio_n_loans = npz["portfolio_n_loans"]
 
         with open(_manifest_path(cache_path)) as f:
             manifest = json.load(f)
@@ -279,12 +335,14 @@ class DataLoader:
 
         instances = [
             {
-                "national_code": national_codes[i],
-                "snapshot_date": snapshot_dates[i],
-                "n_loans":       int(n_loans[i]),
-                "features":      features_flat[offsets[i] : offsets[i + 1]],
-                "label":         int(labels[i]),
-                "current_cat":   int(current_cats[i]),
+                "national_code":     national_codes[i],
+                "snapshot_date":     snapshot_dates[i],
+                "loan_id":           loan_ids[i],
+                "n_loans":           int(n_loans[i]),
+                "portfolio_n_loans": int(portfolio_n_loans[i]),
+                "features":          features_flat[offsets[i] : offsets[i + 1]],
+                "label":             int(labels[i]),
+                "current_cat":       int(current_cats[i]),
             }
             for i in range(len(labels))
         ]
@@ -298,18 +356,19 @@ class DataLoader:
         snapshot_dates: Optional[list] = None,
         max_loans: Optional[int] = None,
         use_cache: bool = True,
+        grain: Optional[str] = None,
     ) -> tuple[list[dict], list[str]]:
         """
-        Load training data from MSSQL → portfolio instances.
-        Returns (instances, feature_names).
+        Load training data from MSSQL → instances at `grain`
+        (default config.PREDICTION_GRAIN). Returns (instances, feature_names).
 
         Cache is invalidated when:
           - DATA_VERSION changes in project_config.py
           - Table name, META_COLS, or DB name changes
-          - max_loans changes
+          - max_loans or the grain changes
         """
         extra = str(max_loans or "auto")
-        key   = _cache_key(extra)
+        key   = _cache_key(extra, grain)
         cache_path = config.DATA_DIR / "train_portfolios_cache.npz"
 
         if use_cache and _cache_is_valid(cache_path, key):
@@ -321,7 +380,7 @@ class DataLoader:
         conn, close_conn = self._get_conn()
         try:
             df = conn.load_training_data(snapshot_dates=snapshot_dates)
-            instances, feature_cols = self.process_raw_data(df, max_loans)
+            instances, feature_cols = self.process_raw_data(df, max_loans, grain)
             if use_cache:
                 ml = max_loans or (
                     int(np.percentile([i["n_loans"] for i in instances], 99))
@@ -337,10 +396,11 @@ class DataLoader:
         snapshot_date: int,
         max_loans: Optional[int] = None,
         use_cache: bool = True,
+        grain: Optional[str] = None,
     ) -> tuple[list[dict], list[str]]:
-        """Load prediction data for a single snapshot."""
+        """Load prediction data for a single snapshot at `grain`."""
         extra = f"pred_{snapshot_date}_{max_loans or 'auto'}"
-        key   = _cache_key(extra)
+        key   = _cache_key(extra, grain)
         cache_path = config.DATA_DIR / f"pred_portfolios_cache_{snapshot_date}.npz"
 
         if use_cache and _cache_is_valid(cache_path, key):
@@ -355,7 +415,7 @@ class DataLoader:
             # never real labels. Drop them so process_raw_data's normal
             # "column absent -> label = -1" path applies here too.
             df = df.drop(columns=[config.TARGET_COL, "WORST_FUTURE_DPD"], errors="ignore")
-            instances, feature_cols = self.process_raw_data(df, max_loans)
+            instances, feature_cols = self.process_raw_data(df, max_loans, grain)
             if use_cache:
                 self._save_cache(cache_path, instances, feature_cols, max_loans or 99, key)
             return instances, feature_cols

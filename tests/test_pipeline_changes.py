@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import project_config as config
 from src.data.data_loader import DataLoader
@@ -48,7 +49,11 @@ def _make_df(with_target: bool = True) -> pd.DataFrame:
 
 
 def test_truncation_keeps_currently_worst_loans_not_future_worst():
-    instances, feature_cols = DataLoader().process_raw_data(_make_df(), max_loans=2)
+    # Portfolio grain by construction: truncation only exists when several
+    # loans are collapsed into one instance.
+    instances, feature_cols = DataLoader().process_raw_data(
+        _make_df(), max_loans=2, grain="portfolio"
+    )
     assert len(instances) == 1
     inst = instances[0]
 
@@ -93,7 +98,7 @@ def test_prediction_table_without_labels_is_processed():
     # Old code crashed here: sort key WORST_FUTURE_DPD doesn't exist on
     # EDP_Feature_pred, and neither does TARGET_COL.
     instances, feature_cols = DataLoader().process_raw_data(
-        _make_df(with_target=False), max_loans=2
+        _make_df(with_target=False), max_loans=2, grain="portfolio"
     )
     assert len(instances) == 1
     assert instances[0]["label"] == -1
@@ -251,10 +256,11 @@ class _FakeConnector:
         return self._pred_df
 
 
-def test_load_pred_portfolios_drops_degenerate_label_columns():
+def test_load_pred_portfolios_drops_degenerate_label_columns(monkeypatch):
     # On TRAIN_TABLE, an immature snapshot's WORST_FUTURE_* columns hold a
     # degenerate value (worst-so-far, not the real future outcome) rather
     # than being absent — must not leak in as a label.
+    monkeypatch.setattr(config, "PREDICTION_GRAIN", "portfolio")   # 3 loans -> 1 instance
     fake = _FakeConnector(pred_df=_make_df(with_target=True))
     instances, feature_cols = DataLoader(mssql_connector=fake).load_pred_portfolios(
         20250101, max_loans=2, use_cache=False
@@ -717,7 +723,7 @@ def test_arm_builders_registry_matches_config():
 
 def _fit_arm_and_scaler(seed=1):
     """Train a multiclass arm the way run.py does; return (scaler, arm, cal, pred_raw)."""
-    from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
+    from src.baselines.aggregated_xgboost import build_features, ARM_BUILDERS
     from src.evaluation.calibration import StratifiedCalibrator
     from src.data.preprocessing import create_preprocessing_pipeline
 
@@ -732,8 +738,8 @@ def _fit_arm_and_scaler(seed=1):
         for inst, x in zip(split, scaler.transform([i["features"] for i in split])):
             inst["features"] = x
 
-    X_tr, y_tr = aggregate_features(train)
-    X_v,  y_v  = aggregate_features(val)
+    X_tr, y_tr = build_features(train)
+    X_v,  y_v  = build_features(val)
     cat_tr = np.array([i["current_cat"] for i in train])
     cat_v  = np.array([i["current_cat"] for i in val])
     arm = ARM_BUILDERS["multiclass"]()
@@ -747,7 +753,7 @@ def test_arm_scorer_bundle_and_dir_roundtrip(tmp_path):
     from src.inference.model_loader import build_arm_bundle, ModelLoader, ArmScorer
 
     scaler, arm, cal, feats, pred = _fit_arm_and_scaler()
-    ref = ArmScorer(scaler, arm).raw_probs(pred)
+    ref = ArmScorer(scaler, arm, config.PREDICTION_GRAIN).raw_probs(pred)
 
     # Bundle round-trip
     joblib.dump(build_arm_bundle(scaler, arm, cal, 2, feats), tmp_path / "model_bundle.pkl")
@@ -764,7 +770,8 @@ def test_arm_scorer_bundle_and_dir_roundtrip(tmp_path):
     joblib.dump(scaler, d / "scaler.pkl")
     joblib.dump(cal, d / "calibrator.pkl")
     (d / "metadata.json").write_text(json.dumps(
-        {"feature_count": 6, "max_loans_per_customer_99th": 2, "features": feats}))
+        {"feature_count": 6, "max_loans_per_customer_99th": 2, "features": feats,
+         "grain": config.PREDICTION_GRAIN}))
     scorer_d, _, _ = ModelLoader(d).load_pipeline()
     assert np.allclose(ref, scorer_d.raw_probs(pred), atol=1e-6)
 
@@ -823,7 +830,7 @@ def _fit_bundle_via_dataframe(tmp_path):
     process_raw_data -> aggregate_features -> arm.train. Returns bundle_path."""
     import joblib
     from src.data.data_loader import DataLoader
-    from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
+    from src.baselines.aggregated_xgboost import build_features, ARM_BUILDERS
     from src.evaluation.calibration import StratifiedCalibrator
     from src.data.preprocessing import create_preprocessing_pipeline
     from src.inference.model_loader import build_arm_bundle
@@ -838,8 +845,8 @@ def _fit_bundle_via_dataframe(tmp_path):
         for inst, x in zip(split, scaler.transform([i["features"] for i in split])):
             inst["features"] = x
 
-    Xtr, ytr = aggregate_features(train_inst)
-    Xv, yv   = aggregate_features(val_inst)
+    Xtr, ytr = build_features(train_inst)
+    Xv, yv   = build_features(val_inst)
     cattr = np.array([i["current_cat"] for i in train_inst])
     catv  = np.array([i["current_cat"] for i in val_inst])
     arm = ARM_BUILDERS["multiclass"]()
@@ -869,7 +876,7 @@ def test_score_dataframe_matches_predictor_shape(tmp_path):
     assert (ranked["RISK_SCORE"].diff().dropna() <= 1e-9).all()
 
 
-def test_arm_path_scores_full_portfolio_not_truncated(tmp_path):
+def test_arm_path_scores_full_portfolio_not_truncated(tmp_path, monkeypatch):
     """
     Regression: training aggregates over the FULL portfolio (run.py loads with
     max_loans=None) but inference used to truncate to the 99th-percentile
@@ -877,7 +884,12 @@ def test_arm_path_scores_full_portfolio_not_truncated(tmp_path):
     the model with min/max/mean/std computed over a different set of loans than
     the model was fit on. The arm path must not truncate — aggregate_features
     is variable-length. (DeepSets still does: it needs fixed-width padding.)
+
+    Portfolio grain only: at loan grain there is nothing to truncate, one row
+    per loan, so the bug cannot occur by construction.
     """
+    monkeypatch.setattr(config, "PREDICTION_GRAIN", "portfolio")
+
     from src.baselines.aggregated_xgboost import aggregate_features
     from src.data.data_loader import DataLoader
     from src.inference.model_loader import ModelLoader
@@ -986,7 +998,11 @@ def test_build_scoring_package_runs_standalone(tmp_path):
 
 # ── explore_shap.py bundle mode (July 11 doc/tooling refresh) ──────────────────
 
-def test_explore_shap_load_from_bundle_produces_named_features(tmp_path):
+def test_explore_shap_load_from_bundle_produces_named_features(tmp_path, monkeypatch):
+    # Portfolio grain: this pins the MIN_/MAX_/MEAN_/STD_/N_LOANS naming.
+    # The loan-grain naming is covered by test_loan_grain_feature_names.
+    monkeypatch.setattr(config, "PREDICTION_GRAIN", "portfolio")
+
     import joblib
     from src.data.data_loader import DataLoader
     from src.baselines.aggregated_xgboost import aggregate_features, ARM_BUILDERS
@@ -1203,3 +1219,146 @@ def test_scoring_package_includes_manager_code_modules(tmp_path):
     r2 = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert r2.returncode == 0, r2.stderr
     assert "OK" in r2.stdout
+
+
+# ── Prediction grain: loan vs portfolio (July 26) ─────────────────────────────
+
+def test_loan_grain_emits_one_instance_per_loan():
+    """
+    The ETL's native grain: WORST_FUTURE_CAT is already per-loan upstream
+    (MAX(LABEL_DPD) GROUP BY LOAN_ID), so loan grain is the label as the
+    source computes it — no max() collapse across the customer's loans.
+    """
+    instances, feature_cols = DataLoader().process_raw_data(_make_df(), grain="loan")
+
+    assert len(instances) == 3
+    # Rows stay sorted by current DPD_DAYS desc within the customer.
+    assert [i["loan_id"] for i in instances] == [1, 2, 3]
+    assert [i["current_cat"] for i in instances] == [2, 1, 0]
+    assert [i["label"] for i in instances] == [0, 1, 3]     # raw cat 4 caps to 3
+    for inst in instances:
+        assert inst["features"].shape[0] == 1
+        assert inst["n_loans"] == 1
+        assert inst["portfolio_n_loans"] == 3   # customer context still available
+        assert inst["national_code"] == "A"
+    assert config.TARGET_COL not in feature_cols
+
+    # Contrast: portfolio grain collapses the same rows to the worst of each.
+    portfolio, _ = DataLoader().process_raw_data(_make_df(), grain="portfolio")
+    assert len(portfolio) == 1
+    assert portfolio[0]["label"] == 3 and portfolio[0]["current_cat"] == 2
+
+
+def test_single_loan_customers_are_identical_across_grains():
+    """
+    Most customers hold exactly one loan, and for them the two grains must
+    produce bit-identical instances. That bounds any loan-vs-portfolio
+    difference to the multi-loan minority, and makes the single-loan slice a
+    valid apples-to-apples bridge back to the portfolio-grain benchmark.
+    """
+    df = _synth_score_df(200, 7)                 # 200 customers, one loan each
+    loan, _      = DataLoader().process_raw_data(df, grain="loan")
+    portfolio, _ = DataLoader().process_raw_data(df, grain="portfolio")
+
+    assert len(loan) == len(portfolio) == 200
+    for a, b in zip(loan, portfolio):
+        assert a["national_code"] == b["national_code"]
+        assert a["label"] == b["label"]
+        assert a["current_cat"] == b["current_cat"]
+        assert a["portfolio_n_loans"] == b["portfolio_n_loans"] == 1
+        assert np.array_equal(a["features"], b["features"])
+
+
+def test_loan_grain_features_are_raw_not_aggregated():
+    from src.baselines.aggregated_xgboost import (
+        build_feature_names, build_features, flat_features,
+    )
+
+    instances, feats = DataLoader().process_raw_data(_make_df(), grain="loan")
+    X, y = build_features(instances)
+
+    # One row per loan, one column per raw feature — no min/max/mean/std/count,
+    # which at this grain would be 4x the columns for zero extra information.
+    assert X.shape == (3, len(feats))
+    assert build_feature_names(feats) == feats
+    assert y.tolist() == [0, 1, 3]
+
+    # Feeding portfolio instances to the loan-grain builder is a config error,
+    # not something to silently mis-aggregate.
+    portfolio, _ = DataLoader().process_raw_data(_make_df(), grain="portfolio")
+    with pytest.raises(ValueError, match="expected 1"):
+        flat_features(portfolio)
+
+
+def test_instance_cache_roundtrips_loan_id_and_portfolio_size(tmp_path):
+    """The NPZ cache gained two fields in v1.3 — they must survive a round-trip."""
+    dl = DataLoader()
+    instances, feats = dl.process_raw_data(_make_df(), grain="loan")
+
+    cache_path = tmp_path / "cache.npz"
+    dl._save_cache(cache_path, instances, feats, max_loans=1, key="k")
+    restored, restored_feats = dl._load_cache(cache_path)
+
+    assert restored_feats == feats
+    assert [i["loan_id"] for i in restored] == [1, 2, 3]
+    assert [i["portfolio_n_loans"] for i in restored] == [3, 3, 3]
+    assert [i["label"] for i in restored] == [i["label"] for i in instances]
+    for a, b in zip(instances, restored):
+        assert np.array_equal(a["features"], b["features"])
+
+
+def test_loan_grain_keeps_healthy_sibling_of_severe_loan(tmp_path):
+    """
+    The business-visible reason for loan grain. current_cat used to be the
+    portfolio MAX, so a customer holding one severe loan was carved out of the
+    queue entirely — including their still-healthy loans, which are exactly
+    what an early-warning system should keep watching (a customer already in
+    distress on one facility is not a low-risk customer on the others).
+    Per loan, only the severe loan is flagged ALREADY_SEVERE.
+    """
+    from src.inference.predictor import score_dataframe
+
+    df = _synth_score_df(2, 31, with_target=False)
+    df["NATIONAL_CODE"] = "mixed-customer"
+    df["LOAN_ID"] = [101, 102]
+    df["LOAN_CATEGORY"] = [3.0, 0.0]       # one severe loan, one clean loan
+    df["DPD_DAYS"] = [200.0, 0.0]
+
+    d = tmp_path / "loan"
+    d.mkdir()
+    q = score_dataframe(df, _fit_bundle_via_dataframe(d))
+
+    assert len(q) == 2
+    flags = dict(zip(q["LOAN_ID"], q["RULE_FLAG"]))
+    assert flags[101] == "ALREADY_SEVERE"          # known risk, no API call
+    assert flags[102] == ""                        # still competes for budget
+    assert q.loc[q["LOAN_ID"] == 102, "RISK_RANK"].notna().all()
+    assert q.loc[q["LOAN_ID"] == 101, "RISK_RANK"].isna().all()
+
+    # Portfolio context survives even though each row is a single loan.
+    assert set(q["N_LOANS_IN_PORTFOLIO"]) == {2}
+    # Customer-level rollup: the worst loan the customer has, on every row.
+    assert q["CUSTOMER_MAX_RISK_SCORE"].nunique() == 1
+    assert np.isclose(q["CUSTOMER_MAX_RISK_SCORE"].iloc[0], q["RISK_SCORE"].max())
+
+
+def test_portfolio_grain_carves_the_whole_customer(tmp_path, monkeypatch):
+    """Contrast to the test above: the pre-loan-grain behaviour it replaces."""
+    monkeypatch.setattr(config, "PREDICTION_GRAIN", "portfolio")
+    from src.inference.predictor import score_dataframe
+
+    df = _synth_score_df(2, 31, with_target=False)
+    df["NATIONAL_CODE"] = "mixed-customer"
+    df["LOAN_ID"] = [101, 102]
+    df["LOAN_CATEGORY"] = [3.0, 0.0]
+    df["DPD_DAYS"] = [200.0, 0.0]
+
+    d = tmp_path / "portfolio"
+    d.mkdir()
+    q = score_dataframe(df, _fit_bundle_via_dataframe(d))
+
+    # Both loans collapse into one customer row, carved out on the worst loan —
+    # the healthy loan never reaches the queue.
+    assert len(q) == 1
+    assert q["RULE_FLAG"].iloc[0] == "ALREADY_SEVERE"
+    assert q["CURRENT_CAT"].iloc[0] == 3

@@ -23,7 +23,7 @@ import numpy as np
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.baselines.aggregated_xgboost import aggregate_features
+from src.baselines.aggregated_xgboost import build_features
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +42,12 @@ class ArmScorer:
     # inst["n_loans"] — so the skew was silent.)
     truncate_loans = None
 
-    def __init__(self, scaler, arm):
+    def __init__(self, scaler, arm, grain: str = "portfolio"):
         self.scaler = scaler
         self.arm = arm
+        # The grain the arm was FIT at, read from the bundle — not from the
+        # local config, which may since have been switched.
+        self.grain = grain
 
     def raw_probs(self, instances: list[dict]) -> np.ndarray:
         X_scaled = self.scaler.transform([i["features"] for i in instances])
@@ -52,13 +55,16 @@ class ArmScorer:
             {"features": x, "n_loans": i["n_loans"], "label": i.get("label", -1)}
             for i, x in zip(instances, X_scaled)
         ]
-        X, _ = aggregate_features(agg_in)
+        X, _ = build_features(agg_in, self.grain)
         current_cat = np.array([i["current_cat"] for i in instances])
         return self.arm.predict_proba(X, current_cat)
 
 
 class DeepSetsScorer:
     """Legacy path: DeepSets embeddings → XGBoost meta-learner."""
+
+    # A set encoder over a customer's loans — portfolio grain by construction.
+    grain = "portfolio"
 
     def __init__(self, scaler, model, xgb_model, max_loans: int, device: str):
         self.scaler = scaler
@@ -115,7 +121,8 @@ def build_arm_bundle(scaler, arm, calibrator, max_loans, features) -> dict:
         "arm": arm,
         "calibrator": calibrator,
         "metadata": {"max_loans_per_customer_99th": max_loans,
-                     "features": features, "num_classes": config.NUM_CLASSES},
+                     "features": features, "num_classes": config.NUM_CLASSES,
+                     "grain": config.PREDICTION_GRAIN},
     }
 
 
@@ -132,7 +139,8 @@ def load_bundle(bundle_path: Path, device: str):
         logger.warning("PLACEHOLDER BUNDLE — %s", meta.get("placeholder_note", ""))
 
     if bundle.get("kind") == "arm":
-        scorer = ArmScorer(bundle["scaler"], bundle["arm"])
+        # Pre-grain bundles are portfolio-grain by definition.
+        scorer = ArmScorer(bundle["scaler"], bundle["arm"], meta.get("grain", "portfolio"))
         return scorer, bundle.get("calibrator"), features
 
     # Legacy deepsets bundle
@@ -184,7 +192,7 @@ class ModelLoader:
         arm_path = self.artifact_dir / "model_arm.pkl"
         if arm_path.exists():
             logger.info(f"Loading arm pipeline from {self.artifact_dir}…")
-            scorer = ArmScorer(scaler, joblib.load(arm_path))
+            scorer = ArmScorer(scaler, joblib.load(arm_path), meta.get("grain", "portfolio"))
             return scorer, self._load_calibrator(), features
 
         logger.info(f"Loading legacy DeepSets pipeline from {self.artifact_dir}…")

@@ -65,7 +65,7 @@ def load_from_bundle(bundle_path: Path, data_path: Path) -> tuple:
     import pandas as pd
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from src.baselines.aggregated_xgboost import aggregate_features
+    from src.baselines.aggregated_xgboost import build_features, build_feature_names
     from src.data.data_loader import DataLoader
 
     if not bundle_path.exists():
@@ -85,6 +85,8 @@ def load_from_bundle(bundle_path: Path, data_path: Path) -> tuple:
     arm = bundle["arm"]
     features = bundle["metadata"]["features"]
     max_loans = bundle["metadata"]["max_loans_per_customer_99th"]
+    # Follow the grain the arm was fit at, not the current config.
+    grain = bundle["metadata"].get("grain", "portfolio")
 
     if getattr(arm, "model", None) is None:
         log.error(
@@ -97,7 +99,7 @@ def load_from_bundle(bundle_path: Path, data_path: Path) -> tuple:
 
     df = pd.read_csv(data_path)
     dl = DataLoader()
-    instances, raw_cols = dl.process_raw_data(df, max_loans)
+    instances, raw_cols = dl.process_raw_data(df, max_loans, grain)
     if raw_cols != features:
         log.warning("Data columns differ from the bundle's training features — "
                     "proceeding, but check for a schema mismatch.")
@@ -105,13 +107,8 @@ def load_from_bundle(bundle_path: Path, data_path: Path) -> tuple:
     X_scaled = scaler.transform([i["features"] for i in instances])
     agg_in = [{"features": x, "n_loans": i["n_loans"], "label": i["label"]}
               for i, x in zip(instances, X_scaled)]
-    X, y = aggregate_features(agg_in)
-
-    agg_names = (
-        [f"MIN_{f}" for f in features] + [f"MAX_{f}" for f in features]
-        + [f"MEAN_{f}" for f in features] + [f"STD_{f}" for f in features]
-        + ["N_LOANS"]
-    )
+    X, y = build_features(agg_in, grain)
+    agg_names = build_feature_names(features, grain)
     log.info(f"Aggregated {len(instances):,} instances into {X.shape[1]} named features "
              f"using arm '{getattr(arm, 'name', '?')}'.")
     return arm.model, X, y, agg_names
