@@ -397,6 +397,20 @@ def train_single_fold(
                 )
                 y_pred     = fe.pop("_cost_preds")
                 y_prob_cal = fe.pop("_probs_cal")
+
+                # Per-row calibrated scores vs. the true label — the only
+                # place they survive the run (arms_metrics.json keeps
+                # aggregates only, and the stage pickles hold RAW probs
+                # without y_test/strata). Consumed by explore_risk_bands.py
+                # to pick queue thresholds offline, without a re-run.
+                import pandas as pd
+                pd.DataFrame({
+                    "y_true":      y_test,
+                    "current_cat": test_strata,
+                    **{f"p{c}": y_prob_cal[:, c] for c in range(y_prob_cal.shape[1])},
+                    "pred_class":  y_pred,
+                }).to_csv(fold_dir / "test_scores.csv.gz", index=False)
+
                 final_metrics["bootstrap_ci"] = bootstrap_confidence_intervals(
                     y_test, y_pred, y_prob_cal, n_iterations=500
                 )
