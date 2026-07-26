@@ -33,10 +33,18 @@ logger = logging.getLogger(__name__)
 class ArmScorer:
     """Deployed path: scale features, aggregate, run the XGBoost arm."""
 
-    def __init__(self, scaler, arm, max_loans: int):
+    # aggregate_features reduces a variable-length portfolio with np.reduceat,
+    # so this path has no fixed-width requirement and must NOT truncate:
+    # training aggregates over the FULL portfolio (run.py loads with
+    # max_loans=None), and capping here would feed the model min/max/mean/std
+    # computed over a different set of loans than it was fit on. (The
+    # LOAN_COUNT column is safe either way — it reads the untruncated
+    # inst["n_loans"] — so the skew was silent.)
+    truncate_loans = None
+
+    def __init__(self, scaler, arm):
         self.scaler = scaler
         self.arm = arm
-        self.max_loans = max_loans
 
     def raw_probs(self, instances: list[dict]) -> np.ndarray:
         X_scaled = self.scaler.transform([i["features"] for i in instances])
@@ -56,7 +64,9 @@ class DeepSetsScorer:
         self.scaler = scaler
         self.model = model
         self.xgb_model = xgb_model
-        self.max_loans = max_loans
+        # Unlike the arm path, DeepSets needs fixed-width padded tensors, so
+        # this scorer genuinely does cap the loans it sees.
+        self.truncate_loans = max_loans
         self.device = device
 
     def raw_probs(self, instances: list[dict]) -> np.ndarray:
@@ -71,10 +81,10 @@ class DeepSetsScorer:
         with torch.no_grad():
             for i in tqdm(range(0, len(X_scaled), 512), desc="Embedding batches"):
                 batch = X_scaled[i:i + 512]
-                padded = np.zeros((len(batch), self.max_loans, n_features), dtype=np.float32)
-                mask = np.ones((len(batch), self.max_loans), dtype=bool)
+                padded = np.zeros((len(batch), self.truncate_loans, n_features), dtype=np.float32)
+                mask = np.ones((len(batch), self.truncate_loans), dtype=bool)
                 for j, arr in enumerate(batch):
-                    seq = min(len(arr), self.max_loans)
+                    seq = min(len(arr), self.truncate_loans)
                     padded[j, :seq] = arr[:seq]
                     mask[j, :seq] = False
                 emb = self.model.extract_embeddings(
@@ -122,7 +132,7 @@ def load_bundle(bundle_path: Path, device: str):
         logger.warning("PLACEHOLDER BUNDLE — %s", meta.get("placeholder_note", ""))
 
     if bundle.get("kind") == "arm":
-        scorer = ArmScorer(bundle["scaler"], bundle["arm"], max_loans)
+        scorer = ArmScorer(bundle["scaler"], bundle["arm"])
         return scorer, bundle.get("calibrator"), features
 
     # Legacy deepsets bundle
@@ -174,7 +184,7 @@ class ModelLoader:
         arm_path = self.artifact_dir / "model_arm.pkl"
         if arm_path.exists():
             logger.info(f"Loading arm pipeline from {self.artifact_dir}…")
-            scorer = ArmScorer(scaler, joblib.load(arm_path), max_loans)
+            scorer = ArmScorer(scaler, joblib.load(arm_path))
             return scorer, self._load_calibrator(), features
 
         logger.info(f"Loading legacy DeepSets pipeline from {self.artifact_dir}…")

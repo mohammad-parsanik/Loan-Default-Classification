@@ -412,7 +412,7 @@ def test_bundle_round_trip(tmp_path):
     scorer, loaded_cal, features = load_bundle(bundle_path, device="cpu")
 
     assert isinstance(scorer, DeepSetsScorer)
-    assert scorer.max_loans == 2
+    assert scorer.truncate_loans == 2
     assert features == feat_names
     assert np.allclose(loaded_cal.transform(probs), calibrator.transform(probs))
 
@@ -747,7 +747,7 @@ def test_arm_scorer_bundle_and_dir_roundtrip(tmp_path):
     from src.inference.model_loader import build_arm_bundle, ModelLoader, ArmScorer
 
     scaler, arm, cal, feats, pred = _fit_arm_and_scaler()
-    ref = ArmScorer(scaler, arm, max_loans=2).raw_probs(pred)
+    ref = ArmScorer(scaler, arm).raw_probs(pred)
 
     # Bundle round-trip
     joblib.dump(build_arm_bundle(scaler, arm, cal, 2, feats), tmp_path / "model_bundle.pkl")
@@ -867,6 +867,58 @@ def test_score_dataframe_matches_predictor_shape(tmp_path):
     # Ranked rows come first, sorted by RISK_SCORE descending
     ranked = q[q["RULE_FLAG"] == ""]
     assert (ranked["RISK_SCORE"].diff().dropna() <= 1e-9).all()
+
+
+def test_arm_path_scores_full_portfolio_not_truncated(tmp_path):
+    """
+    Regression: training aggregates over the FULL portfolio (run.py loads with
+    max_loans=None) but inference used to truncate to the 99th-percentile
+    max_loans stored in the bundle. Customers above that cap therefore reached
+    the model with min/max/mean/std computed over a different set of loans than
+    the model was fit on. The arm path must not truncate — aggregate_features
+    is variable-length. (DeepSets still does: it needs fixed-width padding.)
+    """
+    from src.baselines.aggregated_xgboost import aggregate_features
+    from src.data.data_loader import DataLoader
+    from src.inference.model_loader import ModelLoader
+    from src.inference.predictor import score_dataframe
+
+    bundle_path = _fit_bundle_via_dataframe(tmp_path)      # records max_loans=2
+    scorer, calibrator, _ = ModelLoader(bundle_path).load_pipeline()
+    assert scorer.truncate_loans is None
+
+    # One customer, three loans — above the recorded cap. The loan truncation
+    # would drop (lowest DPD_DAYS) carries an extreme F1, so the portfolio
+    # statistics only come out right if all three loans are aggregated.
+    df = _synth_score_df(3, 21, with_target=False)
+    df["NATIONAL_CODE"] = "same-customer"
+    df["LOAN_CATEGORY"] = 0.0        # current_cat 0 -> mask_monotone is identity
+    df["DPD_DAYS"] = [9.0, 5.0, 1.0]
+    df["F1"] = [0.0, 0.0, -50.0]
+
+    full, _      = DataLoader().process_raw_data(df, None)
+    truncated, _ = DataLoader().process_raw_data(df, 2)
+    assert full[0]["features"].shape[0] == 3
+    assert truncated[0]["features"].shape[0] == 2
+
+    def arm_probs(insts):
+        scaled = scorer.scaler.transform([i["features"] for i in insts])
+        X, _ = aggregate_features([
+            {"features": x, "n_loans": i["n_loans"], "label": -1}
+            for i, x in zip(insts, scaled)
+        ])
+        return scorer.arm.predict_proba(X, np.array([i["current_cat"] for i in insts]))
+
+    expected = arm_probs(full)
+    # Guards the test itself: the dropped loan must actually move the aggregate,
+    # otherwise this would pass even if truncation came back.
+    assert not np.allclose(expected, arm_probs(truncated), atol=1e-6)
+
+    q = score_dataframe(df, bundle_path)
+    assert len(q) == 1
+    assert int(q["N_LOANS_IN_PORTFOLIO"].iloc[0]) == 3
+    got = q[["P_NO_DELAY", "P_CURRENT", "P_PAST_DUE", "P_SEVERE_PAST_DUE"]].to_numpy()
+    assert np.allclose(got, calibrator.transform(expected, np.array([0])), atol=1e-6)
 
 
 def test_score_dataframe_calibration_refresh(tmp_path):

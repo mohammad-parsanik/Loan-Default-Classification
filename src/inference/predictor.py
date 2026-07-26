@@ -219,7 +219,7 @@ def score_dataframe(
     dl = DataLoader()
 
     if calibration_df is not None:
-        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.max_loans)
+        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.truncate_loans)
         cal_inst = [i for i in cal_inst if i["label"] >= 0]
         if cal_inst:
             probs  = scorer.raw_probs(cal_inst)
@@ -230,7 +230,7 @@ def score_dataframe(
             ).fit(probs, y, strata)
             logger.info(f"Calibrator refreshed on {len(cal_inst):,} supplied instances.")
 
-    instances, _ = dl.process_raw_data(df, max_loans or scorer.max_loans)
+    instances, _ = dl.process_raw_data(df, max_loans or scorer.truncate_loans)
     called_log = Predictor._load_called_log(called_log_path)
     return score_instances(instances, scorer, calibrator, called_log)
 
@@ -241,7 +241,7 @@ class Predictor:
     def __init__(self, artifact_dir):
         self.loader = ModelLoader(Path(artifact_dir))
         self.scorer, self.calibrator, _ = self.loader.load_pipeline()
-        self.max_loans = self.scorer.max_loans
+        self.truncate_loans = self.scorer.truncate_loans
         self.data_loader = DataLoader()
 
     # ── Internal scoring path (shared by predict & recalibration) ────────────
@@ -331,7 +331,7 @@ class Predictor:
 
         instances: list[dict] = []
         for snap in resolved:
-            snap_instances, _ = self.data_loader.load_pred_portfolios(snap, self.max_loans)
+            snap_instances, _ = self.data_loader.load_pred_portfolios(snap, self.truncate_loans)
             instances.extend(snap_instances)
 
         if not instances:
