@@ -1,10 +1,17 @@
 # Loan Default Classification — Ranked Early-Warning Queue
 
-A bank early-warning system that ranks customers by their probability of
+A bank early-warning system that ranks **loans** by their probability of
 entering **severe delinquency** within the next 6 months, so a limited
-external enrichment API (240 requests/hour) can be spent on the customers
-where a call actually changes the decision. Already-severe customers are
-excluded by rule — they're a known risk, not a ranking question.
+external enrichment API (240 requests/hour) can be spent where a call
+actually changes the decision. Already-severe loans are excluded by rule —
+they're a known risk, not a ranking question.
+
+> **Grain:** one scored row is one loan (`LOAN_ID` x `SNAPSHOT_DATE`) as of
+> 2026-07-26. Through Run 6 it was one row per customer, with the label
+> collapsed to the worst of their loans; `PREDICTION_GRAIN = "portfolio"`
+> in `project_config.py` restores that. The enrichment API itself is still
+> keyed by `NATIONAL_CODE`, so two loans of one customer cost two queue
+> slots but a single call. See AGENT_HANDOFF.md §19.
 
 > **New to this project? Read in this order:**
 > 1. This file — architecture and data flow at a glance.
@@ -65,11 +72,12 @@ Temporal split (src/data/temporal_split.py)
 Preprocessing (src/data/preprocessing.py)
   │  domain-aware impute → clip outliers → RobustScaler (fit on train only)
   ▼
-Feature aggregation (src/baselines/aggregated_xgboost.py::aggregate_features)
-  │  min/max/mean/std per feature + loan count → 257 features per customer
+Feature build (src/baselines/aggregated_xgboost.py::build_features)
+  │  loan grain: the ~64 raw per-loan features, used as-is
+  │  portfolio grain: min/max/mean/std per feature + loan count → 257
   ▼
 Model arms (src/baselines/aggregated_xgboost.py — see project_config.MODEL_ARMS)
-  │  XGBoost variants trained on the SAME 257 features; compared by ranking
+  │  XGBoost variants trained on the SAME features; compared by ranking
   │  quality; DEPLOYED: "multiclass" (locked after the Run-6 shootout)
   ▼
 Per-current-category calibration (src/evaluation/calibration.py)
@@ -86,13 +94,16 @@ Ranked queue (src/inference/predictor.py)
 
 ### The model, precisely
 
-**Feature aggregation:** ~64 raw per-loan features → 4 summary statistics
-each (min, max, mean, std) across a customer's loans, plus a loan count →
+**Features:** at loan grain, the **~64 raw per-loan features** unchanged —
+one row per loan, nothing to aggregate. (Aggregating here would give
+`min == max == mean == the feature`, `std == 0`, `count == 1`: 4x the
+columns for zero extra information.) At portfolio grain, those 64 become 4
+summary statistics each across a customer's loans plus a loan count —
 **257 features per customer** (`4 × 64 + 1`). This is what every model
-candidate below actually trains on — not the raw per-loan rows.
+candidate below actually trains on.
 
 **Model candidates ("arms", `src/baselines/aggregated_xgboost.py`)** — all
-XGBoost, all on the same 257 features, all with identical hyperparameters
+XGBoost, all on the same features, all with identical hyperparameters
 (`n_estimators=200, max_depth=5, learning_rate=0.05, subsample=0.8,
 colsample_bytree=0.8`) so comparisons isolate the objective, not tuning
 luck:
