@@ -288,13 +288,27 @@ python run.py predict --artifact_dir artifacts/<ts>_final/fold_01/model_bundle.p
 
 ### Output columns
 
+**One row = one loan** (`PREDICTION_GRAIN = "loan"`). Under the legacy
+`"portfolio"` grain one row is one customer and `LOAN_ID` is empty.
+
 | Column | Meaning |
 |---|---|
 | `RISK_RANK` | 1…N queue position; **call the API in this order**. `NaN` for flagged rows. |
-| `RISK_SCORE` | Calibrated, masked P(entering severe) — the sort key. |
+| `LOAN_ID` | The loan this row scores. Empty at portfolio grain. |
+| `NATIONAL_CODE` | The loan's customer — **this is the API key**, not `LOAN_ID`. |
+| `RISK_SCORE` | Calibrated, masked P(entering severe) for this loan — the sort key. |
 | `RULE_FLAG` | `""` = in queue; `ALREADY_SEVERE` / `SUPERSEDED` / `RECENTLY_CALLED` / `PREDICTED_SEVERE` = handled by rule, not called. |
+| `N_LOANS_IN_PORTFOLIO` | How many loans the customer holds at this snapshot (not the rows in this instance — at loan grain that is always 1). |
+| `CUSTOMER_MAX_RISK_SCORE` | Highest `RISK_SCORE` across this customer's loans, repeated on each of their rows. Context for a customer-level decision; the queue still ranks per loan. |
 | `P_NO_DELAY` … `P_SEVERE_PAST_DUE` | Full calibrated class distribution. |
 | `PREDICTED_CLASS`, `EXPECTED_COST` | Secondary/diagnostic (expected-cost rule). |
+
+Because the API is keyed by `NATIONAL_CODE`, two loans of the same customer
+in the queue cost **two slots but one call** — the second is free, and the
+enrichment result applies to both rows. A caller that tracks already-called
+customers within a run gets slightly more than 240 loans/hour of coverage.
+`ALREADY_SEVERE` now flags the *severe loan only*: a customer's other,
+still-healthy loans remain in the queue on purpose.
 
 Consume from `RISK_RANK = 1` downward at 240/hour for as many hours as the
 budget allows. After each call, append `NATIONAL_CODE, CALLED_AT` to the

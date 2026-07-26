@@ -56,10 +56,31 @@ Each arm's entry has this shape (see `src/evaluation/metrics.py::full_evaluation
           "current_cat_2": {...}
       }
   },
+  "ranking_single_loan": {...},# same shape, customers holding exactly 1 loan
   "by_current_cat": {...},     # classification-side per-slice (cost_rule based)
   "bootstrap_ci": {...}        # only on the DEPLOYED arm
 }
 ```
+
+### Comparing a loan-grain run against `results_3`…`results_6`
+
+Those runs were scored at **portfolio grain** (one row per customer). A
+loan-grain run is not directly comparable on the headline `ranking` block,
+for two reasons that have nothing to do with model quality:
+
+1. **The population changed.** Healthy loans belonging to customers with a
+   severe loan now enter the queue; under portfolio grain the whole customer
+   was carved out as `ALREADY_SEVERE`.
+2. **The base rate changed.** A 2-loan customer with one severe loan was 1
+   positive in 1 row; as loans it is 1 positive in 2 rows. PR-AUC's no-skill
+   floor *is* the base rate, so AP moves with it — a better model can score a
+   lower AP. `ranking.base_rate` is reported next to `pr_auc` for exactly
+   this reason; read them together.
+
+Use **`ranking_single_loan`** for the comparison. Customers holding one loan
+produce bit-identical rows under either grain, so that slice is genuinely
+apples-to-apples. Report the full `ranking` block separately, as the new
+baseline going forward.
 
 ### What `ranking` means, concretely
 

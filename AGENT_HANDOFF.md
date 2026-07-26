@@ -8,15 +8,15 @@
 
 A bank needs to predict the **worst future delinquency state** of a customer's entire loan portfolio over a **6-month forward horizon**, to prioritize collection actions.
 
-- **Prediction level:** Customer (grouped by `NATIONAL_CODE`), not individual loan.
+- **Prediction level:** **Individual loan** (`LOAN_ID` x `SNAPSHOT_DATE`) since 2026-07-26 — see §19. Was customer-level (grouped by `NATIONAL_CODE`) through Run 6; `PREDICTION_GRAIN="portfolio"` restores that.
 - **Target:** 4-class classification (bumped from 3 classes on 2026-07-08 — see §11 item 10):
   - `0` — No Delay (performing)
   - `1` — Current / Minor Delay (pre-delinquent)
   - `2` — Past Due+ (NPL, raw category 2 only)
   - `3` — Severe Past Due (raw categories 3-4 collapsed)
-- **Label construction:** For each customer-snapshot, label = `min(max(WORST_FUTURE_CAT across all loans), config.NUM_CLASSES - 1)`. Features retain the full 5-category granularity internally; only the prediction target is capped (currently to 4 classes).
+- **Label construction:** At loan grain, label = `min(WORST_FUTURE_CAT, config.NUM_CLASSES - 1)` for that loan — the ETL already computes `WORST_FUTURE_CAT` per loan. At portfolio grain it is `min(max(WORST_FUTURE_CAT across the customer's loans), config.NUM_CLASSES - 1)`. Features retain the full 5-category granularity internally; only the prediction target is capped (currently to 4 classes).
 - **Business constraint:** This is heavily cost-sensitive. Missing a Cat-2 customer is penalized **4×** more than a false positive over-flagging; the class-3 (Severe Past Due) costs are a derived placeholder, not yet business-tuned. The single source of truth is `project_config.COST_MATRIX`.
-- **Prior work:** A previous project used per-loan LightGBM classifiers and performed poorly. This project replaces that approach with a portfolio-level architecture.
+- **Prior work:** A previous project used per-loan LightGBM classifiers and performed poorly. This project replaced that with a portfolio-level architecture — and, as of 2026-07-26, has returned to a per-loan grain at the business's request. Note this is *not* a revert to the prior work: the label horizon, the ~64 engineered features, the calibration + monotone mask, and the ranked-queue objective are all different. The portfolio-level detour is what established that the per-customer aggregation was buying almost nothing (99th pct = 2 loans/customer).
 
 ---
 
@@ -466,3 +466,31 @@ All verified locally (new tests + full suite); see `tests/test_pipeline_changes.
 2. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order). For the tech team's manager code: `build_scoring_package.py` → `run_scoring(df, ScoringParams(...))`.
 3. **Business items (non-blocking):** `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted; survivorship in the ETL sample remains the main open data question.
 4. **Nice-to-have:** update walk-forward's `build_fold_instances` to use customer-disjoint validation, matching the single-split path — only worth it if walk-forward becomes a routine check rather than an occasional one.
+
+---
+
+## 19. Prediction Grain: Customer → Loan (July 26, 2026 — not yet run on server)
+
+**Decision:** business wants risk and a prediction for **each individual loan**, so `PREDICTION_GRAIN = "loan"` is now the default. One scored row = one (`LOAN_ID`, `SNAPSHOT_DATE`).
+
+**This is a deletion, not an addition.** The ETL already emits a per-loan label — `OLD_ETL Document` line 465 is `MAX(D.LABEL_DPD) AS WORST_FUTURE_DPD ... GROUP BY D.LOAN_ID`, and the final select groups by `LC.LOAN_ID, LC.SNAPSHOT_DATE`. The customer rollup (`label = max` over the customer's loans) was applied in Python, in `process_raw_data`. Loan grain removes that groupby.
+
+**Expected accuracy gain: small, and that was accepted going in.** Single-loan customers produce bit-identical rows under either grain (min == max == mean == the feature, std == 0, count == 1), and the 99th percentile of loans per customer is 2 — so the two models can only differ on the multi-loan minority.
+
+**The real win is the carve-out, not accuracy.** `current_cat` used to be the portfolio MAX, so `CARVE_CURRENT_CAT_GE` removed a customer holding *one* severe loan from the queue entirely — including their still-healthy loans, which are exactly what an early-warning system should keep watching (`mask_monotone` compounded it, forcing P(severe)→1 for the healthy loan). Per loan, only the severe loan is flagged.
+
+**What changed**
+- `PREDICTION_GRAIN` in `project_config.py`; `DATA_VERSION` → `v1.3`; the grain is part of the NPZ cache key, so the two grains cache separately.
+- Instances gain `loan_id` and `portfolio_n_loans` (the customer's true loan count — output context, **not** a model feature).
+- `build_features()` dispatches on grain. Loan grain skips aggregation: X is ~4× smaller and the XGBoost fit correspondingly cheaper.
+- The grain is written to `metadata.json` and the bundle, and **inference follows that, not the local config** — a model always sees features built the way it was fit. Pre-grain bundles read as `"portfolio"`.
+- Output adds `LOAN_ID` and `CUSTOMER_MAX_RISK_SCORE` (worst loan per customer; context only, the queue still ranks per row).
+- `DEEPSETS_ENABLED` now raises unless the grain is `"portfolio"`.
+
+**Deliberately deferred:** portfolio-context features on each loan row (portfolio worst category, loan count, portfolio max DPD). A cat-0 loan belonging to someone with a cat-3 loan is genuinely higher-risk, and the aggregated features used to carry that signal — but the decision was to ship the plain per-loan model first and add these only if the grain change is accepted.
+
+**Also fixed in the same pass (independent bug):** the train/serve truncation skew — see §10 and the `truncate_loans` note in `CLAUDE.md`.
+
+**Reading the next run's numbers:** compare `ranking_single_loan`, NOT `ranking`, against `results_3`…`results_6`. Loan grain changes the population (healthy siblings now enter the queue) and the severe base rate with it, and PR-AUC moves with the base rate regardless of model quality. `ranking.base_rate` sits next to `pr_auc` so the shift is visible. `recall@K` is unchanged and stays keyed to loan-slots: the API is customer-keyed, so two loans of one customer cost two slots but one call, making the metric slightly conservative — the safe direction. `score_instances` logs the duplicate-customer count in the callable window.
+
+---

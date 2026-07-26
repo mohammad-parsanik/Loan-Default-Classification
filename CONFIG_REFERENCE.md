@@ -15,6 +15,12 @@ subset you should double-check before a production `--final` run.
 | `ID_COL`, `CONTRACT_COL`, `CUSTOMER_COL`, `SNAPSHOT_COL`, `TARGET_COL` | `LOAN_ID`, `CONTRACT_NUMBER`, `NATIONAL_CODE`, `SNAPSHOT_DATE`, `WORST_FUTURE_CAT` | Column name constants — change only if the upstream ETL renames columns. |
 | `META_COLS` | derived from the above + `WORST_FUTURE_DPD` | Columns excluded from the feature set. Everything else in the table is a feature. |
 
+## Prediction grain
+
+| Setting | Default | Notes |
+|---|---|---|
+| `PREDICTION_GRAIN` | `"loan"` | What one scored row IS. `"loan"` = one row per (`LOAN_ID`, `SNAPSHOT_DATE`), the ETL's native grain — `WORST_FUTURE_CAT` is already per-loan upstream (`MAX(LABEL_DPD) GROUP BY LOAN_ID`). `"portfolio"` = one row per (`NATIONAL_CODE`, `SNAPSHOT_DATE`), label = max over the customer's loans, features aggregated to min/max/mean/std + count — the pre-July-2026 behaviour that `results_1`…`results_6` were measured under. Changes `process_raw_data`, `build_features`, and what the queue ranks; part of the NPZ cache key, so the two grains cache separately. `DEEPSETS_ENABLED` requires `"portfolio"`. |
+
 ## Label & classes
 
 | Setting | Default | Notes |
@@ -60,8 +66,8 @@ subset you should double-check before a production `--final` run.
 |---|---|---|
 | `RECALIBRATE_ON_PREDICT` | `True` | At `predict` time, refit the probability calibrator on the newest matured snapshot before scoring (tracks base-rate drift). Requires cache/DB access to the training table. |
 | `PRED_SNAPSHOT_DATES` | `None` | Which snapshot(s) `predict` scores when `--snapshot_date` isn't passed. `None` = every currently-immature snapshot in `TRAIN_TABLE`. |
-| `PRED_DEDUP_LATEST` | `True` | When several snapshots are scored in one call, keep only each customer's newest row in the ranked queue (older rows flagged `SUPERSEDED`) — the enrichment API can't be queried "as of" the past, so an old score wastes budget. |
-| `CARVE_CURRENT_CAT_GE` | `NUM_CLASSES - 1` (i.e. `3`) | Customers with `current_cat` at or above this are `ALREADY_SEVERE` — rule-flagged, never ranked. This defines the population the ranking metrics are computed on. |
+| `PRED_DEDUP_LATEST` | `True` | When several snapshots are scored in one call, keep only each customer's newest row in the ranked queue (older rows flagged `SUPERSEDED`) — the enrichment API can't be queried "as of" the past, so an old score wastes budget. Keyed on `NATIONAL_CODE` at both grains, deliberately: the API is customer-keyed, so any newer row makes that customer's older rows stale for calling purposes. |
+| `CARVE_CURRENT_CAT_GE` | `NUM_CLASSES - 1` (i.e. `3`) | Rows with `current_cat` at or above this are `ALREADY_SEVERE` — rule-flagged, never ranked. Defines the population the ranking metrics are computed on. At loan grain this flags the *severe loan*, leaving its healthy siblings in the queue; at portfolio grain `current_cat` was the portfolio max, so one severe loan carved out the whole customer. |
 | `API_RATE_PER_HOUR` | `240` | The enrichment API's call budget. Ranking metrics are reported at `K = API_RATE_PER_HOUR × window_hours`. |
 | `RANKING_REF_WINDOWS` | `{"1_day": 24, "1_week": 168, "1_month": 720}` | Reference call-budget windows (hours) the ranking metrics report recall/lift at. |
 | `CALIBRATION_MIN_STRATUM_N` | `5000` | Minimum validation samples in a `current_cat` stratum to fit its own isotonic calibrator; smaller strata fall back to the pooled calibrator. |
@@ -73,7 +79,7 @@ subset you should double-check before a production `--final` run.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `DATA_VERSION` | `"v1.2"` | Bump this string whenever the upstream ETL schema or label semantics change, to force the NPZ cache (`data/train_portfolios_cache.npz`) to rebuild. A stale cache after an ETL change will silently train on the old schema. |
+| `DATA_VERSION` | `"v1.3"` | Bump this string whenever the upstream ETL schema or label semantics change, to force the NPZ cache (`data/train_portfolios_cache.npz`) to rebuild. A stale cache after an ETL change will silently train on the old schema. |
 
 ## Legacy DeepSets hyperparameters
 

@@ -1362,3 +1362,35 @@ def test_portfolio_grain_carves_the_whole_customer(tmp_path, monkeypatch):
     assert len(q) == 1
     assert q["RULE_FLAG"].iloc[0] == "ALREADY_SEVERE"
     assert q["CURRENT_CAT"].iloc[0] == 3
+
+
+def test_full_evaluation_reports_single_loan_slice():
+    """
+    The single-loan slice is the only cross-grain-comparable ranking block:
+    those customers produce identical rows either way. The headline block
+    covers everyone and its base rate shifts with the grain, so comparing it
+    against results_3..results_6 would measure the population change rather
+    than the model.
+    """
+    from src.evaluation.metrics import full_evaluation
+
+    rng = np.random.default_rng(5)
+    n = 600
+    y = rng.choice([0, 1, 2, 3], n, p=[.55, .25, .12, .08])
+    strata = np.minimum(y, rng.choice([0, 1, 2, 3], n, p=[.7, .2, .07, .03]))
+    probs = rng.dirichlet(np.ones(config.NUM_CLASSES), n)
+    sizes = rng.choice([1, 2, 3], n, p=[.8, .15, .05])
+
+    out = full_evaluation(y, probs, strata=strata, portfolio_sizes=sizes)
+
+    assert "ranking" in out and "ranking_single_loan" in out
+    # The slice must be the single-loan rows that also survive the carve-out.
+    expected_n = int(((sizes == 1) & (strata < config.CARVE_CURRENT_CAT_GE)).sum())
+    assert out["ranking_single_loan"]["n_ranked"] == expected_n
+    assert out["ranking_single_loan"]["n_ranked"] < out["ranking"]["n_ranked"]
+    # base_rate is already reported, so a grain-driven prevalence shift is
+    # visible next to pr_auc rather than being mistaken for a regression.
+    assert "base_rate" in out["ranking"] and "pr_auc" in out["ranking"]
+
+    # Omitting portfolio_sizes leaves the block out entirely (back-compatible).
+    assert "ranking_single_loan" not in full_evaluation(y, probs, strata=strata)

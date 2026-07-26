@@ -211,6 +211,10 @@ def train_single_fold(
     train_strata = np.array([i["current_cat"] for i in train_inst])
     test_strata  = np.array([i["current_cat"] for i in test_inst])
     val_strata   = np.array([i["current_cat"] for i in val_inst])
+    # Customers holding exactly one loan score identically under either grain,
+    # so this slice is the apples-to-apples bridge to the portfolio-grain
+    # benchmark (results_3..results_6). See full_evaluation's docstring.
+    test_sizes   = np.array([i.get("portfolio_n_loans", i["n_loans"]) for i in test_inst])
 
     # ── Stage: Preprocessing ──────────────────────────────────────────────────
     # Not checkpointed as a full round-trip — the transform itself (~3-4 min
@@ -312,6 +316,7 @@ def train_single_fold(
                         arm_metrics = full_evaluation(
                             y_test, test_probs,
                             strata=test_strata, calibrator=arm_cal,
+                            portfolio_sizes=test_sizes,
                         )
                         sev = arm_metrics.pop("_probs_cal")[:, -1]
                         arm_metrics.pop("_cost_preds", None)
@@ -402,7 +407,8 @@ def train_single_fold(
                 # arms loop above — no need to re-run predict_proba.
                 probs_test = arm_test_probs[deploy_name]
                 fe = full_evaluation(
-                    y_test, probs_test, strata=test_strata, calibrator=arm_cal
+                    y_test, probs_test, strata=test_strata, calibrator=arm_cal,
+                    portfolio_sizes=test_sizes,
                 )
                 y_pred     = fe.pop("_cost_preds")
                 y_prob_cal = fe.pop("_probs_cal")

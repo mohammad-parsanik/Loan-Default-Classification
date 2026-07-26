@@ -43,7 +43,8 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     return metrics
 
 
-def full_evaluation(y_true, probs, strata=None, calibrator=None) -> dict:
+def full_evaluation(y_true, probs, strata=None, calibrator=None,
+                    portfolio_sizes=None) -> dict:
     """
     Single evaluation path shared by the baseline and the DeepSets+XGB model,
     so the two are compared under the SAME decision policy.
@@ -58,6 +59,17 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None) -> dict:
                        effect of calibration from the cost rule).
     "cost_rule":       expected-cost decisions on calibrated+masked probs.
     "by_current_cat":  cost-rule metrics per current-category slice.
+    "ranking_single_loan": the ranking block restricted to customers holding
+                       exactly ONE loan (needs `portfolio_sizes`). For those
+                       customers a loan-grain row and a portfolio-grain row
+                       are identical by construction, so this slice — and
+                       only this slice — is comparable across the two grains
+                       and back to the portfolio-grain benchmark
+                       (results_3..results_6). The headline "ranking" block
+                       is NOT: loan grain changes the population (healthy
+                       siblings of severe loans now enter the queue) and the
+                       severe base rate with it, and PR-AUC moves with the
+                       base rate whatever the model does.
     Also returns "_cost_preds"/"_probs_cal" for plots/CIs.
     """
     from src.evaluation.calibration import StratifiedCalibrator
@@ -82,8 +94,14 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None) -> dict:
     out["argmax_cal"] = compute_metrics(y_true, probs_cal.argmax(axis=1), probs_cal)
     out["cost_rule"] = compute_metrics(y_true, cost_preds, probs_cal)
     if strata is not None:
-        out["ranking"] = ranking_metrics(y_true, severity_scores(probs_cal), strata)
+        sev = severity_scores(probs_cal)
+        out["ranking"] = ranking_metrics(y_true, sev, strata)
         out["by_current_cat"] = stratified_metrics(y_true, cost_preds, strata, probs_cal)
+        if portfolio_sizes is not None:
+            one = np.asarray(portfolio_sizes) == 1
+            out["ranking_single_loan"] = ranking_metrics(
+                y_true[one], sev[one], np.asarray(strata)[one]
+            )
     out["_cost_preds"] = cost_preds
     out["_probs_cal"] = probs_cal
     return out
