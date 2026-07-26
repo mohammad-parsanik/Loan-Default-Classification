@@ -103,7 +103,6 @@ class DeepSetsScorer:
 
 def _build_deepsets_scorer(scaler, hparams, state_dict, xgb_model, max_loans, device):
     from src.model.deep_sets import DeepSets   # lazy: legacy path only
-    import torch
     model = DeepSets(**{**hparams, "dropout": 0.0})
     model.load_state_dict(state_dict)
     model.to(device)

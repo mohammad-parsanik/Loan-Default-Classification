@@ -89,9 +89,9 @@ Each stage has crash-safe checkpointing (`StageCheckpointer` in `run.py`). On `-
 
 ### Core Model: DeepSets (not Set-Transformer)
 
-> **Critical clarification:** The README and implementation plan mention a "Set-Transformer." While `src/model/set_transformer.py` exists, **the active model used in training is `src/model/deep_sets.py`**. The `run.py` pipeline imports and trains `DeepSets`, not `SetTransformer`.
+> **Critical clarification:** The README and implementation plan mention a "Set-Transformer." No such model exists in the codebase — `src/model/set_transformer.py` was deleted July 26, 2026 as dead code (never imported by `run.py`). The legacy neural path is `src/model/deep_sets.py`.
 
-**Why DeepSets was chosen over the Set-Transformer:** With MAX_LOANS ≤ 2, self-attention on 1-2 tokens degenerates to a weighted average. DeepSets (phi + pool + rho) is provably permutation-invariant, has far fewer parameters (~42K vs ~173K), and is faster on CPU. The Set-Transformer file is retained but unused.
+**Why DeepSets was chosen over the Set-Transformer:** With MAX_LOANS ≤ 2, self-attention on 1-2 tokens degenerates to a weighted average. DeepSets (phi + pool + rho) is provably permutation-invariant, has far fewer parameters (~42K vs ~173K), and is faster on CPU.
 
 **DeepSets Architecture:**
 ```
@@ -307,7 +307,6 @@ Loan Default Classification/
 │   │   └── temporal_split.py      # Static split + walk-forward fold generation
 │   ├── model/
 │   │   ├── deep_sets.py           # ★ Active model (42K params)
-│   │   ├── set_transformer.py     # Retained but UNUSED in pipeline
 │   │   ├── losses.py              # Cost-Sensitive Focal Loss
 │   │   ├── meta_learner.py        # XGBoost on frozen embeddings + Optuna
 │   │   └── trainer.py             # Training loop with early stopping
@@ -335,7 +334,7 @@ Loan Default Classification/
 
 1. **README.md is outdated.** It still references Oracle, `cx_Oracle`, and the Set-Transformer as the active model. The actual DB is MSSQL/pyodbc, and the active model is DeepSets.
 2. **`Implementation_plan.md` is the original design doc** — many details have evolved (DeepSets replaced Transformer, Oracle replaced by MSSQL, walk-forward added then found infeasible). Treat it as historical context, not current truth.
-3. **`set_transformer.py` is dead code.** It exists but is never imported by `run.py`. The pipeline uses `deep_sets.py`.
+3. **`set_transformer.py` was deleted** (July 26, 2026) — it was never imported by `run.py`. The neural path is `deep_sets.py`; the deployed model is `src/baselines/aggregated_xgboost.py`.
 4. **Snapshot dates are stored as floats** (e.g., `20241021.0`), not integers or datetime. All temporal logic in `temporal_split.py` converts them to `datetime.date` for gap calculations.
 5. **The baseline consistently matches or beats DeepSets+XGB on Macro F1.** This is expected with MAX_LOANS=2. The DeepSets model's Cat-2 recall advantage (87% vs 76-78% in Runs 2-3) was **confounded**: the DeepSets had a cost-sensitive loss while the baseline used plain argmax. Since July 7, 2026 both systems are evaluated under the same expected-cost decision rule (`cost_rule` metrics) — use those for architecture comparisons.
 6. **`torch.compile` is disabled on the Windows training server** (inductor requires MSVC). The model runs in eager mode.
