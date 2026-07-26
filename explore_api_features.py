@@ -23,7 +23,12 @@ exploded two ways and fed through the SAME pipeline as a real endpoint, as a
 pseudo-endpoint named "<endpoint>::<column>[item]" (one row per list item — do
 specific codes/values concentrate in one class) and "...[agg]" (one row per
 customer — count of items + sum/max of amount-like subfields — does HAVING
-several/large flagged items correlate with class). A paired code+description
+several/large flagged items correlate with class). The [agg] side additionally
+derives two families that raw sum/max cannot express (see aggregate_list_column):
+DATE fields become durations in days relative to --as_of_jalali (days since last
+payment, loan age, days to maturity) instead of being dropped as unusable, and
+--bank_field/--own_bank_code split every aggregate into own-bank and
+external-bank halves. A paired code+description
 field (like scoreCodes) is additionally split into its own reference CSV instead
 of being plotted as a redundant many-level categorical. Columns that are
 themselves personal identifiers (e.g. a phone-number list) are never exploded.
@@ -32,9 +37,15 @@ Outputs (in --output_dir, default `api_exploration/`):
   schema.csv                        -- discovered endpoints x features x type x null-rate
                                         (includes the exploded JSON pseudo-endpoints)
   summary_stats.csv                 -- per feature x CURRENT_CAT: count/mean/median/quantiles/nulls
-  separation.csv                    -- per feature: how well it separates severe from the rest (AUC / Cramer's V)
+  separation.csv                    -- per feature: how well it separates severe from the rest (AUC / Cramer's V),
+                                        PLUS queue_value/queue_n — the same statistic recomputed on the ranked
+                                        queue alone (current_cat < severe_ge). Read queue_value first: `value`
+                                        scores a contrast the deployed system never makes, because already-severe
+                                        customers are carved out of the queue and their status is already known
+                                        for free internally. See the note above _queue_auc.
   threshold_suggestions.csv         -- per numeric feature: best severe-vs-rest cut (threshold, dir, precision/recall/F1/lift)
-  category_rates.csv                -- per categorical feature x level: severe-rate and support
+  category_rates.csv                -- per categorical feature x level: severe-rate, support, and n_queue
+                                        (how many customers of that level the system actually ranks)
   <endpoint>_<column>_code_reference.csv -- code -> description mapping for paired code/description JSON fields
   plots/<endpoint or pseudo-endpoint>/<feature>.png  -- distribution split by CURRENT_CAT (+ box-by-class panel)
 
@@ -42,8 +53,14 @@ Usage (run on the server, where the parquet lives):
   # 1. sanity-check what the module sees before generating everything:
   python explore_api_features.py --data api_joined.parquet --inspect
 
-  # 2. full run (tables + plots):
-  python explore_api_features.py --data api_joined.parquet
+  # 2. full run (tables + plots). Pass the date the API responses were pulled
+  #    (the payload's own dateEstlm) and our own code in the registry's bankCode
+  #    field — without the latter you get n_banks but no own/ext split.
+  #    Ours is 18 (بانک تجارت): it is the only code present for 100% of sampled
+  #    customers, and own_n_items reproduces the internal N_LOANS_IN_PORTFOLIO
+  #    for 95% of them. A wrong code is warned about, not silently split.
+  python explore_api_features.py --data api_joined.parquet \
+      --as_of_jalali 14050421 --own_bank_code 18
 
   # narrow to one endpoint / a few features while iterating:
   python explore_api_features.py --data api_joined.parquet --endpoints credit_bureau --max_features 20
@@ -55,6 +72,7 @@ Usage (run on the server, where the parquet lives):
 from __future__ import annotations
 
 import argparse
+import datetime as _date
 import logging
 import sys
 from pathlib import Path
@@ -229,21 +247,59 @@ def summarize_numeric(df: pd.DataFrame, feature: str, class_col: str) -> pd.Data
     return pd.DataFrame(rows)
 
 
+# ── Why there are two separation numbers ──────────────────────────────────────
+#
+# `value` scores the feature against positive=(current_cat >= severe_ge), i.e.
+# ALREADY-SEVERE vs everyone else. That contrast is measured on a population the
+# deployed system never ranks: CARVE_CURRENT_CAT_GE removes already-severe
+# customers from the API queue and rule-flags them, and their status is already
+# known for free from the bank's own table. A feature can therefore score a
+# spectacular `value` and still be worthless in deployment — sumAmMoavagh is
+# exactly this: median AND q75 are 0.0 for current_cat 0, 1 AND 2, so its entire
+# lift comes from a group that never reaches the queue.
+#
+# `queue_value` re-scores the same feature on the RANKED POPULATION ONLY
+# (current_cat < severe_ge), positive = the worst still-rankable category. It is
+# a necessary condition, not a sufficient one: it is still CONCURRENT, so it
+# says "this feature resolves degree-of-trouble among customers we actually
+# rank", NOT "this feature predicts who will go severe". Nothing available
+# offline can establish the latter — the enrichment API returns present-time
+# data only, so predictive validity has to come from a randomised forward
+# holdout. Treat queue_value as a screen: a feature that fails it cannot
+# possibly rank within the queue, so it can be discarded without waiting.
+
+def _queue_auc(df: pd.DataFrame, values: pd.Series, class_col: str, severe_ge: int) -> tuple:
+    """(auc, n) restricted to the ranked queue; positive = worst rankable cat."""
+    from sklearn.metrics import roc_auc_score
+
+    in_queue = df[class_col] < severe_ge
+    s, y = values[in_queue], (df.loc[in_queue, class_col] == severe_ge - 1).astype(int)
+    mask = s.notna()
+    s, y = s[mask], y[mask]
+    if y.nunique() < 2 or len(s) < 10:
+        return np.nan, int(len(s))
+    return round(float(max(roc_auc_score(y, s), 1 - roc_auc_score(y, s))), 4), int(len(s))
+
+
 def separation_numeric(df: pd.DataFrame, feature: str, class_col: str, severe_ge: int) -> dict:
-    """ROC-AUC of the raw feature vs positive=(current_cat >= severe_ge)."""
+    """ROC-AUC of the raw feature vs positive=(current_cat >= severe_ge), plus
+    the same statistic recomputed on the ranked queue alone (see note above)."""
     from sklearn.metrics import roc_auc_score
 
     s = pd.to_numeric(df[feature], errors="coerce")
     y = (df[class_col] >= severe_ge).astype(int)
+    q_auc, q_n = _queue_auc(df, s, class_col, severe_ge)
     mask = s.notna()
     s, y = s[mask], y[mask]
     if y.nunique() < 2 or len(s) < 10:
-        return {"feature": feature, "type": "numeric", "metric": "auc", "value": np.nan, "direction": ""}
+        return {"feature": feature, "type": "numeric", "metric": "auc", "value": np.nan,
+                "direction": "", "queue_value": q_auc, "queue_n": q_n}
     auc = roc_auc_score(y, s)
     # auc<0.5 => the feature separates in the inverse direction; report strength >=0.5.
     direction = "high=severe" if auc >= 0.5 else "low=severe"
     return {"feature": feature, "type": "numeric", "metric": "auc",
-            "value": round(float(max(auc, 1 - auc)), 4), "direction": direction}
+            "value": round(float(max(auc, 1 - auc)), 4), "direction": direction,
+            "queue_value": q_auc, "queue_n": q_n}
 
 
 def suggest_threshold(df: pd.DataFrame, feature: str, class_col: str, severe_ge: int) -> dict | None:
@@ -279,29 +335,39 @@ def category_rates(df: pd.DataFrame, feature: str, class_col: str, severe_ge: in
     """Per level: severe-rate, support, lift over base — candidate categorical rules."""
     y = (df[class_col] >= severe_ge).astype(int)
     base = y.mean()
+    in_queue = df[class_col] < severe_ge
     rows = []
     for level, idx in df.groupby(feature, observed=True).groups.items():
         yy = y.loc[idx]
         rate = float(yy.mean())
+        # n_queue: how many customers this level flags that the system ACTUALLY
+        # ranks. A level whose whole support is already-severe customers is a
+        # restatement of a field the bank already holds, not a usable rule.
         rows.append({"feature": feature, "level": level, "n": int(len(yy)),
                      "severe_rate": round(rate, 4), "base_rate": round(float(base), 4),
-                     "lift": round(rate / base, 3) if base else np.nan})
+                     "lift": round(rate / base, 3) if base else np.nan,
+                     "n_queue": int(in_queue.loc[idx].sum())})
     return pd.DataFrame(rows).sort_values("severe_rate", ascending=False)
 
 
 def separation_categorical(df: pd.DataFrame, feature: str, class_col: str, severe_ge: int) -> dict:
-    """Cramer's V between the feature and severe/not-severe."""
+    """Cramer's V between the feature and severe/not-severe, plus the same
+    statistic on the ranked queue alone (see the note above _queue_auc)."""
     from scipy.stats import chi2_contingency
 
-    y = (df[class_col] >= severe_ge).astype(int)
-    tab = pd.crosstab(df[feature], y)
-    if tab.shape[0] < 2 or tab.shape[1] < 2:
-        return {"feature": feature, "type": "categorical", "metric": "cramers_v", "value": np.nan, "direction": ""}
-    chi2 = chi2_contingency(tab)[0]
-    n = tab.to_numpy().sum()
-    v = np.sqrt(chi2 / (n * (min(tab.shape) - 1)))
+    def _v(sub: pd.DataFrame, positive: pd.Series) -> tuple:
+        tab = pd.crosstab(sub[feature], positive)
+        if tab.shape[0] < 2 or tab.shape[1] < 2:
+            return np.nan, int(len(sub))
+        n = tab.to_numpy().sum()
+        chi2 = chi2_contingency(tab)[0]
+        return round(float(np.sqrt(chi2 / (n * (min(tab.shape) - 1)))), 4), int(n)
+
+    q = df[df[class_col] < severe_ge]
+    q_v, q_n = _v(q, (q[class_col] == severe_ge - 1).astype(int)) if len(q) else (np.nan, 0)
+    v, _ = _v(df, (df[class_col] >= severe_ge).astype(int))
     return {"feature": feature, "type": "categorical", "metric": "cramers_v",
-            "value": round(float(v), 4), "direction": ""}
+            "value": v, "direction": "", "queue_value": q_v, "queue_n": q_n}
 
 
 # ── JSON list-column exploration ──────────────────────────────────────────────
@@ -340,6 +406,58 @@ def _is_amount_like(key: str) -> bool:
     return kl.startswith("am") or "amount" in kl
 
 
+def _is_date_like(key: str) -> bool:
+    return "date" in key.lower()
+
+
+# ── Jalali dates → durations ──────────────────────────────────────────────────
+#
+# Registry rows carry Jalali YYYYMMDD dates (14030431) and timestamps
+# ("14050304 02:50:28.636"). As raw integers they are meaningless as features —
+# 14030431 is not a number you can threshold — which is why the first pass typed
+# them id_like/numeric-junk and dropped them. Converted to DURATIONS relative to
+# the inquiry date they become the only dynamic signal in the payload:
+# days-since-last-payment, loan age, days-to-maturity.
+#
+# Only day DIFFERENCES are ever used, so the absolute epoch is irrelevant; the
+# anchor below pins the scale to Gregorian proleptic ordinals so that
+# date.today().toordinal() is directly comparable. Self-checked against four
+# known Jalali/Gregorian pairs in _self_check().
+
+def _jalali_daynum(jy: int, jm: int, jd: int) -> int:
+    """Birashk-style running day count. Epoch-arbitrary; only differences matter."""
+    jy += 1595
+    days = -355668 + 365 * jy + (jy // 33) * 8 + ((jy % 33) + 3) // 4 + jd
+    days += (jm - 1) * 31 if jm < 7 else (jm - 7) * 30 + 186
+    return days
+
+
+# Anchor: Jalali 1403/01/01 == Gregorian 2024-03-20 (Nowruz).
+_JD_OFFSET = _date.date(2024, 3, 20).toordinal() - _jalali_daynum(1403, 1, 1)
+
+
+def jalali_to_ordinal(value) -> float:
+    """
+    Jalali YYYYMMDD (int, float, or a "YYYYMMDD hh:mm:ss" string) -> Gregorian
+    proleptic ordinal. NaN for missing, zero-as-null, and out-of-range values.
+
+    0 is the API's "not applicable" marker (e.g. emhalDate on a loan that was
+    never deferred), not year zero — mapping it to a real ordinal would invent a
+    ~2,600-year-old date and blow up every duration built from it.
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return np.nan
+    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())[:8]
+    if len(digits) != 8:
+        return np.nan
+    jy, jm, jd = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+    # Range guard: catches 0 ("not applicable"), truncated values, and any field
+    # that merely looks date-shaped. 1300-1500 Jalali ~= 1921-2121 Gregorian.
+    if not (1300 <= jy <= 1500 and 1 <= jm <= 12 and 1 <= jd <= 31):
+        return np.nan
+    return float(_jalali_daynum(jy, jm, jd) + _JD_OFFSET)
+
+
 def explode_list_column(df: pd.DataFrame, col: str, id_col: str | None, class_col: str) -> pd.DataFrame:
     """One row per list item; item dict keys become columns; unions unwrapped."""
     keep = [c for c in (id_col, class_col) if c]
@@ -357,7 +475,10 @@ def explode_list_column(df: pd.DataFrame, col: str, id_col: str | None, class_co
     return pd.DataFrame.from_records(records)
 
 
-def aggregate_list_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
+def aggregate_list_column(
+    df: pd.DataFrame, col: str, as_of_ordinal: float | None = None,
+    bank_field: str | None = None, own_bank_code=None,
+) -> pd.DataFrame:
     """Per-customer derived features: item count, sum/max of amount-like
     subfields, and max-value-seen for every OTHER numeric/coded subfield too
     (e.g. a per-loan status code) — "the worst value across this customer's
@@ -368,10 +489,28 @@ def aggregate_list_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
     is worse" is left for separation/threshold analysis downstream to judge —
     junk candidates (e.g. a max'd branch-code identifier) fall out naturally via
     the same id_like/cardinality checks applied everywhere else in the pipeline.
+
+    Two further families are derived when the inputs are available:
+
+    `as_of_ordinal` — DATE fields become durations in days rather than being
+    dropped. min_days_since_X is the most recent occurrence, max_days_since_X
+    the most stale; a negative value means the date is in the future (a maturity
+    date that has not arrived yet), so days-to-maturity is just the sign flip.
+
+    `bank_field` + `own_bank_code` — splits every aggregate into OWN-bank and
+    EXTERNAL-bank halves. This is the only part of the payload that is
+    structurally NOT redundant with the bank's internal features: the internal
+    model sees this bank's own book and nothing else, so "clean with us, three
+    overdue loans elsewhere" is information it cannot otherwise have. n_banks is
+    emitted whenever bank_field is present, since counting distinct lenders
+    needs no knowledge of which one is ours.
     """
     lists = df[col].apply(lambda x: x if isinstance(x, (list, np.ndarray)) else [])
     n_items = lists.apply(len)
-    out = pd.DataFrame({"n_items": n_items, "has_items": n_items > 0}, index=df.index)
+    # Columns are collected here and concatenated once at the end: the own/ext
+    # split multiplies the column count by ~3, and inserting them one at a time
+    # into a live frame triggers pandas' fragmentation warning on every write.
+    cols: dict[str, pd.Series] = {"n_items": n_items, "has_items": n_items > 0}
 
     keys = set()
     for items in lists:
@@ -379,28 +518,108 @@ def aggregate_list_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
             if isinstance(item, dict):
                 keys.update(item.keys())
 
-    def _numeric_values(field):
+    def _numeric_values(field, subset=None):
+        """Per-customer list of numeric values of `field`, optionally over a
+        subset of each customer's items (used for the own/external split)."""
         def _values(items, f=field):
             vals = []
             for it in items:
-                if isinstance(it, dict) and it.get(f) is not None:
-                    v = _avro_unwrap(it[f])
-                    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
-                        vals.append(float(v))
+                if not isinstance(it, dict) or it.get(f) is None:
+                    continue
+                if subset is not None and not subset(it):
+                    continue
+                v = _avro_unwrap(it[f])
+                if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+                    vals.append(float(v))
             return vals
         return lists.apply(_values)
 
-    for field in sorted(k for k in keys if _is_amount_like(k)):
-        per_row = _numeric_values(field)
-        out[f"sum_{field}"] = per_row.apply(lambda v: sum(v) if v else np.nan)
-        out[f"max_{field}"] = per_row.apply(lambda v: max(v) if v else np.nan)
+    def _emit(field, per_row, prefix="", amount_like=True):
+        if amount_like:
+            cols[f"{prefix}sum_{field}"] = per_row.apply(lambda v: sum(v) if v else np.nan)
+        cols[f"{prefix}max_{field}"] = per_row.apply(lambda v: max(v) if v else np.nan)
 
-    for field in sorted(k for k in keys if not _is_amount_like(k) and "date" not in k.lower()):
+    amount_fields = sorted(k for k in keys if _is_amount_like(k))
+    date_fields = sorted(k for k in keys if _is_date_like(k))
+    # bank_field is excluded: it names a LENDER, so "max bankCode across this
+    # customer's loans" is the maximum of nominal ids and means nothing. What is
+    # actually wanted from it — how many lenders, and which side of the split a
+    # loan falls on — is emitted below as n_banks and the own_/ext_ halves.
+    coded_fields = sorted(k for k in keys
+                          if not _is_amount_like(k) and not _is_date_like(k) and k != bank_field)
+
+    for field in amount_fields:
+        _emit(field, _numeric_values(field))
+
+    # Whether a coded field is aggregatable is a property of the SCHEMA, so it is
+    # decided once on the pooled data. Deciding it per own_/ext_ half instead
+    # would silently drop e.g. own_max_status for a customer with no own loans,
+    # leaving the two halves with different column sets.
+    coded_numeric = []
+    for field in coded_fields:
         per_row = _numeric_values(field)
         if per_row.apply(len).sum() == 0:
             continue  # never numeric for this field (text/id/etc) — nothing to aggregate
-        out[f"max_{field}"] = per_row.apply(lambda v: max(v) if v else np.nan)
-    return out
+        coded_numeric.append(field)
+        _emit(field, per_row, amount_like=False)
+
+    # ── dates -> durations ────────────────────────────────────────────────────
+    if as_of_ordinal is not None:
+        for field in date_fields:
+            def _days(items, f=field):
+                out_ = [as_of_ordinal - o for o in
+                        (jalali_to_ordinal(_avro_unwrap(it[f]))
+                         for it in items if isinstance(it, dict) and it.get(f) is not None)
+                        if not np.isnan(o)]
+                return out_
+            per_row = lists.apply(_days)
+            if per_row.apply(len).sum() == 0:
+                continue  # nothing parsed as a Jalali date — leave it to id_like
+            cols[f"min_days_since_{field}"] = per_row.apply(lambda v: min(v) if v else np.nan)
+            cols[f"max_days_since_{field}"] = per_row.apply(lambda v: max(v) if v else np.nan)
+
+    # ── own bank vs. the rest of the market ───────────────────────────────────
+    if bank_field and bank_field in keys:
+        def _codes(items):
+            return {_avro_unwrap(it[bank_field]) for it in items
+                    if isinstance(it, dict) and it.get(bank_field) is not None}
+        cols["n_banks"] = lists.apply(lambda v: len(_codes(v)) if v else np.nan)
+
+        if own_bank_code is not None:
+            own = str(own_bank_code)
+            halves = {
+                "own_": lambda it: str(_avro_unwrap(it.get(bank_field))) == own,
+                "ext_": lambda it: str(_avro_unwrap(it.get(bank_field))) != own,
+            }
+            for prefix, subset in halves.items():
+                cols[f"{prefix}n_items"] = lists.apply(
+                    lambda v, s=subset: sum(1 for it in v if isinstance(it, dict) and s(it)))
+                for field in amount_fields:
+                    _emit(field, _numeric_values(field, subset), prefix=prefix)
+                for field in coded_numeric:
+                    _emit(field, _numeric_values(field, subset), prefix=prefix, amount_like=False)
+            # A wrong --own_bank_code does not fail, it silently labels our own
+            # loans "external" and produces a meaningless split. Every customer
+            # in the portfolio banks with us, so own_n_items should be >=1 almost
+            # always; a low share means the code is wrong (or the registry names
+            # us under a different one).
+            has_own = (cols["own_n_items"] > 0)[n_items > 0]
+            if len(has_own) and has_own.mean() < 0.8:
+                log.warning(
+                    "--own_bank_code=%s matches no %s row for %.0f%% of customers with registry "
+                    "data. Every customer in the portfolio should hold >=1 loan with us, so this "
+                    "is very likely the wrong code — the own_/ext_ split will be meaningless.",
+                    own_bank_code, bank_field, 100 * (1 - has_own.mean()),
+                )
+            # Share of exposure held outside this bank: scale-free, so it is
+            # comparable across customers with very different total debt.
+            for field in amount_fields:
+                tot = cols[f"sum_{field}"].to_numpy(dtype=float)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    cols[f"ext_share_{field}"] = pd.Series(
+                        np.where(tot > 0, cols[f"ext_sum_{field}"].to_numpy(dtype=float) / tot, np.nan),
+                        index=lists.index)
+    return pd.DataFrame(cols, index=df.index)
 
 
 def _split_code_reference(exploded: pd.DataFrame, item_schema: pd.DataFrame, out: Path, label: str) -> pd.DataFrame:
@@ -450,7 +669,12 @@ def prepare_json_extensions(
             extra_schema.append(item_schema)
             extensions.append({"label": label, "df": exploded, "schema": item_schema})
 
-        agg = aggregate_list_column(ep_df, col)
+        agg = aggregate_list_column(
+            ep_df, col,
+            as_of_ordinal=getattr(args, "as_of_ordinal", None),
+            bank_field=getattr(args, "bank_field", None) or None,
+            own_bank_code=getattr(args, "own_bank_code", None),
+        )
         if not agg.empty and agg.drop(columns=["has_items"]).notna().any().any():
             label = f"{owning_ep}::{col}[agg]"
             merged = pd.concat([ep_df[[class_col]].reset_index(drop=True), agg.reset_index(drop=True)], axis=1)
@@ -616,6 +840,23 @@ def run(df: pd.DataFrame, args) -> None:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Reference point for every date->duration feature. Defaults to today, which
+    # is only right for a pull made today: the API has no as-of parameter, so an
+    # older extract must be dated explicitly or every duration is inflated by the
+    # delay between the pull and this analysis.
+    as_of = getattr(args, "as_of_jalali", None)
+    if as_of:
+        args.as_of_ordinal = jalali_to_ordinal(as_of)
+        if np.isnan(args.as_of_ordinal):
+            raise SystemExit(f"--as_of_jalali {as_of!r} is not a Jalali YYYYMMDD date.")
+    else:
+        args.as_of_ordinal = float(_date.date.today().toordinal())
+        log.warning(
+            "--as_of_jalali not given; dating the API pull as TODAY (%s) for duration features. "
+            "If the responses were pulled earlier, pass the payload's dateEstlm.",
+            _date.date.today().isoformat(),
+        )
+
     extensions = []
     if not args.no_json_explode:
         extensions, extra_schema = prepare_json_extensions(
@@ -698,9 +939,74 @@ def _write(path: Path, df: pd.DataFrame | None) -> None:
 
 # ── Self-check ────────────────────────────────────────────────────────────────
 
+def _check_derived_features() -> None:
+    """Hand-built portfolio: the date/bank arithmetic must reproduce it exactly."""
+    # Anchor the calendar against six known Jalali/Gregorian pairs, including
+    # both kinds of leap boundary — every duration below rides on this.
+    for (jy, jm, jd), g in [((1403, 1, 1), (2024, 3, 20)), ((1404, 1, 1), (2025, 3, 21)),
+                            ((1402, 12, 29), (2024, 3, 19)), ((1405, 1, 1), (2026, 3, 21)),
+                            ((1399, 1, 1), (2020, 3, 20)), ((1395, 12, 30), (2017, 3, 20))]:
+        assert jalali_to_ordinal(f"{jy:04d}{jm:02d}{jd:02d}") == _date.date(*g).toordinal(), (jy, jm, jd)
+    assert np.isnan(jalali_to_ordinal(0))            # "not applicable", not year zero
+    assert np.isnan(jalali_to_ordinal(None))
+    assert np.isnan(jalali_to_ordinal("99999999"))   # date-shaped but out of range
+    assert jalali_to_ordinal("14050304 02:50:28.636") == jalali_to_ordinal(14050304)  # timestamp form
+
+    as_of = jalali_to_ordinal(14050421)
+    # One customer, three loans: two at our bank (17), one elsewhere (18).
+    # Our two are clean; the outside one carries all the overdue amount — the
+    # exact case the internal model cannot see and the split exists to surface.
+    df = pd.DataFrame({"rows": [[
+        {"bankCode": 17, "amMoavagh": 0,        "status": 1, "date": 14040101, "emhalDate": 0},
+        {"bankCode": 17, "amMoavagh": 0,        "status": 1, "date": 14050401, "emhalDate": 0},
+        {"bankCode": 18, "amMoavagh": 50_000_000, "status": 5, "date": 14030115, "emhalDate": 0},
+    ]]})
+    a = aggregate_list_column(df, "rows", as_of_ordinal=as_of,
+                              bank_field="bankCode", own_bank_code=17).iloc[0]
+
+    assert a["n_items"] == 3 and a["n_banks"] == 2
+    assert a["own_n_items"] == 2 and a["ext_n_items"] == 1
+    # Pooled aggregates say "this customer has overdue debt and a status-5 loan";
+    # the split says it is ALL outside our book, and we look clean.
+    assert a["sum_amMoavagh"] == 50_000_000 and a["max_status"] == 5
+    assert a["own_sum_amMoavagh"] == 0 and a["own_max_status"] == 1
+    assert a["ext_sum_amMoavagh"] == 50_000_000 and a["ext_max_status"] == 5
+    assert a["ext_share_amMoavagh"] == 1.0
+
+    # Durations: most recent origination is 14050401, oldest is 14030115.
+    assert a["min_days_since_date"] == as_of - jalali_to_ordinal(14050401) == 20
+    assert a["max_days_since_date"] == as_of - jalali_to_ordinal(14030115)
+    assert a["min_days_since_date"] < a["max_days_since_date"]
+    # emhalDate is 0 on every loan -> nothing parses -> no duration column at all.
+    assert not any(c.endswith("days_since_emhalDate") for c in a.index), list(a.index)
+    # Raw Jalali ints must never survive as bare numerics beside the durations.
+    assert "max_date" not in a.index and "sum_date" not in a.index, list(a.index)
+
+    # ext_share is NaN, not 0/0, when the customer has no exposure of that kind.
+    empty = pd.DataFrame({"rows": [[{"bankCode": 17, "amMoavagh": 0}]]})
+    e = aggregate_list_column(empty, "rows", as_of_ordinal=as_of,
+                              bank_field="bankCode", own_bank_code=17).iloc[0]
+    assert np.isnan(e["ext_share_amMoavagh"]), e["ext_share_amMoavagh"]
+    # Without own_bank_code we still get n_banks, but no own_/ext_ split.
+    n = aggregate_list_column(df, "rows", as_of_ordinal=as_of, bank_field="bankCode").iloc[0]
+    assert n["n_banks"] == 2 and not any(c.startswith(("own_", "ext_")) for c in n.index)
+
+    # A WRONG own_bank_code warns but must still emit the full set of columns —
+    # the mis-set-code guard is a diagnostic, never a branch that skips work.
+    w = aggregate_list_column(df, "rows", as_of_ordinal=as_of,
+                              bank_field="bankCode", own_bank_code=999).iloc[0]
+    assert w["own_n_items"] == 0 and w["ext_n_items"] == 3
+    assert {"own_sum_amMoavagh", "ext_sum_amMoavagh", "ext_share_amMoavagh",
+            "own_max_status", "ext_max_status"} <= set(w.index), list(w.index)
+    assert w["ext_share_amMoavagh"] == 1.0
+    print("derived-feature check OK — Jalali durations + own/external bank split")
+
+
 def _self_check() -> None:
     """Synthetic long-format frame across 3 endpoints; exercise the full pipeline."""
     import tempfile
+
+    _check_derived_features()
 
     rng = np.random.default_rng(0)
     n = 800
@@ -734,6 +1040,13 @@ def _self_check() -> None:
                 # a per-item coded field, not amount-named — the max-across-items
                 # aggregate is what should surface this at the customer level.
                 "statusCode": int(rng.integers(1, 6)) if rng.random() < 0.2 + 0.2 * cat else 1,
+                # Jalali YYYYMMDD; worse customers paid longer ago, so
+                # min_days_since_lastPayDate must separate. 0 = "not applicable"
+                # (never deferred) and must survive as NaN, not year zero.
+                "lastPayDate": int(f"1405{4 - min(cat, 3):02d}{rng.integers(1, 29):02d}"),
+                "emhalDate": 0,
+                # bank 17 is "ours"; higher cats carry more outside lenders.
+                "bankCode": 17 if rng.random() < 0.7 - 0.15 * cat else int(rng.integers(18, 24)),
             })
         return out
 
@@ -761,6 +1074,7 @@ def _self_check() -> None:
             min_n_present=20, pii_substrings="", severe_ge=3,
             numeric="", categorical="", endpoints=None, max_features=None,
             inspect=False, no_plots=False, no_json_explode=False,
+            as_of_jalali="14050421", bank_field="bankCode", own_bank_code="17",
         )
         run(df, args)
         out = Path(args.output_dir)
@@ -792,10 +1106,37 @@ def _self_check() -> None:
         }, agg_rows
         # 'phone.contacts' must never be exploded into item/agg pseudo-endpoints (it's PII).
         assert not schema["endpoint"].astype(str).str.startswith("fraud::phone.contacts").any()
+
+        # Jalali dates -> durations, and the own/external bank split.
+        agg_feats = set(agg_rows["feature"])
+        assert {"events.min_days_since_lastPayDate", "events.max_days_since_lastPayDate"} <= agg_feats, agg_feats
+        assert "events.n_banks" in agg_feats, agg_feats
+        assert {"events.own_sum_amFlagged", "events.ext_sum_amFlagged",
+                "events.ext_share_amFlagged", "events.own_n_items",
+                "events.ext_max_statusCode"} <= agg_feats, agg_feats
+        # emhalDate is 0 everywhere ("not applicable") — must NOT become a
+        # year-zero duration; it should drop out entirely, not appear as a
+        # ~2,600-year-old date.
+        assert not any(f.endswith("days_since_emhalDate") for f in agg_feats), agg_feats
+        # Raw Jalali ints must not survive as bare numerics alongside the durations.
+        assert "events.max_lastPayDate" not in agg_feats, agg_feats
+
         sep = pd.read_csv(out / "separation.csv")
-        # 'utilization' was built to track severity — it should top the separation table.
+        # Both contrasts are reported: 'value' vs already-severe, 'queue_value'
+        # on the ranked population only.
+        assert {"queue_value", "queue_n"} <= set(sep.columns), sep.columns
+        assert sep["queue_n"].max() > 0
+        cat_rates = pd.read_csv(out / "category_rates.csv")
+        assert "n_queue" in cat_rates.columns
+        assert (cat_rates["n_queue"] <= cat_rates["n"]).all()
+        # Some feature built to track severity should top the table. 'lastPayDate'
+        # qualifies: at ITEM level a raw Jalali YYYYMMDD is still rank-ordered by
+        # true date, so AUC on it is meaningful even though its magnitude is not
+        # — which is why only the customer-level AGGREGATE converts to durations.
         top_feat = sep.iloc[0]["feature"]
-        assert top_feat in {"utilization", "status", "n_alerts", "code"}, f"weak signal on top: {top_feat}"
+        assert top_feat in {"utilization", "status", "n_alerts", "code", "lastPayDate",
+                            "events.min_days_since_lastPayDate",
+                            "events.max_days_since_lastPayDate"}, f"weak signal on top: {top_feat}"
         plots = list((out / "plots").rglob("*.png"))
         assert len(plots) >= 4, f"expected several plots, got {len(plots)}"
     print(f"self-check OK — schema/stats/separation/thresholds written, {len(plots)} plots, "
@@ -829,6 +1170,18 @@ def main() -> None:
     p.add_argument("--endpoints", type=str, default=None, help="comma-list to restrict to specific endpoints")
     p.add_argument("--max_features", type=int, default=None, help="cap features per endpoint (for quick iterations)")
     p.add_argument("--no_plots", action="store_true", help="tables only, skip PNGs")
+    p.add_argument("--as_of_jalali", type=str, default=None,
+                   help="Jalali YYYYMMDD the API responses were pulled on (e.g. 14050421 — the "
+                        "payload's own dateEstlm). Turns registry date fields into durations "
+                        "(days since last payment, loan age, days to maturity). Defaults to today; "
+                        "pass the real inquiry date when analysing an older pull.")
+    p.add_argument("--bank_field", type=str, default="bankCode",
+                   help="per-item field naming the lender, used to split aggregates into own-bank "
+                        "vs external-bank halves. Set empty to disable.")
+    p.add_argument("--own_bank_code", type=str, default=None,
+                   help="this bank's code in --bank_field. Without it only n_banks is derived; "
+                        "with it every aggregate also gets own_/ext_ variants plus ext_share_*, "
+                        "which is the part of the payload NOT redundant with internal features.")
     p.add_argument("--no_json_explode", action="store_true",
                    help="skip exploding json_skipped list columns (scoreCodes, bounced cheques, etc) "
                         "into item/aggregate pseudo-endpoints — just report them as json_skipped")
