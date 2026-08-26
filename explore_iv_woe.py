@@ -35,7 +35,7 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent))
 import project_config as config
-from src.data.temporal_split import filter_mature_snapshots
+from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +77,10 @@ def load_cache(data_dir: Path):
     with open(manifest_path) as f:
         manifest = json.load(f)
     feat_cols = manifest["feature_cols"]
+    # The manifest carries each snapshot's LABEL_HORIZON_DATE, which is how
+    # filter_matured_instances below tells a real label from a systematically
+    # optimistic one. Without it that falls back to the calendar rule.
+    register_label_horizons(manifest.get("label_horizons", {}))
 
     log.info(
         f"Loaded {len(labels):,} portfolio instances, "

@@ -22,8 +22,14 @@ BASE_DIR = Path(__file__).resolve().parent
 # and run.py/explore_*.py (training/evaluation-only).
 SCORING_FILES = [
     "project_config.py",
+    # The column contract: project_config derives META_COLS/BINARY_FEATURES
+    # from it and DataLoader projects frames to it by name, so scoring cannot
+    # start without it.
+    "contract/columns.json",
     "src/__init__.py",
     "src/data/__init__.py",
+    "src/data/column_contract.py",
+    "src/data/feed_checks.py",
     "src/data/data_loader.py",
     "src/data/temporal_split.py",
     "src/data/preprocessing.py",
@@ -136,11 +142,14 @@ params = ScoringParams(
 queue = run_scoring(df, params)
 ```
 
-`df` needs one row per loan with the same columns as the source ETL table
-(`NATIONAL_CODE`, `SNAPSHOT_DATE`, `DPD_DAYS`, `LOAN_CATEGORY`, ... — see
-this project's `column_changes.md`). Multiple loans per customer and
-multiple snapshots are handled automatically (grouped, deduped to the
-newest snapshot per customer).
+`df` needs one row per loan with the columns named in `contract/columns.json`
+(shipped in this package): the 64 features plus `NATIONAL_CODE`,
+`SNAPSHOT_DATE` and `LOAN_ID`. Column ORDER does not matter — frames are
+projected by name to the feature list the bundled model was fitted on. A
+missing feature raises and names itself; a column the model does not know is
+dropped with a warning, which is what happens after the feed adds one.
+Multiple loans per customer and multiple snapshots are handled automatically
+(grouped, deduped to the newest snapshot per customer).
 
 ### ScoringParams fields
 

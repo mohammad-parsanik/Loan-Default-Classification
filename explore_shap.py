@@ -99,10 +99,13 @@ def load_from_bundle(bundle_path: Path, data_path: Path) -> tuple:
 
     df = pd.read_csv(data_path)
     dl = DataLoader()
-    instances, raw_cols = dl.process_raw_data(df, max_loans, grain)
-    if raw_cols != features:
-        log.warning("Data columns differ from the bundle's training features — "
-                    "proceeding, but check for a schema mismatch.")
+    # Project to the bundle's own feature list: SHAP values are per-column, so
+    # reading them off a frame in a different column order attributes each
+    # value to the wrong feature name. A missing feature raises here; an
+    # unknown one is dropped with a warning.
+    instances, raw_cols = dl.process_raw_data(df, max_loans, grain,
+                                              feature_order=features)
+    assert raw_cols == features
 
     X_scaled = scaler.transform([i["features"] for i in instances])
     agg_in = [{"features": x, "n_loans": i["n_loans"], "label": i["label"]}

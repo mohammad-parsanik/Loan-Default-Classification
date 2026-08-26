@@ -10,6 +10,13 @@ random?" (lift@K).
 
 These use only the observed label — no cost-matrix guesses, no unknowable
 "was the API call right" ground truth.
+
+Ties are resolved explicitly. Calibrated probabilities tie heavily (isotonic
+regression is a step function), and a stable argsort resolves ties by INPUT
+ORDER — so recall@K and lift@K would otherwise be functions of how the rows
+happened to arrive. `tie_break` makes that choice a stated one; omitted, it
+is the instance's position under the loader's canonical row order, which is
+itself a function of the data. See _order().
 """
 
 import numpy as np
@@ -19,10 +26,22 @@ import project_config as config
 SEVERE_CLASS = config.NUM_CLASSES - 1
 
 
+def _order(scores: np.ndarray, tie_break: np.ndarray = None) -> np.ndarray:
+    """
+    Indices sorting `scores` descending, ties broken by `tie_break` ascending
+    (position when omitted). np.lexsort applies the LAST key first, so the
+    score is passed last.
+    """
+    if tie_break is None:
+        tie_break = np.arange(len(scores))
+    return np.lexsort((tie_break, -scores))
+
+
 def ranking_metrics(
     y_true: np.ndarray,
     scores: np.ndarray,
     strata: np.ndarray = None,
+    tie_break: np.ndarray = None,
 ) -> dict:
     """
     Evaluate a severity ranking on the modelled (non-carved) population.
@@ -34,6 +53,8 @@ def ranking_metrics(
                  current_cat >= CARVE_CURRENT_CAT_GE are excluded (they are
                  rule-flagged, never ranked) and per-stratum breakdowns of
                  the reference-window recalls are added.
+        tie_break : (N,) sortable key (e.g. LOAN_ID) deciding the order of
+                 rows on identical scores. Defaults to input position.
 
     Returns dict:
         n_ranked, n_severe, base_rate, pr_auc,
@@ -43,10 +64,13 @@ def ranking_metrics(
     y_true = np.asarray(y_true)
     scores = np.asarray(scores)
 
+    tie_break = np.arange(len(scores)) if tie_break is None else np.asarray(tie_break)
+
     if strata is not None:
         strata = np.asarray(strata)
         keep = strata < config.CARVE_CURRENT_CAT_GE
         y_true, scores, strata = y_true[keep], scores[keep], strata[keep]
+        tie_break = tie_break[keep]
 
     y_bin = (y_true == SEVERE_CLASS).astype(np.int32)
     n = len(y_bin)
@@ -59,7 +83,7 @@ def ranking_metrics(
     if n == 0 or n_severe == 0:
         return out
 
-    order = np.argsort(-scores, kind="stable")
+    order = _order(scores, tie_break)
     hits_cum = np.cumsum(y_bin[order])          # severe captured in top-i
 
     out["pr_auc"] = _average_precision(y_bin, scores)
@@ -79,21 +103,23 @@ def ranking_metrics(
         by = {}
         for s in np.unique(strata):
             mask = strata == s
-            sub = ranking_metrics(y_true[mask], scores[mask], strata=None)
+            sub = ranking_metrics(y_true[mask], scores[mask], strata=None,
+                                  tie_break=tie_break[mask])
             by[f"current_cat_{int(s)}"] = sub
         out["by_current_cat"] = by
 
     return out
 
 
-def capture_curve(y_true: np.ndarray, scores: np.ndarray, n_points: int = 200) -> dict:
+def capture_curve(y_true: np.ndarray, scores: np.ndarray, n_points: int = 200,
+                  tie_break: np.ndarray = None) -> dict:
     """
     Cumulative-gains curve data for plotting / operating-point selection.
     Returns {"frac_called", "recall", "hours"} arrays (JSON-safe lists);
     hours = customers called / API_RATE_PER_HOUR.
     """
     y_bin = (np.asarray(y_true) == SEVERE_CLASS).astype(np.int32)
-    order = np.argsort(-np.asarray(scores), kind="stable")
+    order = _order(np.asarray(scores), tie_break)
     hits_cum = np.cumsum(y_bin[order])
     n, n_severe = len(y_bin), max(int(y_bin.sum()), 1)
 
@@ -136,4 +162,13 @@ if __name__ == "__main__":
 
     cc = capture_curve(y, s)
     assert cc["recall"][-1] == 1.0
+
+    # Ties are broken by the stated key, not by arrival order: two customers
+    # on the same score, one severe, and the tie-break decides which is called
+    # first — so recall@1 flips with it and nothing else does.
+    y_t = np.array([0, 3])
+    s_t = np.array([0.5, 0.5])
+    _c.RANKING_REF_WINDOWS = {"one": 1 / _c.API_RATE_PER_HOUR}   # K=1
+    assert ranking_metrics(y_t, s_t, tie_break=np.array([0, 1]))["at_one"]["recall"] == 0.0
+    assert ranking_metrics(y_t, s_t, tie_break=np.array([1, 0]))["at_one"]["recall"] == 1.0
     print("ranking.py self-check OK")

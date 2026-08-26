@@ -262,8 +262,12 @@ def test_load_pred_portfolios_drops_degenerate_label_columns(monkeypatch):
     # than being absent — must not leak in as a label.
     monkeypatch.setattr(config, "PREDICTION_GRAIN", "portfolio")   # 3 loans -> 1 instance
     fake = _FakeConnector(pred_df=_make_df(with_target=True))
+    # feature_order: this fixture is a 3-feature stand-in, not the real 64-column
+    # feed, so name the columns explicitly rather than letting the loader demand
+    # the full contract.
     instances, feature_cols = DataLoader(mssql_connector=fake).load_pred_portfolios(
-        20250101, max_loans=2, use_cache=False
+        20250101, max_loans=2, use_cache=False,
+        feature_order=["DPD_DAYS", "LOAN_CATEGORY", "OTHER_FEAT"],
     )
     assert len(instances) == 1
     assert instances[0]["label"] == -1

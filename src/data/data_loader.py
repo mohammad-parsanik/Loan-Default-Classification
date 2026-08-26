@@ -21,7 +21,10 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.data.temporal_split import filter_mature_snapshots
+from src.data.column_contract import CONTRACT_VERSION, FEATURE_ORDER, feature_ordinal
+from src.data.feed_checks import assert_feed_invariants, label_horizons
+from src.data import temporal_split
+from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
 
 try:
     from src.db.mssql_connection import MSSQLConnector
@@ -33,10 +36,18 @@ logger = logging.getLogger(__name__)
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
-def _cache_key(extra: str = "", grain: Optional[str] = None) -> str:
+def _cache_key(extra: str = "", grain: Optional[str] = None,
+               feature_order: Optional[list] = None) -> str:
     """
     Returns a short hex string that uniquely identifies the data schema.
-    Changing DATA_VERSION, table name, META_COLS, or the DB name busts the cache.
+    Changing DATA_VERSION, the table, META_COLS, the DB name, the grain, OR
+    the column contract (its version, or the feature list IN ORDER) busts the
+    cache.
+
+    The feature list is hashed as an ordered list, not a set, on purpose: a
+    cache built when features meant one set of positions must not be reused
+    by a model fitted against another. That was the gap — the key described
+    the schema's shape but not its column identity, so a reorder survived it.
     """
     payload = json.dumps(
         {
@@ -44,6 +55,8 @@ def _cache_key(extra: str = "", grain: Optional[str] = None) -> str:
             "train_table": config.TRAIN_TABLE,
             "meta_cols": sorted(config.META_COLS),
             "database": config.MSSQL_DATABASE,
+            "contract_version": CONTRACT_VERSION,
+            "feature_order": list(feature_order or FEATURE_ORDER),
             # An instance means something different per grain, so the two
             # must never share a cache file. Taken as an argument, not read
             # from config, so an explicit-grain caller keys its own cache.
@@ -98,11 +111,65 @@ class DataLoader:
         """Worst-case capped label for a group of loan labels."""
         return int(min(int(y_arr.max()), config.NUM_CLASSES - 1))
 
-    # ── Feature column discovery ──────────────────────────────────────────────
+    # ── Feature projection (by NAME, never by position) ───────────────────────
 
     @staticmethod
     def get_feature_columns(df: pd.DataFrame) -> list[str]:
-        return [c for c in df.columns if c not in config.META_COLS]
+        """
+        The frame's feature columns in CONTRACT order — used when no explicit
+        order is supplied. Columns the contract does not know (a synthetic
+        fixture's, or an appended column 72) sort after the known ones, by
+        name, so the result is a function of the column SET and never of the
+        order `SELECT *` happened to return them in.
+        """
+        present = [c for c in df.columns if c not in config.META_COLS]
+        return sorted(present, key=lambda c: (feature_ordinal(c), c))
+
+    @staticmethod
+    def project_features(df: pd.DataFrame, order: Optional[list[str]] = None) -> list[str]:
+        """
+        Decide the feature columns to read from `df`, by name.
+
+        `order` is the authoritative list — the contract's FEATURE_ORDER when
+        training, or a trained model's own saved feature list when scoring
+        (which may be an older, shorter contract). Mismatch policy:
+
+          missing feature  -> raise, naming it. The model cannot be fed a
+                              column it was fitted on but did not receive;
+                              at identical width every downstream statistic
+                              would silently apply to the wrong column.
+          unexpected column -> warn, naming it, and drop. This is the NORMAL
+                              path once the feed appends a column 72: an
+                              already-trained model must keep scoring on the
+                              features it knows.
+
+        `order=None` falls back to get_feature_columns (contract order over
+        whatever the frame happens to hold).
+        """
+        if not order:
+            # Empty as well as None: a legacy artifact that records no feature
+            # list falls back to contract order rather than to zero features.
+            return DataLoader.get_feature_columns(df)
+
+        order = list(order)
+        present = set(df.columns)
+        missing = [c for c in order if c not in present]
+        if missing:
+            raise KeyError(
+                f"Frame is missing {len(missing)} required feature column(s): "
+                f"{missing}. Scoring or training against a partial feature set "
+                "would misalign every column-position-keyed transform."
+            )
+
+        known = set(order) | set(config.META_COLS)
+        extra = [c for c in df.columns if c not in known]
+        if extra:
+            logger.warning(
+                f"Dropping {len(extra)} column(s) the model does not know: "
+                f"{extra}. Expected when the feed appends a new feature — the "
+                "model keeps scoring on the features it was fitted on."
+            )
+        return order
 
     # ── Vectorised portfolio grouping ─────────────────────────────────────────
 
@@ -111,6 +178,7 @@ class DataLoader:
         df: pd.DataFrame,
         max_loans: Optional[int] = None,
         grain: Optional[str] = None,
+        feature_order: Optional[list[str]] = None,
     ) -> tuple[list[dict], list[str]]:
         """
         Convert flat DataFrame → list of instance dicts.
@@ -127,9 +195,19 @@ class DataLoader:
           2. np.unique on composite key → group boundaries in O(N)
           3. Slice pre-extracted numpy arrays per group (no pandas overhead in loop)
 
+        `feature_order` names the features to read, in order — the contract's
+        FEATURE_ORDER when training, a model's own saved list when scoring.
+        See project_features. Omit it and the frame's own feature columns are
+        used, sorted into contract order.
+
         Both grains carry `portfolio_n_loans` (the customer's true loan count
         at that snapshot) so downstream output keeps portfolio context even
         when scoring one loan at a time. It is NOT a model feature.
+
+        The result is a function of the frame's CONTENT alone: columns are
+        projected by name and rows are put in a canonical order below, so a
+        shuffled or reordered copy of the same data yields identical
+        instances.
         """
         grain = grain or config.PREDICTION_GRAIN
         if grain not in ("loan", "portfolio"):
@@ -148,16 +226,32 @@ class DataLoader:
             )
             df = df.loc[~header_leak].reset_index(drop=True)
 
-        feature_cols = self.get_feature_columns(df)
+        feature_cols = self.project_features(df, feature_order)
 
-        # Sort: primary by group keys, secondary by *current* DPD descending so
+        # Canonical row order, established once and inherited by everything
+        # downstream. Primary by group keys, then *current* DPD descending so
         # truncation keeps the currently-worst loans. Must NOT use a label
         # column (WORST_FUTURE_DPD): that leaks the future into loan selection
         # and does not exist in the prediction table.
-        df = df.sort_values(
-            [config.CUSTOMER_COL, config.SNAPSHOT_COL, "DPD_DAYS"],
-            ascending=[True, True, False],
-        ).reset_index(drop=True)
+        #
+        # LOAN_ID is the final tie-break and it is what makes the key UNIQUE:
+        # the feed guarantees one row per (LOAN_ID, SNAPSHOT_DATE), so no tie
+        # can survive it. Without it the sort is stable, which only means ties
+        # keep their ARRIVAL order — and DPD_DAYS is 0 for most loans, so the
+        # ties are enormous. Truncation, XGBoost's index-based subsample /
+        # colsample draws, and every group scan below then depend on how the
+        # source laid the rows out rather than on the data.
+        sort_keys = [config.CUSTOMER_COL, config.SNAPSHOT_COL, "DPD_DAYS"]
+        ascending = [True, True, False]
+        if config.ID_COL in df.columns:
+            sort_keys.append(config.ID_COL)
+            ascending.append(True)
+        else:
+            logger.warning(
+                f"{config.ID_COL} absent — row order can only be made canonical "
+                "up to ties on (customer, snapshot, DPD_DAYS)."
+            )
+        df = df.sort_values(sort_keys, ascending=ascending).reset_index(drop=True)
 
         # Pre-extract numpy arrays (avoids per-group pandas overhead).
         # Coerce rather than astype: source exports occasionally contain
@@ -311,7 +405,13 @@ class DataLoader:
         _write_manifest(
             cache_path,
             key,
-            {"feature_cols": feature_cols, "max_loans": max_loans, "n_instances": len(instances)},
+            {"feature_cols": feature_cols, "max_loans": max_loans,
+             "n_instances": len(instances),
+             # snapshot -> LABEL_HORIZON_DATE, so a cache-only run (no DB on
+             # this machine) can still tell a matured snapshot from an
+             # immature one without re-deriving it from the wall clock.
+             "label_horizons": {str(k): int(v)
+                                for k, v in temporal_split.LABEL_HORIZONS.items()}},
         )
         logger.info(f"Cache saved ({cache_path.stat().st_size / 1e6:.1f} MB).")
 
@@ -332,6 +432,7 @@ class DataLoader:
         with open(_manifest_path(cache_path)) as f:
             manifest = json.load(f)
         feature_cols = manifest["feature_cols"]
+        register_label_horizons(manifest.get("label_horizons", {}))
 
         instances = [
             {
@@ -357,6 +458,7 @@ class DataLoader:
         max_loans: Optional[int] = None,
         use_cache: bool = True,
         grain: Optional[str] = None,
+        feature_order: Optional[list[str]] = None,
     ) -> tuple[list[dict], list[str]]:
         """
         Load training data from MSSQL → instances at `grain`
@@ -365,10 +467,11 @@ class DataLoader:
         Cache is invalidated when:
           - DATA_VERSION changes in project_config.py
           - Table name, META_COLS, or DB name changes
+          - the column contract changes (version, or the feature list/order)
           - max_loans or the grain changes
         """
         extra = str(max_loans or "auto")
-        key   = _cache_key(extra, grain)
+        key   = _cache_key(extra, grain, feature_order)
         cache_path = config.DATA_DIR / "train_portfolios_cache.npz"
 
         if use_cache and _cache_is_valid(cache_path, key):
@@ -379,8 +482,12 @@ class DataLoader:
 
         conn, close_conn = self._get_conn()
         try:
+            self._warn_on_failed_etl_runs(conn)
             df = conn.load_training_data(snapshot_dates=snapshot_dates)
-            instances, feature_cols = self.process_raw_data(df, max_loans, grain)
+            df = self._ingest_checks(df)
+            instances, feature_cols = self.process_raw_data(
+                df, max_loans, grain, feature_order=feature_order or FEATURE_ORDER
+            )
             if use_cache:
                 ml = max_loans or (
                     int(np.percentile([i["n_loans"] for i in instances], 99))
@@ -397,10 +504,17 @@ class DataLoader:
         max_loans: Optional[int] = None,
         use_cache: bool = True,
         grain: Optional[str] = None,
+        feature_order: Optional[list[str]] = None,
     ) -> tuple[list[dict], list[str]]:
-        """Load prediction data for a single snapshot at `grain`."""
+        """
+        Load prediction data for a single snapshot at `grain`.
+
+        `feature_order` is the trained model's own feature list — pass it so a
+        model older than the current contract keeps being fed exactly the
+        columns it was fitted on. Defaults to the contract's order.
+        """
         extra = f"pred_{snapshot_date}_{max_loans or 'auto'}"
-        key   = _cache_key(extra, grain)
+        key   = _cache_key(extra, grain, feature_order)
         cache_path = config.DATA_DIR / f"pred_portfolios_cache_{snapshot_date}.npz"
 
         if use_cache and _cache_is_valid(cache_path, key):
@@ -414,8 +528,11 @@ class DataLoader:
             # category observed so far", not the true future outcome) —
             # never real labels. Drop them so process_raw_data's normal
             # "column absent -> label = -1" path applies here too.
+            df = self._ingest_checks(df)
             df = df.drop(columns=[config.TARGET_COL, "WORST_FUTURE_DPD"], errors="ignore")
-            instances, feature_cols = self.process_raw_data(df, max_loans, grain)
+            instances, feature_cols = self.process_raw_data(
+                df, max_loans, grain, feature_order=feature_order or FEATURE_ORDER
+            )
             if use_cache:
                 self._save_cache(cache_path, instances, feature_cols, max_loans or 99, key)
             return instances, feature_cols
@@ -435,7 +552,11 @@ class DataLoader:
         """
         conn, close_conn = self._get_conn()
         try:
+            self._warn_on_failed_etl_runs(conn)
             available = conn.get_available_snapshots()
+            # Maturity comes from the feed's own horizon column, not the
+            # calendar — read it before deciding what is still immature.
+            self._register_horizons_from_db(conn)
         finally:
             if close_conn:
                 conn.close()
@@ -462,6 +583,63 @@ class DataLoader:
         return [available[-1]]
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ingest_checks(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Everything that must happen between "rows arrived" and "rows are used":
+        record each snapshot's label horizon, then check the feed's row-level
+        invariants. Violations are logged, not raised — a handful of bad rows
+        in a 577k-row snapshot should not abort a multi-hour run, but they
+        must not pass unremarked either.
+        """
+        register_label_horizons(label_horizons(df))
+        assert_feed_invariants(df)
+        return df
+
+    @staticmethod
+    def _register_horizons_from_db(conn) -> None:
+        """Populate the snapshot -> LABEL_HORIZON_DATE map from the table."""
+        try:
+            register_label_horizons(conn.get_label_horizons())
+        except Exception as e:
+            logger.info(
+                f"{config.HORIZON_COL} not read ({e}) — maturity falls back to "
+                "the calendar rule."
+            )
+
+    @staticmethod
+    def _warn_on_failed_etl_runs(conn) -> None:
+        """
+        A snapshot missing from the table is otherwise indistinguishable from
+        one whose ETL run never happened or stopped halfway. The upstream job
+        ledger is the only thing that can tell them apart, so read it before
+        deciding that what is in the table is all there is. Advisory only:
+        the ledger may not be readable from this account, and a run that reads
+        the table successfully should not be blocked on bookkeeping.
+        """
+        try:
+            runs = conn.get_etl_runs()
+        except Exception as e:
+            logger.info(f"ETL job ledger not read ({e}) — snapshot completeness unverified.")
+            return
+        if runs is None or not len(runs):
+            return
+
+        incomplete = runs[runs["status"].astype(str).str.upper() != "SUCCESS"]
+        if len(incomplete):
+            logger.warning(
+                f"{len(incomplete)} upstream ETL run(s) did not report SUCCESS — "
+                "the snapshots they would have produced are absent or partial:"
+            )
+            for row in incomplete.head(12).itertuples(index=False):
+                logger.warning(
+                    f"  {getattr(row, 'snapshot_date', '?')}: "
+                    f"status={getattr(row, 'status', '?')} "
+                    f"last_step={getattr(row, 'last_step', '?')}"
+                )
+        else:
+            logger.info(f"ETL job ledger: {len(runs)} run(s), all SUCCESS.")
 
     def _get_conn(self):
         if self.conn is not None:

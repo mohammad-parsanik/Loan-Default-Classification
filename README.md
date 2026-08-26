@@ -30,10 +30,12 @@ they're a known risk, not a ranking question.
 
 ## The problem, precisely
 
-Each month, an upstream ETL table gives one row per loan: ~64 numeric
-features (current days-past-due, trend, history, cross-contract signals —
-see [column_changes.md](column_changes.md)) plus a label,
-`WORST_FUTURE_CAT`, capped to 4 classes:
+Each month, an upstream ETL table (`D_ANALYTICS.EDP_LOAN_FEATURES`) gives one
+row per loan: 64 numeric features (current days-past-due, trend, history,
+cross-contract signals) plus a label, `WORST_FUTURE_CAT`, capped to 4 classes.
+The column set, its order, and each column's handling flags are pinned in
+[`contract/columns.json`](contract/columns.json) — see
+[contract/README.md](contract/README.md).
 
 | Class | Meaning |
 |---|---|
@@ -57,20 +59,24 @@ runs out. See [DEPLOYMENT.md](DEPLOYMENT.md) for the exact output format.
 ## Architecture at a glance
 
 ```
-MSSQL (D_ANALYTICS.DPD_SAMPLE1, aliased EDP_Feature_Train)
-  │  one row per loan per monthly snapshot
+MSSQL (D_ANALYTICS.EDP_LOAN_FEATURES)
+  │  one row per loan per monthly snapshot; 71 columns, pinned by
+  │  contract/columns.json
   ▼
-Portfolio grouping (src/data/data_loader.py)
+Projection + grouping (src/data/data_loader.py)
+  │  project columns BY NAME to the contract's 64 features (or, when scoring,
+  │  to the trained model's own list); sort rows into one canonical order
   │  group by (customer, snapshot); truncate to MAX_LOANS≈2 loans/customer
   │  (kept by CURRENT delinquency, never by the future label — that would leak)
   ▼
 Temporal split (src/data/temporal_split.py)
-  │  test = newest snapshot with a matured (6mo-old) label
+  │  test = newest snapshot whose LABEL_HORIZON_DATE has passed
   │  train = snapshots ≥6mo before test; val = customer-disjoint 20% of train
   │  (val is in-time, so early stopping/tuning never touch the test window)
   ▼
 Preprocessing (src/data/preprocessing.py)
   │  domain-aware impute → clip outliers → RobustScaler (fit on train only)
+  │  sentinel-bearing columns are exempt from clip and scale (see below)
   ▼
 Feature build (src/baselines/aggregated_xgboost.py::build_features)
   │  loan grain: the ~64 raw per-loan features, used as-is
@@ -94,7 +100,7 @@ Ranked queue (src/inference/predictor.py)
 
 ### The model, precisely
 
-**Features:** at loan grain, the **~64 raw per-loan features** unchanged —
+**Features:** at loan grain, the **64 raw per-loan features** unchanged —
 one row per loan, nothing to aggregate. (Aggregating here would give
 `min == max == mean == the feature`, `std == 0`, `count == 1`: 4x the
 columns for zero extra information.) At portfolio grain, those 64 become 4
@@ -139,6 +145,16 @@ mass is zeroed and the remaining probabilities renormalized — this
 sharpens the calibrated distribution for free, using a constraint that
 costs nothing to enforce.
 
+**Sentinel columns.** Four features encode "never reached this delinquency
+band" as `99999`, at the far end of the same axis on which `0` means "in that
+band right now". Running them through a percentile clipper rewrites the best
+state as one of the worst, and it does so *invisibly* in the columns where the
+sentinel is the majority value (there `p99` is the sentinel, so clipping is a
+no-op) while being destructive in the ones where it is a minority. They carry
+`clip: false, scale: false` in the contract and both transformers skip them;
+XGBoost splits on raw values, so nothing is lost. Never impute the sentinel to
+a median.
+
 **Ranking score:** `RISK_SCORE` = the calibrated, masked `P(class == 3)`
 for that customer. That's the entire sort key — no cost matrix, no
 learned ranking objective, just the class-3 probability from whichever
@@ -172,6 +188,19 @@ Full rationale and the evidence behind each is in
 - **Walk-forward validation exists but is off by default** — the team
   deliberately deferred routine time-stability checks; flip
   `WALK_FORWARD_ENABLED` when you want one.
+- **Nothing depends on the order rows or columns arrive in.** Feature
+  identity is by name against `contract/columns.json`; rows are put into one
+  canonical order (`customer, snapshot, DPD desc, LOAN_ID`) before anything
+  reads them; the queue and the ranking metrics break ties explicitly. This
+  was not cosmetic — XGBoost's `subsample`/`colsample_bytree` draw by index,
+  calibrated probabilities tie in large blocks, and every preprocessing
+  statistic is keyed by column position, so all three quietly followed
+  whatever order the database returned. See `tests/test_order_independence.py`.
+- **Validation is customer-disjoint, as a correctness requirement.** Ten of
+  the 64 features describe the borrower rather than the loan and are stamped
+  identically onto every row of every loan they hold, so a random split would
+  put the same ten values on both sides of the fold boundary.
+  `VAL_SPLIT_MODE = "customer"` is not a preference.
 
 ---
 
@@ -192,16 +221,20 @@ needs none of them (see [DEPLOYMENT.md](DEPLOYMENT.md) §4).
 ## Project structure
 
 ```
-project_config.py       All hyperparameters, DB creds, feature lists, toggle flags
+project_config.py       All hyperparameters, DB creds, toggle flags
+contract/columns.json   The upstream feed's column contract (see contract/README.md)
 run.py                  CLI: explore / train [--final] [--resume] / predict
 build_scoring_package.py  Package a trained model for handoff to another system
 
 src/
   db/                   MSSQL connector (pyodbc)
   data/
-    data_loader.py        DB/cache loading, raw→portfolio grouping (leak-safe truncation)
-    temporal_split.py      Static split, customer-disjoint validation, walk-forward folds
-    preprocessing.py       Impute → clip → scale pipeline
+    column_contract.py    Loads/validates contract/columns.json — feature identity
+    feed_checks.py         Row-level invariant checks on a freshly-loaded frame
+    data_loader.py        DB/cache loading, name-based projection, canonical row
+                           order, raw→portfolio grouping (leak-safe truncation)
+    temporal_split.py      Static split, label maturity, customer-disjoint validation
+    preprocessing.py       Impute → clip → scale pipeline (+ feature-list checks)
     dataset.py, data_explorer.py   Legacy-DeepSets dataloaders / one-shot profiling
   baselines/
     aggregated_xgboost.py  THE model: feature aggregation + all XGBoost arms

@@ -215,6 +215,16 @@ def train_single_fold(
     # so this slice is the apples-to-apples bridge to the portfolio-grain
     # benchmark (results_3..results_6). See full_evaluation's docstring.
     test_sizes   = np.array([i.get("portfolio_n_loans", i["n_loans"]) for i in test_inst])
+    # Explicit tie-break for every ranking block. Calibrated probabilities tie
+    # in large blocks, and a stable sort resolves ties by input order — so
+    # recall@K would otherwise move with how the rows arrived. LOAN_ID is
+    # unique per (loan, snapshot); at portfolio grain it is None, and the
+    # canonical instance position is used instead.
+    test_tie_break = np.array(
+        [i.get("loan_id") for i in test_inst]
+        if all(i.get("loan_id") is not None for i in test_inst)
+        else range(len(test_inst))
+    )
 
     # ── Stage: Preprocessing ──────────────────────────────────────────────────
     # Not checkpointed as a full round-trip — the transform itself (~3-4 min
@@ -316,7 +326,7 @@ def train_single_fold(
                         arm_metrics = full_evaluation(
                             y_test, test_probs,
                             strata=test_strata, calibrator=arm_cal,
-                            portfolio_sizes=test_sizes,
+                            portfolio_sizes=test_sizes, tie_break=test_tie_break,
                         )
                         sev = arm_metrics.pop("_probs_cal")[:, -1]
                         arm_metrics.pop("_cost_preds", None)
@@ -325,11 +335,13 @@ def train_single_fold(
                                      if arm_cal is not None else test_probs)
                         sev = probs_cal[:, -1]
                         arm_metrics = {"ranking": ranking_metrics(
-                            y_test, sev, strata=test_strata)}
+                            y_test, sev, strata=test_strata,
+                            tie_break=test_tie_break)}
 
                     # Capture-curve data (carved population) for the plot
                     keep = test_strata < config.CARVE_CURRENT_CAT_GE
-                    arm_metrics["capture_curve"] = capture_curve(y_test[keep], sev[keep])
+                    arm_metrics["capture_curve"] = capture_curve(
+                        y_test[keep], sev[keep], tie_break=test_tie_break[keep])
 
             ckpt.save(stage, (arm, arm_cal, arm_metrics, test_probs))
             ckpt.mark_done(stage, {"ranking_ap": arm_metrics.get("ranking", {}).get("pr_auc")})
@@ -408,7 +420,7 @@ def train_single_fold(
                 probs_test = arm_test_probs[deploy_name]
                 fe = full_evaluation(
                     y_test, probs_test, strata=test_strata, calibrator=arm_cal,
-                    portfolio_sizes=test_sizes,
+                    portfolio_sizes=test_sizes, tie_break=test_tie_break,
                 )
                 y_pred     = fe.pop("_cost_preds")
                 y_prob_cal = fe.pop("_probs_cal")

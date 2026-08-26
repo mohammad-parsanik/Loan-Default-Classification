@@ -182,10 +182,23 @@ def score_instances(
         pred_dedup_latest=pred_dedup_latest,
     )
 
-    # Queue rows first (by risk), flagged rows after; rank only the queue
+    # Queue rows first (by risk), flagged rows after; rank only the queue.
+    #
+    # NATIONAL_CODE (and LOAN_ID at loan grain) break ties on RISK_SCORE.
+    # Calibrated probabilities tie heavily — isotonic regression is a step
+    # function, so thousands of rows can share a value — and without an
+    # explicit tie-break the sort is merely STABLE, which means those ties
+    # keep their arrival order. Who gets called today would then be decided
+    # by how the source laid the rows out. Arbitrary-but-fixed is the honest
+    # thing to hand a call centre: the same input produces the same call list.
     results["_flagged"] = results["RULE_FLAG"] != ""
+    tie_keys = ["_flagged", "RISK_SCORE", "NATIONAL_CODE"]
+    ascending = [True, False, True]
+    if results["LOAN_ID"].notna().any():     # None at portfolio grain
+        tie_keys.append("LOAN_ID")
+        ascending.append(True)
     results = (
-        results.sort_values(["_flagged", "RISK_SCORE"], ascending=[True, False])
+        results.sort_values(tie_keys, ascending=ascending)
         .drop(columns="_flagged")
         .reset_index(drop=True)
     )
@@ -242,11 +255,15 @@ def score_dataframe(
     from src.data.data_loader import DataLoader   # local: keeps this function's
                                                     # dependency footprint explicit
     loader = ModelLoader(Path(artifact_dir))
-    scorer, calibrator, _ = loader.load_pipeline()
+    # The third value is the feature list the model was FITTED on. Every frame
+    # below is projected to it by name, so a caller's column order — and an
+    # appended column the model has never seen — cannot change the score.
+    scorer, calibrator, features = loader.load_pipeline()
     dl = DataLoader()
 
     if calibration_df is not None:
-        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.truncate_loans, scorer.grain)
+        cal_inst, _ = dl.process_raw_data(calibration_df, scorer.truncate_loans,
+                                          scorer.grain, feature_order=features)
         cal_inst = [i for i in cal_inst if i["label"] >= 0]
         if cal_inst:
             probs  = scorer.raw_probs(cal_inst)
@@ -257,7 +274,8 @@ def score_dataframe(
             ).fit(probs, y, strata)
             logger.info(f"Calibrator refreshed on {len(cal_inst):,} supplied instances.")
 
-    instances, _ = dl.process_raw_data(df, max_loans or scorer.truncate_loans, scorer.grain)
+    instances, _ = dl.process_raw_data(df, max_loans or scorer.truncate_loans,
+                                       scorer.grain, feature_order=features)
     called_log = Predictor._load_called_log(called_log_path)
     return score_instances(instances, scorer, calibrator, called_log)
 
@@ -267,7 +285,9 @@ class Predictor:
 
     def __init__(self, artifact_dir):
         self.loader = ModelLoader(Path(artifact_dir))
-        self.scorer, self.calibrator, _ = self.loader.load_pipeline()
+        # `features` is the model's own fitted feature list — the projection
+        # order for every frame this Predictor reads. See ModelLoader.
+        self.scorer, self.calibrator, self.features = self.loader.load_pipeline()
         self.truncate_loans = self.scorer.truncate_loans
         self.data_loader = DataLoader()
 
@@ -283,7 +303,7 @@ class Predictor:
         """Refit the calibrator on the newest matured-label snapshot."""
         try:
             instances, _ = self.data_loader.load_train_portfolios(
-                use_cache=True, grain=self.scorer.grain
+                use_cache=True, grain=self.scorer.grain, feature_order=self.features
             )
         except Exception as e:
             logger.warning(f"Recalibration skipped (train data unavailable): {e}")
@@ -361,7 +381,8 @@ class Predictor:
         instances: list[dict] = []
         for snap in resolved:
             snap_instances, _ = self.data_loader.load_pred_portfolios(
-                snap, self.truncate_loans, grain=self.scorer.grain
+                snap, self.truncate_loans, grain=self.scorer.grain,
+                feature_order=self.features,
             )
             instances.extend(snap_instances)
 

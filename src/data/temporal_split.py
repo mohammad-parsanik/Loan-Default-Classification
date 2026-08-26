@@ -2,8 +2,10 @@
 Temporal split for the Loan Default Classification pipeline.
 
 Rules:
-  1. Drop any snapshot whose date is within the last LABEL_HORIZON_MONTHS
-     calendar months — those labels have not yet materialised.
+  1. Drop any snapshot whose label has not yet matured. Maturity is read from
+     the feed's own LABEL_HORIZON_DATE where available (see
+     filter_mature_snapshots), falling back to a calendar computation over
+     LABEL_HORIZON_MONTHS.
   2. Among the remaining (usable) snapshots, ensure that:
        - test  snapshot is at least LABEL_HORIZON_MONTHS months after val
        - val   snapshot is at least LABEL_HORIZON_MONTHS months after the
@@ -52,28 +54,69 @@ def _months_apart(earlier: date, later: date) -> float:
     return (later - earlier).days / 30.4375   # average days per month
 
 
-def filter_mature_snapshots(raw_snaps) -> list:
+# ── Label maturity ────────────────────────────────────────────────────────────
+
+#: snapshot (int YYYYMMDD) -> LABEL_HORIZON_DATE (int YYYYMMDD), populated by
+#: DataLoader from the feed's own column and carried in the NPZ cache
+#: manifest so cache-only workflows see it too. Module-level because the
+#: readers of maturity (the split, the diagnostics, resolve_pred_snapshots)
+#: are handed bare snapshot values, not the frame they came from.
+LABEL_HORIZONS: Dict[int, int] = {}
+
+
+def register_label_horizons(mapping: Dict) -> None:
+    """Record snapshot -> LABEL_HORIZON_DATE. Later calls merge, not replace."""
+    for snap, horizon in mapping.items():
+        if horizon is None:
+            continue
+        LABEL_HORIZONS[int(snap)] = int(horizon)
+
+
+def filter_mature_snapshots(raw_snaps, horizons: Optional[Dict] = None) -> list:
     """
     Given raw YYYYMMDD snapshot values, return only those whose
-    WORST_FUTURE_* label has had time to materialise (>= LABEL_HORIZON_MONTHS
-    old). Any script that reads WORST_FUTURE_CAT/DPD — training split,
-    IV/UMAP diagnostics, data profiling — must filter through this before
-    trusting that column, or immature rows (whose label is really just
-    "worst category observed so far") silently masquerade as real labels.
+    WORST_FUTURE_* label has had time to materialise. Any script that reads
+    WORST_FUTURE_CAT/DPD — training split, IV/UMAP diagnostics, data
+    profiling — must filter through this before trusting that column.
+    Immature rows carry a well-formed, non-null, systematically optimistic
+    label (the worst category observed SO FAR), with nothing in the value to
+    reveal it, so an unfiltered read does not fail — it just silently trains
+    on optimistic labels.
+
+    Maturity is `LABEL_HORIZON_DATE <= today`, an integer comparison between
+    two Gregorian YYYYMMDD values. The horizon is carried by the feed; it is
+    derived upstream on a different calendar, so re-deriving it here in
+    Gregorian months (as this function used to) can disagree at month
+    boundaries. When no horizon is known for a snapshot the old calendar rule
+    still applies, so synthetic frames and older caches keep working.
     """
-    horizon = config.LABEL_HORIZON_MONTHS
-    today   = date.today()
+    horizons = LABEL_HORIZONS if horizons is None else horizons
+    horizon_months = config.LABEL_HORIZON_MONTHS
+    today     = date.today()
+    today_int = int(today.strftime("%Y%m%d"))
 
-    raw_snaps  = sorted(set(raw_snaps))
-    snap_dates = [_snap_to_date(s) for s in raw_snaps]
+    raw_snaps = sorted(set(raw_snaps))
+    mature, dropped, guessed = [], [], []
 
-    mature  = [r for r, d in zip(raw_snaps, snap_dates) if _months_apart(d, today) >= horizon]
-    dropped = [r for r, d in zip(raw_snaps, snap_dates) if _months_apart(d, today) < horizon]
+    for snap in raw_snaps:
+        known = horizons.get(int(snap))
+        if known is not None:
+            is_mature = int(known) <= today_int
+        else:
+            guessed.append(snap)
+            is_mature = _months_apart(_snap_to_date(snap), today) >= horizon_months
+        (mature if is_mature else dropped).append(snap)
 
+    if guessed:
+        logger.warning(
+            f"No LABEL_HORIZON_DATE for {len(guessed)} snapshot(s) {guessed} — "
+            f"falling back to the {horizon_months}-month calendar rule. Expected "
+            "only for synthetic frames or a pre-v1.4 cache."
+        )
     if dropped:
         logger.warning(
             f"Dropping {len(dropped)} snapshot(s) whose labels are not yet "
-            f"mature (< {horizon} months old): {dropped}"
+            f"mature (LABEL_HORIZON_DATE > {today_int}): {dropped}"
         )
     return mature
 

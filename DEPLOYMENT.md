@@ -121,18 +121,27 @@ python build_scoring_package.py --bundle artifacts/<ts>_final/fold_01/model_bund
                                 --output scoring_package/
 ```
 
-This copies the ~18 source files scoring actually needs (not `run.py`, not
+This copies the ~21 files scoring actually needs (not `run.py`, not
 `src/model/*` DeepSets code, not the evaluation/plotting modules) plus the
 bundle, a `requirements-scoring.txt` (`numpy`, `pandas`, `scikit-learn`,
 `xgboost`, `joblib` — nothing else), and a `README_SCORING.md` into one
 folder. Hand that folder to the other team.
 
+`contract/columns.json` is part of the package — scoring cannot start without
+it, since it is what feature identity is checked against.
+
 **The input `df` they build:** one row per **loan** (not per customer — a
-customer with 2 open loans contributes 2 rows), with the same columns as
-`TRAIN_TABLE` (`column_changes.md` has the full feature dictionary), minus
-`WORST_FUTURE_CAT`/`WORST_FUTURE_DPD` (this is prediction time — those
-don't exist yet). At minimum: `NATIONAL_CODE`, `SNAPSHOT_DATE`,
-`LOAN_CATEGORY`, `DPD_DAYS`, plus the rest of the ~64 feature columns. A
+customer with 2 open loans contributes 2 rows), carrying the 64 feature
+columns named in `contract/columns.json` plus `NATIONAL_CODE`,
+`SNAPSHOT_DATE` and `LOAN_ID`, minus `WORST_FUTURE_CAT`/`WORST_FUTURE_DPD`
+(this is prediction time — those don't exist yet).
+
+**Column order does not matter and never should be relied on.** Frames are
+projected by name to the feature list the bundled model was fitted on: a
+missing feature raises and names itself, and a column the model does not know
+is dropped with a warning — which is exactly what happens after the upstream
+feed appends a new feature, and is why an already-shipped model keeps
+scoring. A
 minimal illustrative example (real feature values, not just the ID
 columns, obviously required in practice):
 
@@ -253,7 +262,7 @@ python make_placeholder_bundle.py --self-check   # build small + score, ~5s
 It runs the actual training path (`process_raw_data` → preprocessing →
 `aggregate_features` → the `DEPLOY_ARM` arm → `StratifiedCalibrator`) on
 randomly generated data carrying the real column schema (the 64 feature
-columns of `column_changes.md`), and writes `placeholder/model_bundle.pkl`,
+columns of `contract/columns.json`), and writes `placeholder/model_bundle.pkl`,
 a `sample_input.csv` (500 label-free loan rows to smoke-test with) and
 `PLACEHOLDER.md`. With `--package` it also emits a complete scoring package
 with the placeholder inside — the same folder layout the real handoff has,

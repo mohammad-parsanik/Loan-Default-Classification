@@ -10,7 +10,8 @@ import seaborn as sns
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.data.temporal_split import filter_mature_snapshots
+from src.data.data_loader import DataLoader
+from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
 
 try:
     from src.db.mssql_connection import MSSQLConnector
@@ -51,6 +52,10 @@ def explore_data(sample_size=1000):
         # snapshot it degenerates to "worst category observed so far" and
         # is not representative of the real training target distribution.
         # Use the newest MATURED snapshot for that number instead.
+        try:
+            register_label_horizons(conn.get_label_horizons())
+        except Exception as e:                       # deprecated table, no grant
+            logger.info(f"{config.HORIZON_COL} not read ({e}).")
         mature_snaps = filter_mature_snapshots(snapshots)
         label_snap   = mature_snaps[-1] if mature_snaps else None
 
@@ -149,7 +154,7 @@ def explore_data(sample_size=1000):
     logger.info(f"Features with missing values: {missing_features}")
     
     # Identify feature columns
-    feature_cols = [c for c in df.columns if c not in config.META_COLS]
+    feature_cols = DataLoader.get_feature_columns(df)   # contract order
     logger.info(f"Identified {len(feature_cols)} feature columns")
     
     # Compile report
