@@ -11,9 +11,10 @@ subset you should double-check before a production `--final` run.
 | Setting | Default | Notes |
 |---|---|---|
 | `MSSQL_SERVER` / `MSSQL_DATABASE` / `MSSQL_USER` / `MSSQL_PASSWORD` | `localhost` / `EDP` / `sa` / `password` | Read from env vars (`MSSQL_SERVER` etc.) with these as fallbacks. Set real values via environment, not by editing the file. |
-| `TRAIN_TABLE` | `"EDP_Feature_Train"` | The **only** live table (aliases `D_ANALYTICS.DPD_SAMPLE1`). Holds both matured snapshots (training) and the newest immature ones (prediction) — there is no separate prediction table. |
-| `ID_COL`, `CONTRACT_COL`, `CUSTOMER_COL`, `SNAPSHOT_COL`, `TARGET_COL` | `LOAN_ID`, `CONTRACT_NUMBER`, `NATIONAL_CODE`, `SNAPSHOT_DATE`, `WORST_FUTURE_CAT` | Column name constants — change only if the upstream ETL renames columns. |
-| `META_COLS` | derived from the above + `WORST_FUTURE_DPD` | Columns excluded from the feature set. Everything else in the table is a feature. |
+| `TRAIN_TABLE` | `CONTRACT_TABLE` = `"D_ANALYTICS.EDP_LOAN_FEATURES"` | Comes from `contract/columns.json`, not a literal. The **only** live table: holds both matured snapshots (training) and the newest immature ones (prediction) — there is no separate prediction table. The 70-column table behind the older names `EDP_Feature_Train` / `D_ANALYTICS.DPD_SAMPLE1` is deprecated and left in place. |
+| `ID_COL`, `CONTRACT_COL`, `CUSTOMER_COL`, `SNAPSHOT_COL`, `TARGET_COL`, `HORIZON_COL` | `LOAN_ID`, `CONTRACT_NUMBER`, `NATIONAL_CODE`, `SNAPSHOT_DATE`, `WORST_FUTURE_CAT`, `LABEL_HORIZON_DATE` | Column-name constants. Each names one *particular* column for one job, which is why they stay literal while the column SET is derived. |
+| `META_COLS`, `FEATURE_ORDER`, `BINARY_FEATURES`, `NO_CLIP`, `NO_SCALE` | **derived from `contract/columns.json`** | Re-exported from `src/data/column_contract.py`, never hand-maintained — that is how they cannot drift from the feed. `META_COLS` = every column whose contract role is not `feature` (7 of them, including `LABEL_HORIZON_DATE`); `FEATURE_ORDER` = the 64 features in contract order. To change any of them, refresh the contract (see `contract/README.md`) — do not add a literal list back here. |
+| `CONTRACT_VERSION` | `1` | The contract file's own version; part of the NPZ cache key. |
 
 ## Prediction grain
 
@@ -26,7 +27,7 @@ subset you should double-check before a production `--final` run.
 | Setting | Default | Notes |
 |---|---|---|
 | `NUM_CLASSES` | `4` | `{0: No Delay, 1: Current, 2: Past Due+, 3: Severe Past Due}`. Raw ETL categories 0/1/2 pass through 1:1; raw 3/4 collapse into class 3. Changing this requires a full retrain (label semantics change) and a `DATA_VERSION` bump. |
-| `LABEL_HORIZON_MONTHS` | `6` | Forward window for `WORST_FUTURE_CAT`. Also the minimum gap enforced between train/val/test snapshots to avoid label-window overlap. |
+| `LABEL_HORIZON_MONTHS` | `6` | The minimum gap enforced between train/val/test snapshots to avoid label-window overlap. It is **no longer** how label maturity is decided: the feed carries `LABEL_HORIZON_DATE` per row and `filter_mature_snapshots` compares it against today (both Gregorian `YYYYMMDD` ints). This value is only the fallback when no horizon is known for a snapshot — synthetic frames, pre-v1.4 caches — and that fallback warns. |
 
 ## Cost matrix
 
@@ -39,7 +40,8 @@ subset you should double-check before a production `--final` run.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `BINARY_FEATURES` | 7 named flags (`IS_IN_WARNING_ZONE`, `IS_DETERIORATING`, ...) | These skip outlier clipping/scaling in preprocessing (already 0/1). Everything else is treated as continuous. |
+| `BINARY_FEATURES` | 7 flags, from the contract's `binary: true` | Skip outlier clipping and scaling in preprocessing (already 0/1). |
+| `NO_CLIP` / `NO_SCALE` | the 4 `DAYS_SINCE_LAST_*` columns, from the contract's `clip`/`scale` flags | Also skip clipping and scaling, for a different reason: they carry a `99999` sentinel meaning "never reached this band", at the opposite end of the same axis from `0` = "in that band right now". A percentile clipper rewrites the best state as one of the worst — invisibly in the columns where the sentinel is the majority value, destructively in the others. XGBoost splits on raw values, so exempting them costs nothing. **Never impute the sentinel to a median.** |
 
 ## Split & validation
 
@@ -48,7 +50,7 @@ subset you should double-check before a production `--final` run.
 | `WALK_FORWARD_ENABLED` | `False` | `True` = train/evaluate across every valid rolling-window fold instead of one static split. Off by default — routine runs use the single static split; flip on only for a periodic stability check (`DEPLOYMENT.md` §2), and revert after. |
 | `MIN_TRAIN_SNAPSHOTS` | `1` | Minimum training snapshots for a walk-forward fold to be generated at all. Folds with very few snapshots are unstable — see `analyze_walk_forward.py`'s `--min_train_snaps` filter for post-hoc analysis rather than raising this (raising it would silently drop early folds instead of showing you why they're unstable). |
 | `OPTIMIZE_ON_VALIDATION` | `True` | `True` = carve a validation set for early-stopping/tuning/calibration. `False` = no validation set at all (only meaningful for the legacy DeepSets path). |
-| `VAL_SPLIT_MODE` | `"customer"` | `"customer"` = in-time, customer-disjoint holdout (stable hash of `NATIONAL_CODE`) carved from the training snapshots — never overlaps the test label window. `"temporal"` is the legacy mode (val = a distinct calendar snapshot) — leaky when val/test label windows overlap; don't use for the deployed arm. |
+| `VAL_SPLIT_MODE` | `"customer"` | **Keep it here.** `"customer"` = in-time, customer-disjoint holdout (stable md5 of `NATIONAL_CODE`) carved from the training snapshots — never overlaps the test label window. Beyond that it is a correctness requirement: ten of the 64 features describe the borrower, not the loan, and are stamped identically onto every row of every loan they hold, so any non-customer-disjoint split puts those ten values on both sides of the fold boundary. `"temporal"` is the legacy mode (val = a distinct calendar snapshot) — leaky when val/test label windows overlap; don't use for the deployed arm. |
 | `CUSTOMER_VAL_FRACTION` | `0.20` | Fraction of customers held out for validation under `VAL_SPLIT_MODE="customer"`. |
 
 ## Model arms
@@ -79,7 +81,7 @@ subset you should double-check before a production `--final` run.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `DATA_VERSION` | `"v1.3"` | Bump this string whenever the upstream ETL schema or label semantics change, to force the NPZ cache (`data/train_portfolios_cache.npz`) to rebuild. A stale cache after an ETL change will silently train on the old schema. |
+| `DATA_VERSION` | `"v1.4"` | Bump this string whenever the upstream ETL schema or label semantics change, to force the NPZ cache (`data/train_portfolios_cache.npz`) to rebuild. A stale cache after an ETL change will silently train on the old schema — and a change in what a column *means* is invisible to every schema check, so this string is the only thing that catches it. The cache key also covers `CONTRACT_VERSION` and the feature list **in order**, so a contract change invalidates the cache without needing a bump here. |
 
 ## Legacy DeepSets hyperparameters
 

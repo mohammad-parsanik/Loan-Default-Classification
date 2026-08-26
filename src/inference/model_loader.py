@@ -11,6 +11,11 @@ Two model families are supported behind a common `Scorer` interface:
 ModelLoader.load_pipeline() → (scorer, calibrator, features). It accepts
 either an artifact DIRECTORY (fold_dir) or a single-file BUNDLE (.pkl);
 the artifact kind is auto-detected.
+
+`features` is the feature list the model was FITTED on, in order. It is not
+decoration: callers must project their frame to it before scoring (see
+DataLoader.project_features). An artifact that cannot state its own feature
+order cannot be scored safely and is refused at load.
 """
 
 import json
@@ -24,6 +29,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
 from src.baselines.aggregated_xgboost import build_features
+from src.data.preprocessing import assert_pipeline_features
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +48,19 @@ class ArmScorer:
     # inst["n_loans"] — so the skew was silent.)
     truncate_loans = None
 
-    def __init__(self, scaler, arm, grain: str = "portfolio"):
+    def __init__(self, scaler, arm, grain: str = "portfolio",
+                 features: list | None = None):
         self.scaler = scaler
         self.arm = arm
         # The grain the arm was FIT at, read from the bundle — not from the
         # local config, which may since have been switched.
         self.grain = grain
+        # Likewise the feature list: callers project their frame to THIS,
+        # not to whatever the current contract says, so an older model keeps
+        # scoring correctly after the feed appends a column.
+        self.features = list(features or [])
+        if self.features:
+            assert_pipeline_features(self.scaler, self.features)
 
     def raw_probs(self, instances: list[dict]) -> np.ndarray:
         X_scaled = self.scaler.transform([i["features"] for i in instances])
@@ -110,6 +123,22 @@ def _build_deepsets_scorer(scaler, hparams, state_dict, xgb_model, max_loans, de
     return DeepSetsScorer(scaler, model, xgb_model, max_loans, device)
 
 
+def _require_features(features: list, source) -> list:
+    """
+    An artifact must be able to state its own feature order. Without it there
+    is no way to project an incoming frame to the columns the model was fitted
+    on, and every preprocessing statistic is keyed by column position — so the
+    failure mode is silent wrong answers at identical width, not an error.
+    """
+    if not features:
+        raise ValueError(
+            f"{source} does not record the feature list it was trained on "
+            "(metadata 'features' is empty). It cannot be scored safely: "
+            "retrain it, or write its feature order into the metadata by hand."
+        )
+    return list(features)
+
+
 # ── Bundles ───────────────────────────────────────────────────────────────────
 
 def build_arm_bundle(scaler, arm, calibrator, max_loans, features) -> dict:
@@ -138,8 +167,10 @@ def load_bundle(bundle_path: Path, device: str):
         logger.warning("PLACEHOLDER BUNDLE — %s", meta.get("placeholder_note", ""))
 
     if bundle.get("kind") == "arm":
+        features = _require_features(features, f"Bundle {bundle_path}")
         # Pre-grain bundles are portfolio-grain by definition.
-        scorer = ArmScorer(bundle["scaler"], bundle["arm"], meta.get("grain", "portfolio"))
+        scorer = ArmScorer(bundle["scaler"], bundle["arm"],
+                           meta.get("grain", "portfolio"), features)
         return scorer, bundle.get("calibrator"), features
 
     # Legacy deepsets bundle
@@ -191,7 +222,9 @@ class ModelLoader:
         arm_path = self.artifact_dir / "model_arm.pkl"
         if arm_path.exists():
             logger.info(f"Loading arm pipeline from {self.artifact_dir}…")
-            scorer = ArmScorer(scaler, joblib.load(arm_path), meta.get("grain", "portfolio"))
+            features = _require_features(features, f"Artifact directory {self.artifact_dir}")
+            scorer = ArmScorer(scaler, joblib.load(arm_path),
+                               meta.get("grain", "portfolio"), features)
             return scorer, self._load_calibrator(), features
 
         logger.info(f"Loading legacy DeepSets pipeline from {self.artifact_dir}…")

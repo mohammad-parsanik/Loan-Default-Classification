@@ -23,7 +23,7 @@ A bank needs to predict the **worst future delinquency state** of a customer's e
 ## 2. Dataset Description
 
 ### Source & Ingestion
-- Data originates from an **MSSQL** database (table `D_ANALYTICS.DPD_SAMPLE1`, aliased as `EDP_Feature_Train` in config), accessed via `pyodbc` through `src/db/mssql_connection.py`.
+- Data originates from an **MSSQL** database (table `D_ANALYTICS.EDP_LOAN_FEATURES` since 2026-08-26 — see §20; previously `D_ANALYTICS.DPD_SAMPLE1`, aliased `EDP_Feature_Train`), accessed via `pyodbc` through `src/db/mssql_connection.py`.
 - **Important:** The original implementation plan and README mention Oracle/cx_Oracle — this is outdated. The actual codebase was migrated to **MSSQL (`pyodbc`)** early in development. The config file (`project_config.py`) reflects MSSQL credentials.
 - After the first database load, portfolios are cached to disk as a compressed NPZ file (`data/train_portfolios_cache.npz`) with a manifest file for cache invalidation (`DATA_VERSION` in config). Subsequent runs load from this cache in ~10 seconds instead of hitting the DB.
 
@@ -56,7 +56,7 @@ All **~64 features are strictly numeric**. No categorical features exist in this
 | F — Cross-Contract | `WORST_CLOSED_LOAN_DPD`, `COUNT_ACTIVE_CONTRACTS`, etc. | 10 |
 | G — Contract Maturity | `CONTRACT_AGE_MONTH`, `PCT_COMPLETED`, etc. | 4 |
 
-Full feature dictionary: see `column_changes.md`.
+Full feature dictionary: `etl_integration/CONSUMER_CONTRACT.md` §5 (local-only, authoritative), with `column_changes.md` as this project's older copy. The machine-readable column set, order and handling flags live in `contract/columns.json` — that is what the code actually reads (see §20 and `contract/README.md`).
 
 Meta/excluded columns (`META_COLS` in config): `LOAN_ID`, `CONTRACT_NUMBER`, `NATIONAL_CODE`, `SNAPSHOT_DATE`, `WORST_FUTURE_CAT`, `WORST_FUTURE_DPD`. These are never used as model inputs.
 
@@ -289,18 +289,25 @@ Three standalone scripts exist in the project root for data quality analysis. Th
 
 ```
 Loan Default Classification/
-├── project_config.py              # All hyperparameters, DB creds, feature lists, toggle flags
+├── project_config.py              # All hyperparameters, DB creds, toggle flags
+├── contract/
+│   ├── columns.json               # ★ The feed's column contract — feature identity
+│   └── README.md                  # What it holds, what reads it, how to refresh it
 ├── run.py                         # CLI entry point: train / predict / explore (604 lines)
 ├── requirements.txt               # Python dependencies
 ├── AGENT_HANDOFF.md               # This document
-├── column_changes.md              # Full feature data dictionary
+├── column_changes.md              # Feature data dictionary (gitignored; the
+│                                  #   authoritative copy is etl_integration/)
 ├── leakage_analysis.md            # Detailed Val-Test leakage analysis
 ├── EXPLORATION.md                 # Usage guide for explore_*.py scripts
 │
 ├── src/
 │   ├── db/mssql_connection.py     # MSSQL connector (pyodbc)
 │   ├── data/
-│   │   ├── data_loader.py         # Vectorized load + NPZ cache
+│   │   ├── column_contract.py     # Loads/validates contract/columns.json
+│   │   ├── feed_checks.py         # Row-level feed invariants on every load
+│   │   ├── data_loader.py         # Vectorized load + NPZ cache; name-based
+│   │   │                          #   projection + canonical row order
 │   │   ├── data_explorer.py       # One-time data profiling
 │   │   ├── dataset.py             # PyTorch Dataset + padding/masking
 │   │   ├── preprocessing.py       # Impute → Clip → Scale pipeline
@@ -325,7 +332,9 @@ Loan Default Classification/
 ├── results_1/                     # Logs + plots from Run 1 (initial 5-snapshot run)
 ├── results_2/                     # Log from Run 2 (walk-forward attempt, 7 snapshots)
 ├── results_3/                     # Log from Run 3 (leakage-free run)
-└── tests/                         # Unit tests for dataset, transformer, losses, preprocessing
+└── tests/                         # Unit + integration tests
+    ├── test_pipeline_changes.py   # The main suite
+    └── test_order_independence.py # Permute an input, assert the output is unchanged
 ```
 
 ---
@@ -493,3 +502,57 @@ All verified locally (new tests + full suite); see `tests/test_pipeline_changes.
 **Reading the next run's numbers:** compare `ranking_single_loan`, NOT `ranking`, against `results_3`…`results_6`. Loan grain changes the population (healthy siblings now enter the queue) and the severe base rate with it, and PR-AUC moves with the base rate regardless of model quality. `ranking.base_rate` sits next to `pr_auc` so the shift is visible. `recall@K` is unchanged and stays keyed to loan-slots: the API is customer-keyed, so two loans of one customer cost two slots but one call, making the metric slightly conservative — the safe direction. `score_instances` logs the duplicate-customer count in the callable window.
 
 ---
+
+## 20. ETL Feed Alignment + Order Independence (August 26, 2026 — not yet run on server)
+
+The upstream ETL was rebuilt. Two work orders landed together, because the column contract they share makes them one change: `etl_integration/SESSION_HANDOFF.md` (align with the new feed) and `etl_integration/ORDER_INDEPENDENCE_ML_PLAN.md` (stop depending on row/column order). Both are local-only documents; this section is the tracked record.
+
+**Still blocked, unchanged by any of this:** do **not** retrain, and do **not** compare any metric against `results_1`…`results_6`. The upstream validation gate has not passed and the 12-snapshot rebuild has not happened. Several features changed *meaning*, not just value, so a model trained on the new table is not comparable to one trained on the old — and the difference is not noise. Everything below is a correctness and reproducibility change to the code that *will* do that training; the point of landing it now is that the rebuild becomes the first result this project can reproduce.
+
+### The table
+
+`TRAIN_TABLE` is now `D_ANALYTICS.EDP_LOAN_FEATURES` (71 columns), read from the contract rather than written as a literal. Three names had been circulating for what should be one table; that was settled upstream on 2026-08-26, and the 70-column table behind the other two is deprecated and left in place. `src/db/create_dpd_sample.sql` and its runner were **deleted** rather than updated — the authoritative DDL lives beside the SQL that has to satisfy it, in the ETL repo, and two DDLs for one table is how the dictionary drifted in the first place.
+
+### The column contract
+
+`contract/columns.json` (tracked) pins the column set, ordinal order, and per-column handling flags; `src/data/column_contract.py` loads and validates it at import. `project_config.META_COLS` / `BINARY_FEATURES` / `NO_CLIP` / `NO_SCALE` are now **derived** from it. It carries no column semantics — this repo is public and the prose dictionary stays in the gitignored `etl_integration/`. `column_contract` cross-checks the tracked file against the vendored copy when that folder is present, so a forgotten refresh warns instead of drifting silently. See `contract/README.md` for the refresh procedure.
+
+Deriving `META_COLS` is what fixes the sharpest edge in the new feed. Column 71 is `LABEL_HORIZON_DATE`, and `FEATURE_COLS` is built as *every column minus `META_COLS`* from a `SELECT *` — so on the first read against the new table it would have become feature #65: a monotonically increasing date that proxies snapshot recency and correlates with label maturity. Nothing raises. The model just gets quietly better on the training set.
+
+### Label maturity is now read, not computed
+
+`filter_mature_snapshots` compares `LABEL_HORIZON_DATE <= today` (both Gregorian `YYYYMMDD` ints) against a snapshot→horizon map that `DataLoader` populates from the feed and carries in the NPZ manifest. The old `months_apart(snapshot, today) >= 6` re-derived, in Gregorian months, a fact the row now carries — derived upstream on a different calendar, so the two can disagree at month boundaries. `LABEL_HORIZON_MONTHS` is still used for the train/val/test gap logic, and as a warned fallback when no horizon is known.
+
+### The sentinel columns
+
+The four `DAYS_SINCE_LAST_*` features now carry `99999` = "never reached this band", against a scale where `0` = "in that band right now" — the two ends of one axis. `OutlierClipper` was clipping them to `[p1, p99]`, which rewrites *never delinquent* as *cleared a long time ago*. What makes this worth writing down: the bug is a **no-op in one of the four columns and destructive in its sibling**. Where "never" is the overwhelming majority, `p99` *is* the sentinel and the clip does nothing; where it is a minority, `p99` sits far below and the clip destroys the distinction. Spot-checking one column proves nothing about the others. They are now exempt from both clipping and scaling via the contract, and the sentinel must never be imputed to a median.
+
+### Order independence
+
+Six findings, from an audit of both repos. The first could be silently wrong in production; the rest made results depend on arrival order.
+
+| # | What was wrong | Fix |
+|---|---|---|
+| M1 | Feature identity was positional end to end and never name-checked. The training order *was* saved to `metadata.json` and `load_pipeline()` *did* return it — and all three call sites threw it away (`scorer, calibrator, _ = ...`). A reordered source applies the wrong median, clip bounds and scaler to each column, at identical width, with no error. | `DataLoader.project_features(df, order)` reindexes by name; every call site binds the model's saved list; `preprocessing.assert_pipeline_features` verifies it against what the transformers were fitted on; `ModelLoader` refuses an artifact that cannot state its own feature order. |
+| M2 | `_cache_key` hashed `DATA_VERSION`, table, `META_COLS`, database and grain — not the column list or its order. A reorder survived the cache. | The key now covers `CONTRACT_VERSION` and the feature list **in order**. |
+| M3 | `subsample=0.8, colsample_bytree=0.8` sample by index. A fixed `random_state` fixes the draw, not what gets drawn. | No hyperparameter change — the sampling was never the problem, the undefined order underneath it was. Fixed by M1 + M7. |
+| M4 | The queue sorted on `["_flagged", "RISK_SCORE"]`. Multi-key `sort_values` is stable, so ties kept their arrival order — and calibrated probabilities tie heavily, isotonic regression being a step function. Who got called today was decided by page layout. | Sort on `_flagged, RISK_SCORE, NATIONAL_CODE, LOAN_ID`. |
+| M5 | `ranking.py`'s `argsort(kind="stable")` inherited the same dependence, so `recall@K` and `lift@K` did too. | `ranking_metrics(..., tie_break=)` / `capture_curve(..., tie_break=)`, fed `LOAN_ID` by `run.py`. |
+| M6 | Truncation kept the first N rows after a sort ending on `DPD_DAYS desc` — 0 for most loans, so the ties were enormous. | `LOAN_ID` appended to the canonical sort makes the key unique; no tie survives it. |
+
+Already correct and left alone: `aggregate_features`' min/max/mean/std reduction is permutation-invariant, and `_customer_bucket` uses md5 rather than `hash()` precisely so the split survives `PYTHONHASHSEED` — that is the in-repo precedent M1 now follows one layer up.
+
+Reported `recall@K` / `lift@K` may move very slightly against earlier runs. They were never stable to begin with; this is the first version of them that can be reproduced.
+
+### Also landed
+
+- `src/data/feed_checks.py` — the feed's row-level invariants (`WORST_FUTURE_CAT >= LOAN_CATEGORY`, the `DAYS_SINCE_LAST_*` ladder, category ranges, grain uniqueness, `NPL ⇒ PRE-NPL`, horizon constant within a snapshot, sentinels still present), checked on every DB load. Logged, not raised: a handful of bad rows in a 577k-row snapshot should not abort a multi-hour run.
+- `MSSQLConnector.get_etl_runs()` reads the upstream job ledger before loading, so a snapshot missing from the table is distinguishable from one whose run never happened. Advisory — a run that can read the table is not blocked on bookkeeping.
+- `MSSQLConnector.get_label_horizons()` — one cheap `DISTINCT` supplying the maturity map for every snapshot.
+- `DATA_VERSION` → `v1.4`. Every earlier cache is stale.
+- `VAL_SPLIT_MODE = "customer"` is unchanged and now carries a comment saying why it is a **correctness requirement**: ten of the 64 features are customer-level and identical across every loan a borrower holds, so a random split puts those ten values on both sides of the fold boundary.
+- `tests/test_order_independence.py` — 15 tests, each verified to fail when its corresponding change is reverted.
+
+### Reading the first run on the new feed
+
+Judge it on its own terms. `results_1`…`results_6` are not a baseline for it. Within the run, the usual rule still holds: the `current_cat_0` slice and the `ranking` block, never aggregate F1.

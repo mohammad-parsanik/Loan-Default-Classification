@@ -44,7 +44,7 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
 
 
 def full_evaluation(y_true, probs, strata=None, calibrator=None,
-                    portfolio_sizes=None) -> dict:
+                    portfolio_sizes=None, tie_break=None) -> dict:
     """
     Single evaluation path shared by the baseline and the DeepSets+XGB model,
     so the two are compared under the SAME decision policy.
@@ -70,6 +70,11 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None,
                        siblings of severe loans now enter the queue) and the
                        severe base rate with it, and PR-AUC moves with the
                        base rate whatever the model does.
+    `tie_break` (e.g. per-instance LOAN_ID) decides the order of rows on
+    identical scores in every ranking block. Calibrated probabilities tie in
+    large blocks, so without it recall@K is a function of input order — see
+    src/evaluation/ranking.py.
+
     Also returns "_cost_preds"/"_probs_cal" for plots/CIs.
     """
     from src.evaluation.calibration import StratifiedCalibrator
@@ -95,12 +100,13 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None,
     out["cost_rule"] = compute_metrics(y_true, cost_preds, probs_cal)
     if strata is not None:
         sev = severity_scores(probs_cal)
-        out["ranking"] = ranking_metrics(y_true, sev, strata)
+        out["ranking"] = ranking_metrics(y_true, sev, strata, tie_break=tie_break)
         out["by_current_cat"] = stratified_metrics(y_true, cost_preds, strata, probs_cal)
         if portfolio_sizes is not None:
             one = np.asarray(portfolio_sizes) == 1
             out["ranking_single_loan"] = ranking_metrics(
-                y_true[one], sev[one], np.asarray(strata)[one]
+                y_true[one], sev[one], np.asarray(strata)[one],
+                tie_break=None if tie_break is None else np.asarray(tie_break)[one],
             )
     out["_cost_preds"] = cost_preds
     out["_probs_cal"] = probs_cal

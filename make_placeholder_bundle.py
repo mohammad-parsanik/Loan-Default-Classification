@@ -35,46 +35,12 @@ import project_config as config
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("placeholder")
 
-# The 64 per-loan feature columns of D_ANALYTICS.DPD_SAMPLE1 (column_changes.md,
-# cross-checked against explore_output/iv_report.csv), in documented group
-# order. NOTE: nothing in the scoring path validates feature NAMES — the
-# preprocessing pipeline is positional, so what actually has to match at swap
-# time is the column COUNT and ORDER of the caller's DataFrame.
-FEATURE_COLUMNS = [
-    # Group A — current DPD state
-    "DPD_DAYS", "LOAN_CATEGORY", "DAYS_TO_NEXT_THRESHOLD",
-    "PAYED_OVERDUE_INST_CNT", "UNPAYED_INST_CNT", "PAYED_OVERDUE_AMNT",
-    "OVERDUE_RATIO", "ONTIME_RATIO", "IS_IN_WARNING_ZONE",
-    "CNT_INSTALLMENT_WARNING_ZONE", "MATURED_INST_CNT", "UPCOMING_INST_CNT",
-    "UPCOMING_AMNT",
-    # Group B — DPD trajectory
-    "DPD_DAYS_T1", "DPD_DAYS_T2", "DPD_DAYS_T3", "DPD_DAYS_T4", "DPD_DAYS_T5",
-    "CATEGORY_T1", "CATEGORY_T2", "CATEGORY_T3",
-    # Group C — trend & velocity
-    "DPD_TREND_1M", "DPD_TREND_3M", "CATEGORY_TREND_1M", "CATEGORY_TREND_3M",
-    "IS_DETERIORATING", "IS_IMPROVING", "IS_ACCELERATING",
-    "MONTHS_IN_CURRENT_CATEGORY",
-    # Group D — historical worst performance
-    "HIST_MAX_DPD_DAYS", "HIST_MAX_CATEGORY", "HAS_EVER_BEEN_NPL",
-    "HAS_EVER_BEEN_PRENPL", "HAS_RECOVERED_BEFORE", "CNT_RECOVERED_BEFORE",
-    "COUNT_CATEGORY_CHANGES",
-    # Group E — DPD event counts
-    "COUNT_DPD_EVENTS_LAST_3M", "COUNT_DPD_EVENTS_LAST_6M",
-    "COUNT_30PLUS_DPD_LAST_3M", "COUNT_60PLUS_DPD_LAST_3M",
-    "COUNT_90PLUS_DPD_LAST_3M", "MAX_DPD_LAST_3M", "MAX_DPD_LAST_6M",
-    "TOTAL_DPD_DAYS_LAST_3M", "TOTAL_DPD_DAYS_LAST_6M",
-    "CONSECUTIVE_MONTHS_WITH_DPD", "DAYS_SINCE_LAST_DPD",
-    "DAYS_SINCE_LAST_30_DPD", "DAYS_SINCE_LAST_60_DPD",
-    "DAYS_SINCE_LAST_90_DPD",
-    # Group F — cross-contract customer history
-    "WORST_CLOSED_LOAN_DPD", "AVERAGE_CLOSE_LOAN_DPD", "MAX_DPD_ANY_PAST_LOAN",
-    "AVG_DPD_OTHER_LOANS", "PRE_UPTO30_DPD_LOANS", "PRE_UPTO60_DPD_LOANS",
-    "PRE_UPTO120_DPD_LOANS", "PRE_UPTO150_DPD_LOANS", "COUNT_ACTIVE_CONTRACTS",
-    "COUNT_DELINQUENT_CONTRACTS",
-    # Group G — contract maturity & structure
-    "CONTRACT_AGE_MONTH", "PCT_COMPLETED", "REMAINING_INST_CNT",
-    "REMAINING_AMNT",
-]
+# The per-loan feature columns come from the contract (contract/columns.json),
+# not a hand-copied list — a placeholder built against a stale schema is worse
+# than no placeholder. Feature identity is by NAME everywhere in the scoring
+# path, so what has to match at swap time is the set of column names the
+# caller supplies, not their order.
+FEATURE_COLUMNS = list(config.FEATURE_ORDER)
 
 MAX_LOANS = 2          # what MAX_LOANS_PER_CUSTOMER resolves to on real data
 CAT_PROBS = [0.62, 0.22, 0.09, 0.05, 0.02]      # raw LOAN_CATEGORY 0..4 mix
@@ -91,7 +57,11 @@ def _feature_values(name: str, latent: np.ndarray, cat: np.ndarray,
     if name == "LOAN_CATEGORY":
         return cat.astype(float)
     if name.startswith("DAYS_SINCE"):
-        return np.maximum(0.0, 900 - 200 * latent + rng.normal(0, 120, n)).round()
+        # 99999 = "never reached this band", the sentinel the real feed carries.
+        # Included so a placeholder scores over the same value range as the
+        # real thing, and so the clip/scale exemptions are actually exercised.
+        vals = np.maximum(0.0, 900 - 200 * latent + rng.normal(0, 120, n)).round()
+        return np.where(rng.random(n) < 0.35, 99999.0, vals)
     if "RATIO" in name or name == "PCT_COMPLETED":
         return np.clip(0.5 + 0.15 * latent + rng.normal(0, 0.2, n), 0, 1)
     if "AMNT" in name:
@@ -126,6 +96,8 @@ def synth_frame(n_rows: int, seed: int, snapshot: float = 20260601.0,
         "CONTRACT_NUMBER": [f"CT{seed}{i:08d}" for i in range(n_rows)],
         "NATIONAL_CODE": [f"{seed}{c:09d}" for c in owner],
         "SNAPSHOT_DATE": snapshot,
+        # T+6 for this snapshot; a meta column, never a feature.
+        config.HORIZON_COL: 20261201,
     })
     for col in FEATURE_COLUMNS:
         df[col] = _feature_values(col, latent, cat, rng)
@@ -150,8 +122,10 @@ def build_bundle(out_path: Path, n_train: int, n_val: int, seed: int) -> Path:
     from src.inference.model_loader import build_arm_bundle
 
     dl = DataLoader()
-    train_inst, feats = dl.process_raw_data(synth_frame(n_train, seed), MAX_LOANS)
-    val_inst, _ = dl.process_raw_data(synth_frame(n_val, seed + 1), MAX_LOANS)
+    train_inst, feats = dl.process_raw_data(synth_frame(n_train, seed), MAX_LOANS,
+                                            feature_order=FEATURE_COLUMNS)
+    val_inst, _ = dl.process_raw_data(synth_frame(n_val, seed + 1), MAX_LOANS,
+                                      feature_order=FEATURE_COLUMNS)
 
     scaler = create_preprocessing_pipeline(feats, config.BINARY_FEATURES)
     scaler.fit([i["features"] for i in train_inst])

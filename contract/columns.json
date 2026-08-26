@@ -1,0 +1,581 @@
+{
+  "_comment": "Machine-readable column contract for the upstream feed. Code fields only: no column semantics (see etl_integration/, local-only, for those). Refresh by re-running the same projection over the vendored ETL copy; src/data/column_contract.py cross-checks the two when both are present.",
+  "contract_version": 1,
+  "table": "D_ANALYTICS.EDP_LOAN_FEATURES",
+  "etl_commit": "98a67ac",
+  "columns": [
+    {
+      "ordinal": 1,
+      "name": "LOAN_ID",
+      "type": "BIGINT",
+      "role": "key",
+      "nullable": false
+    },
+    {
+      "ordinal": 2,
+      "name": "SNAPSHOT_DATE",
+      "type": "BIGINT",
+      "role": "key",
+      "nullable": false
+    },
+    {
+      "ordinal": 3,
+      "name": "DPD_DAYS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 4,
+      "name": "LOAN_CATEGORY",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 5,
+      "name": "DAYS_TO_NEXT_THRESHOLD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 6,
+      "name": "PAYED_OVERDUE_INST_CNT",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 7,
+      "name": "UNPAYED_INST_CNT",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 8,
+      "name": "PAYED_OVERDUE_AMNT",
+      "type": "DECIMAL(18, 2)",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 9,
+      "name": "MATURED_INST_CNT",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 10,
+      "name": "OVERDUE_RATIO",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 11,
+      "name": "IS_IN_WARNING_ZONE",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 12,
+      "name": "ONTIME_RATIO",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 13,
+      "name": "UPCOMING_INST_CNT",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 14,
+      "name": "UPCOMING_AMNT",
+      "type": "DECIMAL(18, 2)",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 15,
+      "name": "CNT_INSTALLMENT_WARNING_ZONE",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 16,
+      "name": "DPD_DAYS_T1",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 17,
+      "name": "DPD_DAYS_T2",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 18,
+      "name": "DPD_DAYS_T3",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 19,
+      "name": "DPD_DAYS_T4",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 20,
+      "name": "DPD_DAYS_T5",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 21,
+      "name": "CATEGORY_T1",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 22,
+      "name": "CATEGORY_T2",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 23,
+      "name": "CATEGORY_T3",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 24,
+      "name": "DPD_TREND_1M",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 25,
+      "name": "DPD_TREND_3M",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 26,
+      "name": "CATEGORY_TREND_1M",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 27,
+      "name": "CATEGORY_TREND_3M",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 28,
+      "name": "IS_DETERIORATING",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 29,
+      "name": "IS_ACCELERATING",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 30,
+      "name": "IS_IMPROVING",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 31,
+      "name": "MONTHS_IN_CURRENT_CATEGORY",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 32,
+      "name": "HIST_MAX_DPD_DAYS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 33,
+      "name": "HIST_MAX_CATEGORY",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 34,
+      "name": "HAS_EVER_BEEN_NPL",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 35,
+      "name": "HAS_EVER_BEEN_PRENPL",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 36,
+      "name": "HAS_RECOVERED_BEFORE",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": true
+    },
+    {
+      "ordinal": 37,
+      "name": "CNT_RECOVERED_BEFORE",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 38,
+      "name": "COUNT_CATEGORY_CHANGES",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 39,
+      "name": "COUNT_DPD_EVENTS_LAST_3M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 40,
+      "name": "COUNT_DPD_EVENTS_LAST_6M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 41,
+      "name": "COUNT_30PLUS_DPD_LAST_3M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 42,
+      "name": "COUNT_60PLUS_DPD_LAST_3M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 43,
+      "name": "COUNT_90PLUS_DPD_LAST_3M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 44,
+      "name": "MAX_DPD_LAST_3M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 45,
+      "name": "MAX_DPD_LAST_6M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 46,
+      "name": "TOTAL_DPD_DAYS_LAST_3M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 47,
+      "name": "TOTAL_DPD_DAYS_LAST_6M",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 48,
+      "name": "CONSECUTIVE_MONTHS_WITH_DPD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 49,
+      "name": "DAYS_SINCE_LAST_DPD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false,
+      "sentinel": 99999,
+      "clip": false,
+      "scale": false
+    },
+    {
+      "ordinal": 50,
+      "name": "DAYS_SINCE_LAST_30_DPD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false,
+      "sentinel": 99999,
+      "clip": false,
+      "scale": false
+    },
+    {
+      "ordinal": 51,
+      "name": "DAYS_SINCE_LAST_60_DPD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false,
+      "sentinel": 99999,
+      "clip": false,
+      "scale": false
+    },
+    {
+      "ordinal": 52,
+      "name": "DAYS_SINCE_LAST_90_DPD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false,
+      "sentinel": 99999,
+      "clip": false,
+      "scale": false
+    },
+    {
+      "ordinal": 53,
+      "name": "WORST_CLOSED_LOAN_DPD",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 54,
+      "name": "AVERAGE_CLOSE_LOAN_DPD",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 55,
+      "name": "MAX_DPD_ANY_PAST_LOAN",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 56,
+      "name": "AVG_DPD_OTHER_LOANS",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 57,
+      "name": "PRE_UPTO30_DPD_LOANS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 58,
+      "name": "PRE_UPTO60_DPD_LOANS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 59,
+      "name": "PRE_UPTO120_DPD_LOANS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 60,
+      "name": "PRE_UPTO150_DPD_LOANS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 61,
+      "name": "COUNT_ACTIVE_CONTRACTS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 62,
+      "name": "COUNT_DELINQUENT_CONTRACTS",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 63,
+      "name": "CONTRACT_AGE_MONTH",
+      "type": "INT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 64,
+      "name": "PCT_COMPLETED",
+      "type": "FLOAT",
+      "role": "feature",
+      "nullable": true,
+      "binary": false
+    },
+    {
+      "ordinal": 65,
+      "name": "REMAINING_INST_CNT",
+      "type": "INT",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 66,
+      "name": "REMAINING_AMNT",
+      "type": "DECIMAL(18, 2)",
+      "role": "feature",
+      "nullable": false,
+      "binary": false
+    },
+    {
+      "ordinal": 67,
+      "name": "WORST_FUTURE_DPD",
+      "type": "INT",
+      "role": "label",
+      "nullable": true
+    },
+    {
+      "ordinal": 68,
+      "name": "WORST_FUTURE_CAT",
+      "type": "INT",
+      "role": "label",
+      "nullable": true
+    },
+    {
+      "ordinal": 69,
+      "name": "NATIONAL_CODE",
+      "type": "VARCHAR(20)",
+      "role": "meta",
+      "nullable": true
+    },
+    {
+      "ordinal": 70,
+      "name": "CONTRACT_NUMBER",
+      "type": "VARCHAR(50)",
+      "role": "meta",
+      "nullable": true
+    },
+    {
+      "ordinal": 71,
+      "name": "LABEL_HORIZON_DATE",
+      "type": "BIGINT",
+      "role": "meta",
+      "nullable": true
+    }
+  ]
+}

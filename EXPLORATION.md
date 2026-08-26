@@ -119,7 +119,7 @@ model you're actually shipping is always explainable this way.
 
 ```bash
 # Primary: no DB, no DeepSets — just the bundle + a CSV of raw rows
-# (same columns as TRAIN_TABLE — see column_changes.md)
+# (same columns as TRAIN_TABLE — see contract/columns.json; any order)
 python explore_shap.py --bundle artifacts/<ts>_final/fold_01/model_bundle.pkl \
                        --data snapshot_sample.csv
 ```
@@ -138,7 +138,7 @@ python explore_shap.py --bundle artifacts/<ts>_final/fold_01/model_bundle.pkl \
 |---|---|---|
 | High IV on `iv_ovr3` but feature absent from `shap_class3_bar.png` | Model underusing a real signal | Consider Optuna tuning (`ARM_OPTUNA_TRIALS`) or feature interactions |
 | SHAP dependence plot for a feature is a clean monotonic line | Model learned an intuitive relationship | Good — safe to explain to stakeholders/auditors |
-| SHAP shows an unexpected feature direction (e.g., more overdue → lower risk) | Possible leakage, encoding bug, or genuine surprise worth investigating | Trace back to the raw ETL definition in `column_changes.md` |
+| SHAP shows an unexpected feature direction (e.g., more overdue → lower risk) | Possible leakage, encoding bug, or genuine surprise worth investigating | Trace back to the raw ETL definition in `etl_integration/CONSUMER_CONTRACT.md` §5 (local-only), or `column_changes.md`. Check the sentinel columns first: `DAYS_SINCE_LAST_*` run worst→best, so a *high* value is the safest state, not the riskiest. |
 
 ---
 

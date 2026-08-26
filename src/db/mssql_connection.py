@@ -72,11 +72,55 @@ class MSSQLConnector:
 
         return self.read_sql(query, params)
 
+    # The upstream ETL's own bookkeeping. `job_name` identifies the monthly
+    # load; rows written before 2026-08 hold a Jalali "YYYY-MM" in run_month
+    # and are inert here — the two formats cannot collide with a Gregorian
+    # YYYYMMDD, so they simply never match a snapshot we ask about.
+    ETL_JOB_CONTROL_TABLE = "etl_job_control"
+    ETL_JOB_NAME          = "ORACLE_X_MONTHLY_LOAD"
+
+    def get_etl_runs(self, limit: int = 24) -> pd.DataFrame:
+        """
+        Recent upstream load attempts, newest first, as
+        (snapshot_date, status, last_step, error_message).
+
+        Only status = 'SUCCESS' means the snapshot is complete. Publishing is
+        one transaction upstream, so a half-published snapshot is not
+        observable — this is about ABSENCE: distinguishing "that month was
+        never run / failed" from "that month has no data".
+
+        Raises if the ledger is not readable (absent table, no grant); callers
+        treat that as "completeness unverified", not as a failure.
+        """
+        query = (
+            f"SELECT TOP {int(limit)} run_month AS snapshot_date, status, "
+            f"last_step, error_message "
+            f"FROM {self.ETL_JOB_CONTROL_TABLE} WHERE job_name = ? "
+            f"ORDER BY run_month DESC"
+        )
+        return self.read_sql(query, (self.ETL_JOB_NAME,))
+
     def get_available_snapshots(self, table: str = None) -> list:
         table = table or config.TRAIN_TABLE
         query = f"SELECT DISTINCT {config.SNAPSHOT_COL} FROM {table} ORDER BY {config.SNAPSHOT_COL}"
         df = self.read_sql(query)
         return df[config.SNAPSHOT_COL].tolist()
+
+    def get_label_horizons(self, table: str = None) -> dict:
+        """
+        snapshot -> LABEL_HORIZON_DATE for every snapshot in the table.
+
+        A cheap DISTINCT (the horizon is constant within a snapshot), so any
+        code that has to tell a matured snapshot from an immature one can read
+        the feed's own answer instead of re-deriving it from the wall clock in
+        a different calendar. See temporal_split.filter_mature_snapshots.
+        """
+        table = table or config.TRAIN_TABLE
+        query = (f"SELECT DISTINCT {config.SNAPSHOT_COL}, {config.HORIZON_COL} "
+                 f"FROM {table} ORDER BY {config.SNAPSHOT_COL}")
+        df = self.read_sql(query)
+        return {int(s): int(h)
+                for s, h in df.dropna().itertuples(index=False)}
 
     def close(self):
         if hasattr(self, 'conn') and self.conn is not None:

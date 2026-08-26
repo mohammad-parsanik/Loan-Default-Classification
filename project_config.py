@@ -1,5 +1,19 @@
 import os
+import sys
 from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent))
+# Re-exported deliberately: the rest of the project reads these off
+# project_config, as it always has. Only their SOURCE moved.
+from src.data.column_contract import (            # noqa: E402, F401
+    BINARY_FEATURES,
+    CONTRACT_VERSION,
+    FEATURE_ORDER,
+    META_COLS,
+    NO_CLIP,
+    NO_SCALE,
+    TABLE as CONTRACT_TABLE,
+)
 
 # ── Database ─────────────────────────────────────────────
 MSSQL_SERVER = os.getenv("MSSQL_SERVER", "localhost")
@@ -11,17 +25,33 @@ MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "password")
 # Single live table: contains matured snapshots (for training) plus the
 # newest, not-yet-matured snapshot(s) (for prediction). No separate pred
 # table — predict reads TRAIN_TABLE too, see PRED_SNAPSHOT_DATES below.
-TRAIN_TABLE = "EDP_Feature_Train"
+# The 71-column feed (contract/columns.json). The 70-column table that
+# "EDP_Feature_Train" / "D_ANALYTICS.DPD_SAMPLE1" referred to is deprecated
+# and left in place; nothing here reads it any more.
+TRAIN_TABLE = CONTRACT_TABLE
 
 ID_COL       = "LOAN_ID"
 CONTRACT_COL = "CONTRACT_NUMBER"
 CUSTOMER_COL = "NATIONAL_CODE"
 SNAPSHOT_COL = "SNAPSHOT_DATE"
 TARGET_COL   = "WORST_FUTURE_CAT"
+# T+6 as a Gregorian YYYYMMDD int: the date this row's label becomes
+# trustworthy. Carried per row by the feed, so maturity is a comparison
+# rather than a re-derivation of the horizon from the wall clock in a
+# different calendar. See src/data/temporal_split.filter_mature_snapshots.
+HORIZON_COL  = "LABEL_HORIZON_DATE"
 
-# RECORD_STATUS_CODE removed — column does not exist in the current dataset
-META_COLS = [ID_COL, CONTRACT_COL, CUSTOMER_COL,
-             SNAPSHOT_COL, TARGET_COL, "WORST_FUTURE_DPD"]
+# META_COLS / BINARY_FEATURES / FEATURE_ORDER are NOT maintained here — they
+# are derived from contract/columns.json (imported above), so they cannot
+# drift from the feed. The five *_COL names above stay literal: each names a
+# particular column for a particular job, which is a different thing from
+# "the set of non-feature columns".
+#
+# Notably this is how LABEL_HORIZON_DATE (column 71) becomes a meta column by
+# construction. Without it, FEATURE_COLS = "every column minus META_COLS"
+# would silently adopt it as feature #65 — a monotonically increasing date
+# that proxies snapshot recency and correlates with label maturity. Nothing
+# would raise; the model would just get quietly better on the training set.
 
 NUM_CLASSES = 4  # {0: No Delay, 1: Current, 2: Past Due+, 3: Severe Past Due}
 
@@ -61,13 +91,17 @@ COST_MATRIX = [
 ]
 
 # ── Feature typing ───────────────────────────────────────
-# No categorical features — Collateral_type removed from dataset
-BINARY_FEATURES = [
-    "IS_IN_WARNING_ZONE", "IS_DETERIORATING", "IS_IMPROVING",
-    "IS_ACCELERATING", "HAS_EVER_BEEN_NPL", "HAS_EVER_BEEN_PRENPL",
-    "HAS_RECOVERED_BEFORE",
-]
-# FEATURE_COLS built dynamically: all columns minus META_COLS
+# No categorical features. BINARY_FEATURES (0/1 flags), NO_CLIP and NO_SCALE
+# all come from the contract:
+#   - binary flags are exempt from clipping and scaling, as before;
+#   - NO_CLIP/NO_SCALE additionally exempt the four sentinel-bearing
+#     DAYS_SINCE_LAST_* columns. Their 99999 is a CODE ("never reached this
+#     band"), at the opposite end of the axis from 0 ("in the band right
+#     now"). Percentile-clipping rewrites "never delinquent" as "cleared a
+#     long time ago" — and it does so invisibly in one of the four columns
+#     while being a no-op in another, so spot-checking one proves nothing.
+#     XGBoost splits on raw values and needs no scaling here.
+#     Do NOT impute the sentinel to the median.
 
 # ── Label window ────────────────────────────────────────
 # WORST_FUTURE_CAT uses a 6-month forward horizon.
@@ -96,6 +130,11 @@ OPTIMIZE_ON_VALIDATION = True
 #                so tuning/early-stopping cause no test leakage.
 #   "temporal" — legacy behaviour: val = second-newest usable snapshot.
 #                LEAKY when val and test label windows overlap (Run 2).
+# Keep this at "customer". It is a CORRECTNESS requirement, not a
+# preference: the ten cross-loan (Group F) features are customer-level and
+# are stamped identically onto every row of every loan a borrower holds. A
+# random split puts two rows of the same customer on both sides of the fold
+# boundary carrying ten identical values, and leaks them across it.
 VAL_SPLIT_MODE        = "customer"
 CUSTOMER_VAL_FRACTION = 0.20   # share of customers held out for validation
 
@@ -204,7 +243,15 @@ CERTAINTY_ACT_THRESHOLD = None
 # v1.3: instances carry loan_id + portfolio_n_loans, and PREDICTION_GRAIN
 # changes what an instance IS -- new NPZ arrays, must rebuild. (The grain
 # itself is also part of the cache key, so the two grains cache separately.)
-DATA_VERSION = "v1.3"
+# v1.4: new ETL feed (contract/columns.json, table above). LABEL_HORIZON_DATE
+# added to META_COLS; DAYS_SINCE_LAST_* now carry a 99999 sentinel and are
+# exempt from clip/scale; HAS_EVER_BEEN_NPL/PRENPL thresholds corrected; the
+# cross-loan block, CONSECUTIVE_MONTHS_WITH_DPD, MONTHS_IN_CURRENT_CATEGORY,
+# COUNT_CATEGORY_CHANGES and the COUNT_* thresholds all changed MEANING, not
+# just value. Feature identity is also name-based from here on and the cache
+# key now covers the column list. Every earlier cache is stale — must rebuild.
+# See etl_integration/CONSUMER_CONTRACT.md section 8 (local-only).
+DATA_VERSION = "v1.4"
 
 # ── Model — DeepSets (CPU-optimized) ────────────────────
 MAX_LOANS_PER_CUSTOMER = None  # Computed from data (99th percentile)

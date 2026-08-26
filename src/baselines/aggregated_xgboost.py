@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 # Shared hyperparameters for every arm — deliberately identical so the
 # comparison isolates the OBJECTIVE/decomposition, not tuning luck.
+#
+# subsample / colsample_bytree sample by INDEX. A fixed random_state fixes
+# the draw, not what gets drawn: permute the rows and different rows land in
+# each tree; permute the columns and different columns do. That is fine here
+# and needs no change, because both are pinned upstream — rows arrive in the
+# loader's canonical order (customer, snapshot, DPD desc, LOAN_ID) and columns
+# in the contract's feature order. Retraining on logically identical data now
+# reproduces the same model. Do not "fix" this by dropping the sampling: the
+# sampling was never the problem, the undefined order underneath it was.
 XGB_DEFAULTS = dict(
     n_estimators=200,
     max_depth=5,
