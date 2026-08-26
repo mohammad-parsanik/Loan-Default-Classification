@@ -4,6 +4,7 @@
 /OLD_ETL Document — EDP Feature Tables.md
 /column_changes.md
 /deprecated/
+/etl_integration/
 /offline_packages
 /offline_bundle_pandas_pyarrow
 *.zip
