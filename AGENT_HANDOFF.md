@@ -258,13 +258,14 @@ When set to `False`:
 
 ## 7. Exploration & Diagnostic Tools
 
-Three standalone scripts exist in the project root for data quality analysis. These are documented in `EXPLORATION.md`:
+Four standalone scripts exist in the project root for data quality analysis. These are documented in `EXPLORATION.md`:
 
 | Script | Purpose |
 |--------|---------|
 | `explore_iv_woe.py` | Information Value & Weight of Evidence per feature, One-vs-Rest for all `config.NUM_CLASSES` classes. Reads from NPZ cache (no DB needed). |
 | `explore_umap.py` | UMAP projection of raw features or model embeddings with CLI-tunable hyperparameters. |
 | `explore_shap.py` | SHAP TreeExplainer on XGBoost meta-learner. Needs `.npy` embeddings copied from the training server. |
+| `explore_clip_impact.py` | Whether `OutlierClipper`'s `[p1, p99]` clip merges away a risk-bearing tail. Reads `tail_lift` = `P(severe \| x > p99) / P(severe)`. Reads from NPZ cache (no DB needed). Added for the 700M→7B population widening (§21). |
 
 **Key finding from IV analysis:** Top features (`LOAN_CATEGORY`, `DPD_DAYS`) had very high IV values (>0.50, which normally signals leakage). After investigation, the conclusion was these are **genuinely strong signals** — they're point-in-time observations available at prediction time. Note this is partly mechanical: DPD is a counter, so for already-delinquent customers the future label is largely predetermined by continued accrual. That is why evaluation is now also reported per current-category slice (the currently-clean slice is the real early-warning task).
 
@@ -556,3 +557,48 @@ Reported `recall@K` / `lift@K` may move very slightly against earlier runs. They
 ### Reading the first run on the new feed
 
 Judge it on its own terms. `results_1`…`results_6` are not a baseline for it. Within the run, the usual rule still holds: the `current_cat_0` slice and the `ranking` block, never aggregate F1.
+
+---
+
+## 21. Population Widened: contract amount ≤ 700M → ≤ 7B (September 2, 2026 — not yet run on server)
+
+The ETL's `q1` scope filter changed. A loan enters a snapshot if its contract amount is **≤ 7,000,000,000** rials, where the ceiling used to be 700,000,000. Everything else about the filter is unchanged: first installment on or before T−6, last installment on or after T+6, monthly repayment schedule, individual customer.
+
+Upstream records this as a **correction of a miscommunicated figure, not a policy change** (`etl_integration/CONSUMER_CONTRACT.md` §8: "the population is retail either way"). That reframes every earlier run rather than excusing it: `results_1`…`results_6` were trained on an unintended *subset* of the population the project was always meant to serve, not on a deliberate low-value segment that has now been extended. Nothing technical below changes because of it — the model still has to be refitted on a population it has never seen — but it is the reason not to treat the old population as a "core" segment worth preserving a model for.
+
+**Nothing in this repo encodes the cap** — it was never a constant here, only a fact about which rows arrive. The 71-column contract, `CONTRACT_VERSION`, every column meaning and every handling flag are untouched, so the pipeline runs against the new table with no code change. That is exactly the risk: this is the first change to the feed that **no schema check, contract check or feed invariant can see**. The table name, the column set, the snapshot dates and the column semantics are all identical; only the row population differs.
+
+### What changed here
+
+- **`DATA_VERSION` → `v1.5`.** The one mandatory edit. `_cache_key` hashes `DATA_VERSION`, table, `META_COLS`, database, grain, `CONTRACT_VERSION` and the ordered feature list — none of which move when the population does. Without the bump, `data/train_portfolios_cache.npz` stays valid and silently serves the ≤700M population forever.
+- `explore_clip_impact.py` — new diagnostic, see below and `EXPLORATION.md` Script 4.
+
+### Backfilled, and therefore consistent
+
+The tables and **all** snapshots are being rebuilt under the new filter. This is the good case, and it is worth naming why: had the widening applied forward-only, the population shift would sit exactly on the temporal split — training on ≤700M loans, deploying against a queue containing 7B loans the model had never seen, with test-fold metrics unable to show it because the test fold would be old-population too. Backfilled, train and score populations match and the only consequence is that every historical number is superseded. Re-reading the same `SNAPSHOT_DATE` now returns different rows; that is expected, not a bug (the ETL publishes per-snapshot with `DELETE WHERE SNAPSHOT_DATE = ?` then insert).
+
+### Comparability: decided
+
+**`results_1`…`results_6` are not a baseline. Do not compare against them, in any block, including `ranking_single_loan`.** That slice controls for prediction grain, not for population — it has no power here. The severe base rate moves with the new segment, and PR-AUC moves with the base rate regardless of model quality, so a lower AP on the new feed is not evidence of a worse model and a higher one is not evidence of a better one. `ranking.base_rate` is reported next to `pr_auc` so the shift is at least visible. The first run on the rebuilt table is the new baseline; judge it on its own terms, on the `current_cat_0` slice and the `ranking` block, never aggregate F1.
+
+This compounds with §20 — the feed alignment already made old results non-comparable because several features changed meaning. Two independent reasons now, same conclusion.
+
+### The clipping question (open, has a tool)
+
+`OutlierClipper` clips every non-binary, non-`NO_CLIP` feature to `[p1, p99]` fit on train. **Clipping is the one preprocessing step XGBoost cannot shrug off.** Imputation and `PortfolioRobustScaler` are monotone and trees split on order, so they are invisible to the model; clipping merges every value above p99 into a single number and destroys the ordering up there.
+
+Three features are amount-scaled and inherit the 10× wider range directly: `PAYED_OVERDUE_AMNT` (8), `UPCOMING_AMNT` (14), `REMAINING_AMNT` (66). The concern is structural, not hypothetical: the newly admitted large loans are a *minority* sitting at the *top* of the distribution, which is precisely the region clipping flattens. If severe events concentrate there, the clip is deleting the signal the widening was meant to add. Note the shape of this is the same trap as the `DAYS_SINCE_LAST_*` sentinels in §20 — harmless in the columns where the extreme value is the majority, destructive where it is a minority — which is why it gets measured rather than assumed.
+
+**Not pre-emptively changed.** Setting `clip: false` on those three in `contract/columns.json` is a one-line fix and it is the wrong move to make blind: clipping exists because unbounded tails hurt, and the tail could as easily be noise as risk. Measure first with `explore_clip_impact.py`, then A/B on validation lift@K before committing. Whichever way it goes, changing a `clip` flag bumps `contract_version` and invalidates the cache on its own.
+
+### Secondary consequences, no action
+
+- **`COST_MATRIX` is flat per loan** and now spans a 10× exposure range, so it is considerably more wrong than it was. Harmless: it feeds `PREDICTED_CLASS` / `EXPECTED_COST` only, never `RISK_SCORE`, never training. It was already advisory (business gave only the 4× anchor); it is now more so.
+- **`MAX_LOANS_PER_CUSTOMER`** resolves from the 99th percentile at runtime and is inert at loan grain. Ignore.
+- **`assert_feed_invariants`** was measured against the old segment. Nullability and range assumptions are worth re-reading in the log on the first load rather than trusting.
+- **Row volume** grows. If it grows a lot, the arm-training stages are where it will show.
+- **`etl_integration/CONSUMER_CONTRACT.md` was refreshed from upstream on 2026-09-02** and is current: §7 carries the new ceiling, §8 carries a row-population entry for it. Diffed against the previous copy, that ceiling is the *only* substantive change — no column was added, removed or redefined, `contract_version` is still 1, and the vendored `etl_integration/columns.json` still matches the tracked `contract/columns.json` projection exactly, so no contract refresh is needed. (The refreshed copy arrived without the provenance header the convention calls for; it was restored by hand, with the ETL commit noted as unrecorded.)
+
+### The business question this raises
+
+The queue ranks by P(severe) alone and `recall@K` counts loans, so a 7B loan and a 70M loan occupy identical slots at identical value. If the objective is money at risk, that is now a real distortion rather than a rounding error — either rank on `P3 × REMAINING_AMNT` or report exposure-weighted recall beside the count-based one. Deliberately **not** implemented: it changes what the deliverable optimises, which is a business decision, not a maintenance one. Raised with the business, pending.
