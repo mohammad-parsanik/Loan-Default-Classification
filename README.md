@@ -250,7 +250,8 @@ src/
     scoring.py               run_scoring() — manager-code integration entry point
     scoring_params.py        ScoringParams — explicit, per-call-overridable business knobs
 
-explore_iv_woe.py, explore_umap.py, explore_shap.py   Standalone diagnostics (see EXPLORATION.md)
+explore_iv_woe.py, explore_umap.py, explore_shap.py,  Standalone diagnostics (see EXPLORATION.md)
+explore_clip_impact.py
 tests/                  Unit + integration tests (pytest; also runnable without it, see below)
 ```
 
@@ -270,6 +271,7 @@ python run.py predict --artifact_dir <dir_or_bundle.pkl> [--snapshot_date ...] [
 python explore_iv_woe.py
 python explore_umap.py --mode raw
 python explore_shap.py --bundle <model_bundle.pkl> --data <snapshot.csv>
+python explore_clip_impact.py
 
 # Package a trained model for a system that shouldn't depend on this whole repo:
 python build_scoring_package.py --bundle <model_bundle.pkl> --output scoring_package/

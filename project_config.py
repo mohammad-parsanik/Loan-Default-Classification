@@ -251,7 +251,17 @@ CERTAINTY_ACT_THRESHOLD = None
 # just value. Feature identity is also name-based from here on and the cache
 # key now covers the column list. Every earlier cache is stale — must rebuild.
 # See etl_integration/CONSUMER_CONTRACT.md section 8 (local-only).
-DATA_VERSION = "v1.4"
+# v1.5: POPULATION change, not a schema change (Sept 2, 2026). The ETL's q1
+# scope filter widened from contract amount <= 700,000,000 to <= 7,000,000,000,
+# so the table now covers loans an order of magnitude larger. Same 71 columns,
+# same meanings, same contract version -- nothing in this repo encodes the cap,
+# and no schema or contract check can see it, so THIS STRING is the only thing
+# that stops a stale cache from silently serving the old population. Tables and
+# all snapshots are being rebuilt under the new filter, so the change is
+# backfilled: train and score populations stay consistent. Expect the severe
+# base rate, the monetary features' p99 (PAYED_OVERDUE_AMNT / UPCOMING_AMNT /
+# REMAINING_AMNT) and therefore PR-AUC to move. Not comparable to results_1-6.
+DATA_VERSION = "v1.5"
 
 # ── Model — DeepSets (CPU-optimized) ────────────────────
 MAX_LOANS_PER_CUSTOMER = None  # Computed from data (99th percentile)

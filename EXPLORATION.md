@@ -1,14 +1,15 @@
 # Data & Model Exploration Tools
 
-Three standalone scripts, kept permanently in the project root (not a
+Four standalone scripts, kept permanently in the project root (not a
 one-off exploration phase — re-run them each retraining cycle, especially
 after an ETL change or a new snapshot). They answer:
 
 1. **Do individual features actually carry predictive signal?** → `explore_iv_woe.py`
 2. **Is there a separable manifold in the feature space?** → `explore_umap.py`
 3. **Is the deployed model relying on economically sensible features?** → `explore_shap.py`
+4. **Is preprocessing destroying signal before the model sees it?** → `explore_clip_impact.py`
 
-All three read from a local cache or a lightweight CSV — no live DB
+All four read from a local cache or a lightweight CSV — no live DB
 connection needed for any of them.
 
 ---
@@ -142,6 +143,89 @@ python explore_shap.py --bundle artifacts/<ts>_final/fold_01/model_bundle.pkl \
 
 ---
 
+---
+
+## Script 4: `explore_clip_impact.py` — does the [p1, p99] clip destroy signal?
+
+Answers a question the other three can't: whether `OutlierClipper` is
+throwing away risk before the model ever sees it.
+
+**Why clipping specifically.** Of the three preprocessing steps, it's the
+only one XGBoost can't shrug off. Median imputation and
+`PortfolioRobustScaler` are monotone, and trees split on order — a scaled
+feature produces identical splits. Clipping is different: it merges every
+value above p99 into one number, so any ordering up there is gone
+permanently. That's correct when the tail is noise and harmful when the
+tail is the risk, and nothing in the pipeline distinguishes the two cases.
+
+Run it after any change that moves a feature's distribution — a population
+change most of all. The immediate motive was the Sept 2, 2026 widening of
+the ETL scope filter from contract amount ≤ 700M to ≤ 7B
+(`AGENT_HANDOFF.md` §21), which stretched the right tail of the three
+monetary features by an order of magnitude and put the newly admitted
+loans exactly where the clip bites.
+
+### Output columns
+
+| Column | Meaning |
+|---|---|
+| `p1`, `p99`, `max` | the bounds the clipper would fit, and the real maximum |
+| `pct_hi` / `pct_lo` | share of loan-rows pinned to each bound (~1% by construction, unless the column is a `*RATIO*`) |
+| `n_merged` | distinct values above p99 collapsed into a single number |
+| `tail_span` | `(max − p99) / (p99 − p1)` — how much of the feature's range is discarded |
+| **`tail_lift`** | `P(severe \| x > p99) / P(severe)` — **this is the number to read** |
+
+`tail_lift > 1` means severe events concentrate above the clip bound, i.e.
+the clip is merging away a region that predicts the label. `≈ 1` means the
+tail is indistinguishable from the body and clipping costs nothing.
+`< 1` means the tail is *safer* than average and clipping is, if anything,
+helping. The script warns on any feature above `--lift_threshold`
+(default 1.5).
+
+It mirrors the clipper rather than reimplementing it: `BINARY_FEATURES`
+and the contract's `NO_CLIP` columns are skipped exactly as
+`OutlierClipper.fit` skips them, and `*RATIO*` columns use the same
+`[0, 1]` bounds instead of percentiles. Only mature snapshots are counted
+(`filter_mature_snapshots` over the manifest's `label_horizons`), because
+immature rows carry a systematically optimistic label that would bias every
+`tail_lift`.
+
+### Inputs / Outputs
+
+Reads `data/train_portfolios_cache.npz` + its `.manifest.json`. No DB, no
+model, no bundle. Writes `explore_output/clip_impact.csv` and prints the
+same table.
+
+```bash
+python explore_clip_impact.py
+python explore_clip_impact.py --only REMAINING_AMNT,UPCOMING_AMNT,PAYED_OVERDUE_AMNT
+python explore_clip_impact.py --baseline data/cache_700m.npz
+```
+
+`--baseline` diffs `p99` and `max` against an older cache and adds a
+`p99_ratio` column — how far the bound moved when the population changed.
+**Copy the old cache aside before rebuilding**; the path is reused, so a
+rebuild overwrites the only copy of the comparison.
+
+### How to act on it
+
+| Observation | Meaning | Action |
+|---|---|---|
+| `tail_lift ≈ 1`, small `tail_span` | clip bound is benign | leave it alone |
+| `tail_lift > 1.5`, large `n_merged` | the clip is merging a risk-bearing tail into one value | candidate for `clip: false` in `contract/columns.json` — **then A/B it on validation lift@K**, don't ship on this number alone |
+| `tail_lift < 1` | large values are the *safe* end | leave it alone; this is the `DAYS_SINCE_LAST_*` shape, where high = healthy |
+| `p99_ratio` ≫ 1 under `--baseline` | the population change moved the bound | expected after a scope-filter change; read `tail_lift` on the new cache to decide whether it matters |
+
+A high `tail_lift` is a reason to investigate, not a verdict. Exempting a
+column from clipping hands the model an unbounded feature, which is what
+clipping was there to prevent — the measurement says the tail *carries*
+signal, not that keeping it will net out positive. Validation lift@K
+decides that.
+
+Changing a `clip` flag edits `contract/columns.json`, which bumps
+`contract_version` and invalidates the NPZ cache on its own — no
+`DATA_VERSION` bump needed for that particular change.
+
 ## Recommended workflow (each retraining cycle)
 
 ```
@@ -154,6 +238,12 @@ python explore_shap.py --bundle artifacts/<ts>_final/fold_01/model_bundle.pkl \
 3. python explore_shap.py --bundle <latest model_bundle.pkl> --data <a recent snapshot>
      → confirm the shipped model's top features are still the expected,
        economically sensible ones (DPD trend, category history, etc.)
+
+4. python explore_clip_impact.py
+     → read tail_lift; confirm preprocessing isn't merging away a
+       risk-bearing tail. Run this BEFORE step 3 after any population
+       or distribution change — no point explaining a model that was
+       fitted on truncated inputs.
 ```
 
 None of these scripts modify the pipeline or its artifacts — they're
