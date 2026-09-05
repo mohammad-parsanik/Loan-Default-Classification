@@ -81,7 +81,7 @@ subset you should double-check before a production `--final` run.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `DATA_VERSION` | `"v1.5"` | Bump this string whenever the upstream ETL schema, label semantics, **or population** change, to force the NPZ cache (`data/train_portfolios_cache.npz`) to rebuild. A stale cache after an ETL change will silently train on the old data — and a change in what a column *means*, or in *which rows exist*, is invisible to every schema check, so this string is the only thing that catches it. The cache key also covers `CONTRACT_VERSION` and the feature list **in order**, so a contract change invalidates the cache without needing a bump here; a population change does **not** — same table, same columns, same snapshot dates, different rows. `v1.5` is exactly that case: the ETL scope filter widened from contract amount ≤ 700M to ≤ 7B (Sept 2, 2026). |
+| `DATA_VERSION` | `"v1.5"` | Bump this string whenever the upstream ETL schema, label semantics, **or population** change, to force the NPZ cache (`data/snapshots/<stage>_<key>/`) to rebuild. A stale cache after an ETL change will silently train on the old data — and a change in what a column *means*, or in *which rows exist*, is invisible to every schema check, so this string is the only thing that catches it. The cache key also covers `CONTRACT_VERSION` and the feature list **in order**, so a contract change invalidates the cache without needing a bump here; a population change does **not** — same table, same columns, same snapshot dates, different rows. `v1.5` is exactly that case: the ETL scope filter widened from contract amount ≤ 700M to ≤ 7B (Sept 2, 2026). |
 
 ## Legacy DeepSets hyperparameters
 

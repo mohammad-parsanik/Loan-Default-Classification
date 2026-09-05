@@ -25,7 +25,7 @@ A bank needs to predict the **worst future delinquency state** of a customer's e
 ### Source & Ingestion
 - Data originates from an **MSSQL** database (table `D_ANALYTICS.EDP_LOAN_FEATURES` since 2026-08-26 — see §20; previously `D_ANALYTICS.DPD_SAMPLE1`, aliased `EDP_Feature_Train`), accessed via `pyodbc` through `src/db/mssql_connection.py`.
 - **Important:** The original implementation plan and README mention Oracle/cx_Oracle — this is outdated. The actual codebase was migrated to **MSSQL (`pyodbc`)** early in development. The config file (`project_config.py`) reflects MSSQL credentials.
-- After the first database load, portfolios are cached to disk as a compressed NPZ file (`data/train_portfolios_cache.npz`) with a manifest file for cache invalidation (`DATA_VERSION` in config). Subsequent runs load from this cache in ~10 seconds instead of hitting the DB.
+- After the first database load, portfolios are cached to disk **one NPZ per snapshot** under `data/snapshots/<stage>_<key>/`, each with its own manifest for cache invalidation (`DATA_VERSION` in config). Subsequent runs load from this cache instead of hitting the DB. Snapshot-level granularity mirrors the ETL: a matured snapshot is never recomputed upstream so its file is permanent, while the newest 7 (immature) snapshots are rewritten on every monthly load and their caches are provisional.
 
 ### Snapshots & Timeline
 The data contains **8 raw snapshot dates** in format `YYYYMMDD` as floats:
@@ -282,7 +282,7 @@ Four standalone scripts exist in the project root for data quality analysis. The
 | **Database** | MSSQL via `pyodbc` with ODBC Driver 17 |
 | **Key dependencies** | `torch>=2.0`, `xgboost>=2.0`, `optuna>=3.0`, `pyodbc>=4.0` (see `requirements.txt`) |
 | **No GPU** | Pipeline is CPU-only. `torch.compile` is skipped on Windows (inductor requires MSVC). CPU threading is configured: 12 compute / 4 interop. |
-| **Data cache** | `data/train_portfolios_cache.npz` (~204 MB). Invalidated by changing `DATA_VERSION` in config. |
+| **Data cache** | `data/snapshots/<stage>_<key>/<snapshot>.npz`, one per snapshot, uncompressed. Invalidated by changing `DATA_VERSION` in config. |
 
 ---
 
@@ -570,7 +570,7 @@ Upstream records this as a **correction of a miscommunicated figure, not a polic
 
 ### What changed here
 
-- **`DATA_VERSION` → `v1.5`.** The one mandatory edit. `_cache_key` hashes `DATA_VERSION`, table, `META_COLS`, database, grain, `CONTRACT_VERSION` and the ordered feature list — none of which move when the population does. Without the bump, `data/train_portfolios_cache.npz` stays valid and silently serves the ≤700M population forever.
+- **`DATA_VERSION` → `v1.5`.** The one mandatory edit. `_cache_key` hashes `DATA_VERSION`, table, `META_COLS`, database, grain, `CONTRACT_VERSION` and the ordered feature list — none of which move when the population does. Without the bump, the cached snapshots stay valid and silently serve the ≤700M population forever.
 - `explore_clip_impact.py` — new diagnostic, see below and `EXPLORATION.md` Script 4.
 
 ### Backfilled, and therefore consistent
@@ -602,3 +602,98 @@ Three features are amount-scaled and inherit the 10× wider range directly: `PAY
 ### The business question this raises
 
 The queue ranks by P(severe) alone and `recall@K` counts loans, so a 7B loan and a 70M loan occupy identical slots at identical value. If the objective is money at risk, that is now a real distortion rather than a rounding error — either rank on `P3 × REMAINING_AMNT` or report exposure-weighted recall beside the count-based one. Deliberately **not** implemented: it changes what the deliverable optimises, which is a business decision, not a maintenance one. Raised with the business, pending.
+
+---
+
+## 22. Load Stage Rebuilt for the ≤7B Row Volume (September 5, 2026 — not yet run on server)
+
+### What happened
+
+The first run against the rebuilt (≤7B) tables died in the load stage:
+
+```
+INFO - Loading training data from D_ANALYTICS.EDP_LOAN_FEATURES
+MemoryError: unable to allocate 326 MiB for an array with shape (42713503,) and data type uint64
+```
+
+The number is the row count: **42,713,503**, up from the ~6M every prior run
+was built around. §21 predicted volume growth would show in the arm-training
+stages; it showed a stage earlier.
+
+`load_training_data` issued a single `SELECT * FROM D_ANALYTICS.EDP_LOAN_FEATURES`
+— every snapshot, mature and immature, all 71 columns — through
+`pd.read_sql`, which on a DBAPI connection does one `cursor.fetchall()` into a
+list of pyodbc `Row` objects before building the frame. The float64 frame alone
+is ~24 GB; the row-object intermediate is several times that. The 326 MiB
+allocation that actually failed was just the next thing asked for.
+
+### What changed
+
+`DataLoader.load_train_portfolios` no longer reads the table in one shot:
+
+- **One `SELECT` per snapshot**, vectorised and released before the next. Peak
+  frame is ~1/20th of the table. Equivalent by construction — instances group
+  by `(customer, snapshot)`, so no group spans a snapshot boundary.
+- **Mature snapshots only.** The split discarded immature ones anyway; loading
+  them was ~25% of the rows for nothing.
+- **One NPZ per snapshot** under `data/snapshots/<stage>_<key>/`, replacing the
+  monolithic `train_portfolios_cache.npz`. This mirrors the ETL: each monthly
+  load recomputes the newest 7 snapshots (T new, T-7 just matured, five
+  rewritten in between), so a **matured** snapshot never changes again and its
+  file is permanent, while an **immature** one is provisional. Next month's run
+  reads one new snapshot from the DB and the rest from disk instead of
+  rebuilding ~40M rows.
+- **Immature caches expire with the ETL cycle.** `load_pred_portfolios` reuses a
+  cached immature snapshot only while the ETL run that built it is still the
+  newest `SUCCESS` in `etl_job_control`; if that ledger is unreadable the
+  snapshot is re-read every time. Serving last month's rows under this month's
+  snapshot date is the failure this prevents, and nothing in the data would
+  reveal it.
+- **`np.savez`, not `np.savez_compressed`.** Single-threaded zlib over a
+  multi-GB `features_flat` cost tens of minutes per rebuild to save a few GB of
+  disk. `np.load` reads either.
+- **Diagnostics** (`explore_iv_woe`, `explore_umap`, `explore_clip_impact`) now
+  read through `data_loader.load_cached_arrays()`, which concatenates the
+  per-snapshot NPZs and rebases `offsets`. They take `--cache_dir` / `--cache`
+  pointing at a snapshot directory.
+
+### Instance order changed, deliberately
+
+Per-snapshot loading produces `(SNAPSHOT_DATE, NATIONAL_CODE, DPD_DAYS desc,
+LOAN_ID)` — snapshot-major, where the whole-table load was customer-major. A
+global re-sort to restore the old order was implemented, then removed: the
+order-independence requirement (§20) is that the order be a function of the
+data rather than of arrival order, not that it be customer-major specifically,
+and snapshot-major is what per-snapshot caching yields for free. Consequence:
+**XGBoost's index-based `subsample`/`colsample_bytree` draw differently than
+they would have before**, so a pre- and post-September-2026 run are not
+bit-comparable even on identical data. Accepted — `results_1`…`results_6` are
+already dead as a baseline (§21), so nothing was being compared against.
+
+### Residual risk — the next wall
+
+The read is fixed; the **instance representation is not**. At loan grain,
+~32M mature rows become ~32M instance dicts: roughly 19 GB of dict and array
+object overhead, plus ~8 GB of `X_all` blocks held alive by the per-instance
+`features` views, plus another ~8 GB while `_save_cache` fills `features_flat`.
+On the 128 GB server that should fit alongside preprocessing and four arms, but
+not comfortably. The array form already exists — it is exactly what the NPZ
+cache stores and what `load_cached_arrays` returns — so the fix, if the run
+falls over again, is to stop exploding it back into dicts in `_load_cache` and
+teach `build_features` / the arms to consume the flat arrays directly. Not done
+here: it touches the arms, the splits and the scorers.
+
+`process_raw_data` also still materialises a float64 intermediate
+(`df[feature_cols].apply(pd.to_numeric)`) and two full boolean frames for the
+unparseable-value warning — ~27 GB of transient peak at whole-table scale, but
+only ~1.4 GB now that it sees one snapshot at a time. Left alone.
+
+### Regression tests
+
+`tests/test_order_independence.py` — streaming load equals the whole-table load
+(both grains) and is invariant to input row order; immature snapshots are never
+queried; a cached mature snapshot is served from disk and a newly matured one
+costs exactly one DB read; an immature prediction cache is rebuilt when the ETL
+run tag moves and reused when it does not; `load_cached_arrays` rebases
+`offsets` correctly across snapshot files (portfolio grain, variable group
+sizes — the case that can silently be wrong).

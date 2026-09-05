@@ -347,3 +347,195 @@ def test_ranking_metrics_are_identical_under_permutation():
     b = ranking_metrics(y[perm], scores[perm], strata[perm], tie_break=loan_id[perm])
     for window in config.RANKING_REF_WINDOWS:
         assert a[f"at_{window}"] == b[f"at_{window}"]
+
+
+# ── per-snapshot streaming load & cache ───────────────────────────────────────
+
+class _FakeConn:
+    """Serves a multi-snapshot frame the way MSSQLConnector would."""
+
+    def __init__(self, df: pd.DataFrame, etl_run: str = "20260901"):
+        self.df = df
+        self.etl_run = etl_run
+        self.queries: list = []
+
+    def get_available_snapshots(self):
+        return sorted(self.df[config.SNAPSHOT_COL].unique().tolist())
+
+    def get_label_horizons(self):
+        return {int(s): int(h) for s, h in
+                self.df[[config.SNAPSHOT_COL, config.HORIZON_COL]]
+                .drop_duplicates().itertuples(index=False)}
+
+    def get_etl_runs(self, limit: int = 24):
+        return pd.DataFrame({"snapshot_date": [self.etl_run], "status": ["SUCCESS"],
+                             "last_step": ["done"], "error_message": [None]})
+
+    def _rows(self, snaps):
+        self.queries.append(sorted(int(s) for s in snaps))
+        keep = self.df[config.SNAPSHOT_COL].isin([float(d) for d in snaps])
+        return self.df.loc[keep].copy()
+
+    def load_training_data(self, snapshot_dates=None):
+        return self._rows(snapshot_dates or self.get_available_snapshots())
+
+    def load_prediction_data(self, snapshot_date=None):
+        return self._rows([snapshot_date])
+
+    def close(self):
+        pass
+
+
+def _multi_snapshot_frame(snaps=(20250131.0, 20250228.0, 20250331.0),
+                          horizon: int = 20250731) -> pd.DataFrame:
+    """Same customers in every snapshot — so customer-major and snapshot-major
+    orderings genuinely differ, which is what these tests are about."""
+    parts = []
+    for snap in snaps:
+        part = _contract_frame(120, seed=0)
+        part[config.SNAPSHOT_COL] = snap
+        part[config.HORIZON_COL] = horizon
+        parts.append(part)
+    # Shuffled on the way in: the loader's answer must not depend on it.
+    return (pd.concat(parts, ignore_index=True)
+              .sample(frac=1.0, random_state=7).reset_index(drop=True))
+
+
+def _snapshot_major(instances: list[dict]) -> list[dict]:
+    """process_raw_data's own order, re-sorted snapshot-major. `sorted` is
+    stable, so the within-snapshot key (customer, DPD desc, LOAN_ID) survives."""
+    return sorted(instances, key=lambda i: i["snapshot_date"])
+
+
+@pytest.mark.parametrize("grain", ["loan", "portfolio"])
+def test_streaming_load_matches_whole_table_load(grain):
+    """
+    The loader reads one snapshot at a time (a single SELECT * is ~43M rows at
+    the >=7B population). The instances must be exactly those a whole-table
+    load produces, in (SNAPSHOT, CUSTOMER, DPD desc, LOAN_ID) order — a
+    function of the data, never of the order rows arrived in.
+    """
+    df = _multi_snapshot_frame()
+    whole, _ = DataLoader().process_raw_data(df, grain=grain, feature_order=FEATURE_ORDER)
+
+    conn = _FakeConn(df)
+    got, _ = DataLoader(conn).load_train_portfolios(
+        use_cache=False, grain=grain, feature_order=FEATURE_ORDER
+    )
+
+    # One query per snapshot, never one for the whole table.
+    assert conn.queries == [[20250131], [20250228], [20250331]]
+    _instances_equal(got, _snapshot_major(whole))
+
+
+def test_streaming_load_is_row_order_independent():
+    """Same rows, different arrival order, byte-identical instances."""
+    df = _multi_snapshot_frame()
+    a, _ = DataLoader(_FakeConn(df)).load_train_portfolios(
+        use_cache=False, grain="loan", feature_order=FEATURE_ORDER)
+    shuffled = df.sample(frac=1.0, random_state=99).reset_index(drop=True)
+    b, _ = DataLoader(_FakeConn(shuffled)).load_train_portfolios(
+        use_cache=False, grain="loan", feature_order=FEATURE_ORDER)
+    _instances_equal(a, b)
+
+
+def test_streaming_load_skips_immature_snapshots():
+    """Immature snapshots are dropped server-side, not loaded and discarded."""
+    df = _multi_snapshot_frame()
+    future = df[df[config.SNAPSHOT_COL] == 20250331.0].copy()
+    future[config.SNAPSHOT_COL] = 20260831.0
+    future[config.HORIZON_COL] = 20270228          # horizon in the future
+    df = pd.concat([df, future], ignore_index=True)
+
+    conn = _FakeConn(df)
+    instances, _ = DataLoader(conn).load_train_portfolios(
+        use_cache=False, grain="loan", feature_order=FEATURE_ORDER)
+
+    assert [20260831] not in conn.queries
+    assert 20260831.0 not in {i["snapshot_date"] for i in instances}
+
+
+def test_mature_snapshot_cache_is_permanent_and_incremental(tmp_path, monkeypatch):
+    """
+    A matured snapshot never changes upstream, so its NPZ is reused forever;
+    when a new one matures only THAT snapshot is read from the DB. This is the
+    whole point of caching per snapshot rather than per table.
+    """
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    df = _multi_snapshot_frame()
+
+    conn = _FakeConn(df)
+    first, _ = DataLoader(conn).load_train_portfolios(
+        use_cache=True, grain="loan", feature_order=FEATURE_ORDER)
+    assert conn.queries == [[20250131], [20250228], [20250331]]
+
+    # Second run, same snapshots: served entirely from disk.
+    conn2 = _FakeConn(df)
+    second, _ = DataLoader(conn2).load_train_portfolios(
+        use_cache=True, grain="loan", feature_order=FEATURE_ORDER)
+    assert conn2.queries == []
+    _instances_equal(second, first)
+
+    # A fourth snapshot matures: exactly one new DB read.
+    extra = _contract_frame(120, seed=0)
+    extra[config.SNAPSHOT_COL] = 20250430.0
+    extra[config.HORIZON_COL] = 20250731
+    conn3 = _FakeConn(pd.concat([df, extra], ignore_index=True))
+    grown, _ = DataLoader(conn3).load_train_portfolios(
+        use_cache=True, grain="loan", feature_order=FEATURE_ORDER)
+    assert conn3.queries == [[20250430]]
+    assert len(grown) == len(first) + 120
+
+
+def test_immature_pred_cache_is_rebuilt_on_a_new_etl_run(tmp_path, monkeypatch):
+    """
+    The ETL rewrites the newest 7 snapshots every month, so a cached immature
+    snapshot is only good for the ETL cycle that produced it. Reusing it past
+    that serves last month's rows under this month's snapshot date.
+    """
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    df = _multi_snapshot_frame(snaps=(20260831.0,), horizon=20270228)  # immature
+
+    conn = _FakeConn(df, etl_run="20260901")
+    DataLoader(conn).load_pred_portfolios(20260831, use_cache=True, grain="loan",
+                                          feature_order=FEATURE_ORDER)
+    assert conn.queries == [[20260831]]
+
+    # Same ETL cycle -> cache hit.
+    conn2 = _FakeConn(df, etl_run="20260901")
+    DataLoader(conn2).load_pred_portfolios(20260831, use_cache=True, grain="loan",
+                                           feature_order=FEATURE_ORDER)
+    assert conn2.queries == []
+
+    # Next monthly load -> the snapshot was recomputed upstream, re-read it.
+    conn3 = _FakeConn(df, etl_run="20261001")
+    DataLoader(conn3).load_pred_portfolios(20260831, use_cache=True, grain="loan",
+                                           feature_order=FEATURE_ORDER)
+    assert conn3.queries == [[20260831]]
+
+
+def test_load_cached_arrays_rebases_offsets_across_snapshots(tmp_path, monkeypatch):
+    """
+    The diagnostics read the cache as flat arrays. Each snapshot's NPZ has its
+    own offsets starting at 0, so joining them requires shifting by the running
+    loan count — get that wrong and every portfolio after the first snapshot
+    slices the wrong rows, silently. Portfolio grain (variable group sizes) is
+    the case that can actually be wrong.
+    """
+    from src.data.data_loader import load_cached_arrays, train_cache_dir
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    df = _multi_snapshot_frame()
+
+    instances, _ = DataLoader(_FakeConn(df)).load_train_portfolios(
+        use_cache=True, grain="portfolio", feature_order=FEATURE_ORDER)
+
+    arrays, feat_cols = load_cached_arrays(train_cache_dir(grain="portfolio"))
+    assert feat_cols == FEATURE_ORDER
+    assert len(arrays["offsets"]) == len(instances) + 1
+    assert arrays["offsets"][0] == 0
+    assert arrays["offsets"][-1] == arrays["features_flat"].shape[0] == len(df)
+
+    flat, offsets = arrays["features_flat"], arrays["offsets"]
+    for i, inst in enumerate(instances):
+        np.testing.assert_array_equal(flat[offsets[i]:offsets[i + 1]], inst["features"])
