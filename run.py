@@ -709,7 +709,7 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
 
     # ── Stage 1: Load data ────────────────────────────────────────────────────
     # Deliberately NOT checkpointed via joblib: the NPZ cache
-    # (train_portfolios_cache.npz) already makes this call fast (~30-60s).
+    # (data/snapshots/train_<key>/) already makes this call fast (~30-60s).
     # Pickling 10M+ per-instance dicts here used to cost 15-30+ MINUTES to
     # save (and as long again to load back on --resume) — strictly worse
     # than just recomputing every time.

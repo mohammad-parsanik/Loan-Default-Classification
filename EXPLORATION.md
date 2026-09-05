@@ -49,9 +49,9 @@ label window includes the current month).
 
 ### Inputs / Outputs
 
-- Input: `data/train_portfolios_cache.npz` (run `python run.py train` once
-  to generate it; **matured snapshots only** — instances from an
-  immature/not-yet-labeled snapshot are automatically excluded).
+- Input: the per-snapshot cache `data/snapshots/train_<key>/` (run
+  `python run.py train` once to generate it; **matured snapshots only** —
+  the training cache holds nothing else). Override with `--cache_dir`.
 - Output: `explore_output/iv_report.csv`, `iv_chart.png`,
   `woe_detail_<feature>.png` (per top-N feature).
 
@@ -192,8 +192,8 @@ immature rows carry a systematically optimistic label that would bias every
 
 ### Inputs / Outputs
 
-Reads `data/train_portfolios_cache.npz` + its `.manifest.json`. No DB, no
-model, no bundle. Writes `explore_output/clip_impact.csv` and prints the
+Reads the per-snapshot cache `data/snapshots/train_<key>/` (override with
+`--cache`). No DB, no model, no bundle. Writes `explore_output/clip_impact.csv` and prints the
 same table.
 
 ```bash
