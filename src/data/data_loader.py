@@ -87,6 +87,38 @@ def _cache_is_valid(cache_path: Path, key: str) -> bool:
         return False
 
 
+def _cache_dir(stage: str, key: str) -> Path:
+    """
+    Directory holding one NPZ per snapshot for a given (stage, schema key).
+
+    Snapshots are cached individually because that is how the upstream ETL
+    treats them. Each monthly load recomputes the last 7 snapshots: the newest
+    (T) is fresh, the oldest of the seven (T-7) has just matured, and the ones
+    between are rewritten without changing anything the ML side reads. A
+    matured snapshot is never touched again, so its NPZ is permanent; an
+    immature one is provisional and gets rewritten until it matures. One
+    monolithic cache file cannot express either half — a single new snapshot
+    forced a full rebuild of all ~40M rows, and a rewritten immature snapshot
+    was invisible.
+    """
+    return config.DATA_DIR / "snapshots" / f"{stage}_{key}"
+
+
+def _snapshot_npz(cache_dir: Path, snapshot: int) -> Path:
+    return cache_dir / f"{int(snapshot)}.npz"
+
+
+def _cached_snapshots(cache_dir: Path, key: str) -> list[int]:
+    """Snapshots present in `cache_dir` with a manifest matching `key`."""
+    if not cache_dir.is_dir():
+        return []
+    found = []
+    for npz in cache_dir.glob("*.npz"):
+        if npz.stem.isdigit() and _cache_is_valid(npz, key):
+            found.append(int(npz.stem))
+    return sorted(found)
+
+
 def _write_manifest(cache_path: Path, key: str, meta: dict) -> None:
     manifest = _manifest_path(cache_path)
     with open(manifest, "w") as f:
@@ -361,9 +393,10 @@ class DataLoader:
         feature_cols: list[str],
         max_loans: int,
         key: str,
+        meta: Optional[dict] = None,
     ) -> None:
         """
-        Save instances as a compact NPZ file.
+        Save one snapshot's instances as an NPZ file.
         Structure:
           features_flat : (N_total_loans, N_features)  — all loan arrays stacked
           offsets       : (N_instances + 1,)            — cumsum for slicing
@@ -374,10 +407,22 @@ class DataLoader:
           feature_cols  : serialised as JSON in separate manifest
         """
         logger.info(f"Saving portfolio cache to {cache_path}…")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        features_flat = np.vstack([inst["features"] for inst in instances])
-        sizes = np.array([inst["features"].shape[0] for inst in instances], dtype=np.int32)
+        # Fill a preallocated block rather than np.vstack-ing the per-instance
+        # arrays: at loan grain there are tens of millions of (1, F) slices,
+        # and vstack builds an atleast_2d list over all of them and its own
+        # concatenate temporary before returning the same block.
+        sizes = np.fromiter(
+            (inst["features"].shape[0] for inst in instances),
+            dtype=np.int64, count=len(instances),
+        )
         offsets = np.concatenate([[0], np.cumsum(sizes)])
+        features_flat = np.empty(
+            (int(offsets[-1]), instances[0]["features"].shape[1]), dtype=np.float32
+        )
+        for inst, start, end in zip(instances, offsets[:-1], offsets[1:]):
+            features_flat[start:end] = inst["features"]
         labels  = np.array([inst["label"] for inst in instances], dtype=np.int32)
         current_cats = np.array([inst["current_cat"] for inst in instances], dtype=np.int32)
         n_loans = np.array([inst["n_loans"] for inst in instances], dtype=np.int32)
@@ -389,7 +434,10 @@ class DataLoader:
             dtype=np.int32,
         )
 
-        np.savez_compressed(
+        # Uncompressed on purpose: at the >=7B population features_flat is
+        # several GB, and single-threaded zlib over it costs tens of minutes
+        # on every rebuild to save a few GB of disk. np.load reads either.
+        np.savez(
             cache_path,
             features_flat=features_flat,
             offsets=offsets,
@@ -411,9 +459,19 @@ class DataLoader:
              # this machine) can still tell a matured snapshot from an
              # immature one without re-deriving it from the wall clock.
              "label_horizons": {str(k): int(v)
-                                for k, v in temporal_split.LABEL_HORIZONS.items()}},
+                                for k, v in temporal_split.LABEL_HORIZONS.items()},
+             **(meta or {})},
         )
         logger.info(f"Cache saved ({cache_path.stat().st_size / 1e6:.1f} MB).")
+
+    def _maybe_conn(self):
+        """Like _get_conn, but returns (None, False) when there is no DB on this
+        machine — a cached snapshot directory is then the only source."""
+        try:
+            return self._get_conn()
+        except Exception as e:
+            logger.info(f"No DB connection ({e}) — cache-only.")
+            return None, False
 
     def _load_cache(self, cache_path: Path) -> tuple[list[dict], list[str]]:
         """Restore instances from NPZ cache."""
@@ -464,39 +522,109 @@ class DataLoader:
         Load training data from MSSQL → instances at `grain`
         (default config.PREDICTION_GRAIN). Returns (instances, feature_names).
 
+        Snapshots are read and vectorised ONE AT A TIME, never as a single
+        `SELECT *` over the whole table. At the ≤7B population the table is
+        ~43M rows; one fetchall of that is tens of GB of pyodbc row objects
+        before pandas even builds the frame, and the sort/coerce steps in
+        process_raw_data each copy it again. Per snapshot the peak is ~1/20th
+        of that, and the result is identical: instances group by
+        (customer, snapshot), so no group can span a snapshot boundary.
+        What per-snapshot processing does NOT preserve on its own is the
+        canonical INSTANCE order — see _canonical_order.
+
+        Only mature snapshots are read; the split discards immature ones
+        anyway, so loading them was ~25% of the rows for nothing. Each mature
+        snapshot is cached as its OWN NPZ (see _cache_dir) and is permanent —
+        a matured snapshot never changes upstream — so next month's run reads
+        one new snapshot from the DB and the rest from disk.
+
+        Instance order is (SNAPSHOT_DATE, NATIONAL_CODE, DPD_DAYS desc,
+        LOAN_ID): snapshots are processed in ascending order and
+        process_raw_data sorts within each. That is a function of the data
+        alone, which is what order independence requires — the previous
+        customer-major order was one valid choice of canonical order, not the
+        requirement itself, and snapshot-major is the order per-snapshot
+        caching produces for free.
+
         Cache is invalidated when:
           - DATA_VERSION changes in project_config.py
           - Table name, META_COLS, or DB name changes
           - the column contract changes (version, or the feature list/order)
           - max_loans or the grain changes
+        A snapshot that has since matured is simply a file that is not there.
         """
         extra = str(max_loans or "auto")
         key   = _cache_key(extra, grain, feature_order)
-        cache_path = config.DATA_DIR / "train_portfolios_cache.npz"
+        cache_dir = _cache_dir("train", key)
 
-        if use_cache and _cache_is_valid(cache_path, key):
-            return self._load_cache(cache_path)
-
-        if use_cache and cache_path.exists():
-            logger.info("Cache key mismatch — regenerating portfolio cache.")
-
-        conn, close_conn = self._get_conn()
+        conn, close_conn = self._maybe_conn()
         try:
-            self._warn_on_failed_etl_runs(conn)
-            df = conn.load_training_data(snapshot_dates=snapshot_dates)
-            df = self._ingest_checks(df)
-            instances, feature_cols = self.process_raw_data(
-                df, max_loans, grain, feature_order=feature_order or FEATURE_ORDER
-            )
-            if use_cache:
-                ml = max_loans or (
-                    int(np.percentile([i["n_loans"] for i in instances], 99))
-                )
-                self._save_cache(cache_path, instances, feature_cols, ml, key)
+            snaps = self._training_snapshots(conn, cache_dir, key, snapshot_dates)
+
+            instances: list[dict] = []
+            feature_cols: list[str] = []
+            for n, snap in enumerate(snaps, 1):
+                npz = _snapshot_npz(cache_dir, snap)
+                if use_cache and _cache_is_valid(npz, key):
+                    part, feature_cols = self._load_cache(npz)
+                else:
+                    if conn is None:
+                        raise RuntimeError(
+                            f"Snapshot {snap} is not cached and no DB connection "
+                            "is available to read it."
+                        )
+                    logger.info(f"Snapshot {snap} ({n}/{len(snaps)}) — reading from DB…")
+                    df = conn.load_training_data(snapshot_dates=[snap])
+                    df = self._ingest_checks(df)
+                    part, feature_cols = self.process_raw_data(
+                        df, max_loans, grain, feature_order=feature_order or FEATURE_ORDER
+                    )
+                    del df
+                    if use_cache and part:
+                        ml = max_loans or (
+                            int(np.percentile([i["n_loans"] for i in part], 99))
+                        )
+                        self._save_cache(npz, part, feature_cols, ml, key,
+                                         meta={"snapshot": int(snap), "mature": True})
+                instances.extend(part)
+
+            logger.info(f"{len(instances):,} instances from {len(snaps)} snapshot(s).")
             return instances, feature_cols
         finally:
-            if close_conn:
+            if close_conn and conn is not None:
                 conn.close()
+
+    def _training_snapshots(self, conn, cache_dir: Path, key: str,
+                            requested: Optional[list] = None) -> list:
+        """
+        The snapshots to train on, ascending: `requested` if the caller named
+        them, else every mature snapshot in the table. With no DB reachable
+        (a dev machine with a copied cache directory) it is whatever the cache
+        holds.
+        """
+        if requested:
+            return sorted(int(s) for s in requested)
+
+        if conn is None:
+            snaps = _cached_snapshots(cache_dir, key)
+            if not snaps:
+                raise RuntimeError(
+                    f"No DB connection and no cached snapshots in {cache_dir}."
+                )
+            logger.info(f"No DB — using {len(snaps)} cached snapshot(s).")
+            return snaps
+
+        self._warn_on_failed_etl_runs(conn)
+        # Before anything else, so LABEL_HORIZONS knows about every snapshot in
+        # the table — including the immature ones we are about to skip.
+        self._register_horizons_from_db(conn)
+        snaps = filter_mature_snapshots(conn.get_available_snapshots())
+        if not snaps:
+            raise RuntimeError(
+                f"No mature snapshots in {config.TRAIN_TABLE} — nothing to train on."
+            )
+        logger.info(f"{len(snaps)} mature snapshot(s): {snaps[0]} … {snaps[-1]}")
+        return snaps
 
     def load_pred_portfolios(
         self,
@@ -512,16 +640,25 @@ class DataLoader:
         `feature_order` is the trained model's own feature list — pass it so a
         model older than the current contract keeps being fed exactly the
         columns it was fitted on. Defaults to the contract's order.
-        """
-        extra = f"pred_{snapshot_date}_{max_loans or 'auto'}"
-        key   = _cache_key(extra, grain, feature_order)
-        cache_path = config.DATA_DIR / f"pred_portfolios_cache_{snapshot_date}.npz"
 
-        if use_cache and _cache_is_valid(cache_path, key):
-            return self._load_cache(cache_path)
+        Scoring targets immature snapshots, and the ETL rewrites the newest 7
+        of those on every monthly load — so unlike a mature snapshot's cache,
+        this one is PROVISIONAL. It is reused only while the ETL run that
+        produced it is still the newest successful one; after the next load it
+        is rewritten. If the job ledger cannot be read the run tag is unknown,
+        and an immature snapshot is then re-read from the DB every time rather
+        than risk serving last month's rows.
+        """
+        extra = f"pred_{max_loans or 'auto'}"
+        key   = _cache_key(extra, grain, feature_order)
+        cache_dir = _cache_dir("pred", key)
+        npz = _snapshot_npz(cache_dir, snapshot_date)
 
         conn, close_conn = self._get_conn()
         try:
+            if use_cache and _cache_is_valid(npz, key) and self._pred_cache_is_fresh(npz, conn):
+                return self._load_cache(npz)
+
             df = conn.load_prediction_data(snapshot_date=snapshot_date)
             # TRAIN_TABLE carries WORST_FUTURE_CAT/DPD for every row, but on
             # an immature snapshot those values are degenerate ("worst
@@ -533,12 +670,53 @@ class DataLoader:
             instances, feature_cols = self.process_raw_data(
                 df, max_loans, grain, feature_order=feature_order or FEATURE_ORDER
             )
-            if use_cache:
-                self._save_cache(cache_path, instances, feature_cols, max_loans or 99, key)
+            if use_cache and instances:
+                mature = int(snapshot_date) in set(
+                    filter_mature_snapshots([int(snapshot_date)])
+                )
+                self._save_cache(
+                    npz, instances, feature_cols, max_loans or 99, key,
+                    meta={"snapshot": int(snapshot_date), "mature": mature,
+                          "etl_run": self._etl_run_tag(conn)},
+                )
             return instances, feature_cols
         finally:
             if close_conn:
                 conn.close()
+
+    @staticmethod
+    def _etl_run_tag(conn) -> Optional[str]:
+        """
+        The newest SUCCESSful upstream load, identifying the current ETL cycle;
+        None when the ledger is unreadable (no grant, table absent).
+        """
+        try:
+            runs = conn.get_etl_runs()
+        except Exception:
+            return None
+        ok = runs[runs["status"].astype(str).str.upper() == "SUCCESS"]
+        return None if ok.empty else str(ok.iloc[0]["snapshot_date"])
+
+    @classmethod
+    def _pred_cache_is_fresh(cls, npz: Path, conn) -> bool:
+        """A mature snapshot's cache is final; an immature one is only good for
+        the ETL cycle that built it."""
+        try:
+            with open(_manifest_path(npz)) as f:
+                manifest = json.load(f)
+        except Exception:
+            return False
+        if manifest.get("mature"):
+            return True
+        built = manifest.get("etl_run")
+        current = cls._etl_run_tag(conn)
+        if built is None or current is None or built != current:
+            logger.info(
+                f"{npz.name}: immature snapshot cached under ETL run {built!r}, "
+                f"current is {current!r} — re-reading from the DB."
+            )
+            return False
+        return True
 
     def resolve_pred_snapshots(self, requested: Optional[list] = None) -> list:
         """
@@ -648,6 +826,62 @@ class DataLoader:
             raise RuntimeError(
                 "pyodbc/MSSQL is unavailable on this machine and no valid "
                 "NPZ cache was found. Run on the training server, or copy "
-                "data/train_portfolios_cache.npz (+ manifest) here."
+                "data/snapshots/<stage>_<key>/ here."
             )
         return MSSQLConnector(), True
+
+
+# ── Raw-array access for the diagnostic scripts ───────────────────────────────
+
+def train_cache_dir(max_loans: Optional[int] = None, grain: Optional[str] = None,
+                    feature_order: Optional[list[str]] = None) -> Path:
+    """The directory load_train_portfolios caches into, for the given schema."""
+    return _cache_dir("train", _cache_key(str(max_loans or "auto"), grain, feature_order))
+
+
+def load_cached_arrays(cache_dir: Optional[Path] = None) -> tuple[dict, list[str]]:
+    """
+    The train cache as flat arrays — features_flat, offsets, labels,
+    current_cats, n_loans, national_codes, snapshot_dates, loan_ids,
+    portfolio_n_loans — concatenated across the per-snapshot NPZ files in
+    snapshot order, with `offsets` rebased so it indexes the joined block.
+
+    This is what the standalone diagnostics (explore_iv_woe, explore_umap,
+    explore_clip_impact) want: the arrays, not tens of millions of instance
+    dicts rebuilt from them. Label horizons are registered as a side effect,
+    so filter_mature_snapshots works afterwards without a DB.
+    """
+    cache_dir = cache_dir or train_cache_dir()
+    parts = sorted(
+        (p for p in cache_dir.glob("*.npz") if p.stem.isdigit()),
+        key=lambda p: int(p.stem),
+    ) if cache_dir.is_dir() else []
+    if not parts:
+        raise FileNotFoundError(
+            f"No cached snapshots in {cache_dir} — run `python run.py train` first."
+        )
+
+    stacked: dict[str, list] = {}
+    feature_cols: list[str] = []
+    row_base = 0
+    for npz_path in parts:
+        with np.load(npz_path, allow_pickle=True) as npz:
+            for name in npz.files:
+                arr = npz[name]
+                if name == "offsets":
+                    # Each file's offsets start at 0; drop that and shift.
+                    arr = arr[1:] + row_base
+                    row_base = int(arr[-1]) if len(arr) else row_base
+                stacked.setdefault(name, []).append(arr)
+        with open(_manifest_path(npz_path)) as f:
+            manifest = json.load(f)
+        feature_cols = manifest["feature_cols"]
+        register_label_horizons(manifest.get("label_horizons", {}))
+
+    arrays = {k: np.concatenate(v) for k, v in stacked.items()}
+    arrays["offsets"] = np.concatenate([[0], arrays["offsets"]])
+    logger.info(
+        f"Loaded {len(arrays['labels']):,} instances / "
+        f"{arrays['features_flat'].shape[0]:,} loans from {len(parts)} snapshot(s)."
+    )
+    return arrays, feature_cols

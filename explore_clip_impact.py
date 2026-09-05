@@ -19,7 +19,7 @@ With --baseline, also diffs p99 against an older cache, which is how you see
 a population change (e.g. a widened contract-amount filter) move the bounds.
 Copy the old cache aside BEFORE rebuilding — the path is reused.
 
-Inputs (no DB): data/train_portfolios_cache.npz + .manifest.json
+Inputs (no DB): data/snapshots/train_<key>/  (per-snapshot NPZ cache)
 Usage:
   python explore_clip_impact.py
   python explore_clip_impact.py --baseline data/cache_700m.npz
@@ -27,7 +27,6 @@ Usage:
 """
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -38,7 +37,8 @@ import pandas as pd
 sys.path.append(str(Path(__file__).resolve().parent))
 import project_config as config
 from src.data.column_contract import NO_CLIP
-from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
+from src.data.data_loader import load_cached_arrays
+from src.data.temporal_split import filter_mature_snapshots
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s",
                     datefmt="%H:%M:%S")
@@ -47,29 +47,23 @@ log = logging.getLogger(__name__)
 SEVERE_CLASS = config.NUM_CLASSES - 1
 
 
-def load_loan_rows(cache_path: Path):
+def load_loan_rows(cache_dir=None):
     """
     Returns (features_flat, severe_flag_per_row, feat_cols), mature rows only.
 
     Labels are per instance; features_flat is per loan. At loan grain that is
-    1:1, at portfolio grain a customer's label repeats across their loans —
+    1:1, at portfolio grain a customer's label repeats across their loans --
     np.repeat over the offsets covers both.
     """
-    manifest_path = cache_path.with_suffix(".manifest.json")
-    if not cache_path.exists():
-        log.error(f"Cache not found: {cache_path} — run `python run.py train` first.")
+    try:
+        arrays, feat_cols = load_cached_arrays(cache_dir)
+    except FileNotFoundError as e:
+        log.error(str(e))
         sys.exit(1)
-
-    with np.load(cache_path, allow_pickle=True) as npz:
-        features_flat  = npz["features_flat"]
-        offsets        = npz["offsets"]
-        labels         = npz["labels"]
-        snapshot_dates = npz["snapshot_dates"]
-
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-    feat_cols = manifest["feature_cols"]
-    register_label_horizons(manifest.get("label_horizons", {}))
+    features_flat  = arrays["features_flat"]
+    offsets        = arrays["offsets"]
+    labels         = arrays["labels"]
+    snapshot_dates = arrays["snapshot_dates"]
 
     sizes = np.diff(offsets)
     mature = set(filter_mature_snapshots(np.unique(snapshot_dates)))
@@ -79,7 +73,7 @@ def load_loan_rows(cache_path: Path):
 
     keep_rows = np.repeat(keep_inst, sizes)
     severe = np.repeat((labels == SEVERE_CLASS), sizes)[keep_rows]
-    log.info(f"{cache_path.name}: {keep_rows.sum():,} loan-rows, "
+    log.info(f"{keep_rows.sum():,} loan-rows, "
              f"{len(feat_cols)} features, severe base rate {severe.mean():.4%}")
     return features_flat[keep_rows], severe, feat_cols
 
@@ -122,7 +116,8 @@ def clip_report(flat, severe, feat_cols, only=None) -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache", default=str(config.DATA_DIR / "train_portfolios_cache.npz"))
+    ap.add_argument("--cache", default=None,
+                    help="per-snapshot cache dir (default: the current schema's)")
     ap.add_argument("--baseline", default=None,
                     help="older cache to diff p99 against (population-shift check)")
     ap.add_argument("--only", default=None, help="comma-separated feature subset")
@@ -132,7 +127,7 @@ def main():
     args = ap.parse_args()
 
     only = set(args.only.split(",")) if args.only else None
-    flat, severe, feat_cols = load_loan_rows(Path(args.cache))
+    flat, severe, feat_cols = load_loan_rows(Path(args.cache) if args.cache else None)
     rep = clip_report(flat, severe, feat_cols, only)
 
     if args.baseline:

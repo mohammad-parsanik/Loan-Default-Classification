@@ -31,7 +31,6 @@ Usage examples:
 """
 
 import argparse
-import json
 import logging
 import sys
 from datetime import datetime
@@ -40,6 +39,9 @@ from pathlib import Path
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parent))
+from src.data.data_loader import load_cached_arrays  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,24 +56,16 @@ CLASS_COLORS = ["#4C9BE8", "#F0A500", "#E84C4C", "#4CAF50"]
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_from_cache(data_dir: Path) -> tuple:
-    """Load and mean-pool portfolios from the NPZ cache."""
-    cache_path    = data_dir / "train_portfolios_cache.npz"
-    manifest_path = data_dir / "train_portfolios_cache.manifest.json"
-
-    if not cache_path.exists():
-        log.error(f"Cache not found: {cache_path}")
-        log.error("Run 'python run.py train' to generate the cache first.")
+def load_from_cache(cache_dir=None) -> tuple:
+    """Load and mean-pool portfolios from the per-snapshot NPZ cache."""
+    try:
+        arrays, feat_cols = load_cached_arrays(cache_dir)
+    except FileNotFoundError as e:
+        log.error(str(e))
         sys.exit(1)
-
-    log.info(f"Loading cache from {cache_path} ...")
-    with np.load(cache_path, allow_pickle=True) as npz:
-        features_flat = npz["features_flat"]  # (N_loans, F)
-        offsets       = npz["offsets"]         # (N_instances+1,)
-        labels        = npz["labels"]          # (N_instances,)
-
-    with open(manifest_path) as f:
-        feat_cols = json.load(f)["feature_cols"]
+    features_flat = arrays["features_flat"]   # (N_loans, F)
+    offsets       = arrays["offsets"]          # (N_instances+1,)
+    labels        = arrays["labels"]           # (N_instances,)
 
     log.info(f"Loaded {len(labels):,} instances, {len(feat_cols)} features. Mean-pooling portfolios ...")
     n_instances = len(offsets) - 1
@@ -246,7 +240,7 @@ def main():
     )
 
     # Paths
-    parser.add_argument("--data_dir",        type=Path, default=Path(__file__).parent / "data",
+    parser.add_argument("--cache_dir",       type=Path, default=None,
                         help="Directory containing NPZ cache (for --mode raw).")
     parser.add_argument("--embeddings_path", type=Path, default=None,
                         help="Path to .npy embeddings array (required for --mode embeddings).")
@@ -275,7 +269,7 @@ def main():
 
     # Load data
     if args.mode == "raw":
-        X, labels = load_from_cache(args.data_dir)
+        X, labels = load_from_cache(args.cache_dir)
     else:
         if args.embeddings_path is None or args.labels_path is None:
             parser.error("--mode embeddings requires --embeddings_path and --labels_path")

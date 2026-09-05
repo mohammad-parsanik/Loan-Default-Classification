@@ -9,8 +9,8 @@ Strategy: One-vs-Rest (OvR) for each of the config.NUM_CLASSES classes, e.g.:
   - OvR-2: "Past Due+"         vs  {No Delay, Current, Severe Past Due}
   - OvR-3: "Severe Past Due"   vs  {No Delay, Current, Past Due+}
 
-Inputs (no DB required -- reads from NPZ cache):
-  data/train_portfolios_cache.npz  +  data/train_portfolios_cache.manifest.json
+Inputs (no DB required -- reads the per-snapshot NPZ cache):
+  data/snapshots/train_<key>/<snapshot>.npz  (+ .manifest.json each)
 
 Outputs (in --output_dir, default: explore_output/):
   iv_report.csv            -- IV for every feature across all OvR problems
@@ -24,7 +24,6 @@ Usage examples:
 """
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -35,7 +34,8 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent))
 import project_config as config
-from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
+from src.data.data_loader import load_cached_arrays
+from src.data.temporal_split import filter_mature_snapshots
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,43 +50,26 @@ CLASS_NAMES = {0: "No Delay", 1: "Current", 2: "Past Due+", 3: "Severe Past Due"
 
 # ── Cache loading ─────────────────────────────────────────────────────────────
 
-def load_cache(data_dir: Path):
+def load_cache(cache_dir=None):
     """
     Returns:
         features_flat  : (N_total_loans, F)  float32
-        offsets        : (N_instances+1,)    int32
+        offsets        : (N_instances+1,)    int64
         labels         : (N_instances,)      int32
         snapshot_dates : (N_instances,)      object
         feat_cols      : list[str]
+
+    Concatenated across the per-snapshot cache files; label horizons are
+    registered as a side effect, which is how filter_matured_instances below
+    tells a real label from a systematically optimistic one.
     """
-    cache_path    = data_dir / "train_portfolios_cache.npz"
-    manifest_path = data_dir / "train_portfolios_cache.manifest.json"
-
-    if not cache_path.exists():
-        log.error(f"Cache not found: {cache_path}")
-        log.error("Run the training pipeline first (python run.py train) to generate the cache.")
+    try:
+        arrays, feat_cols = load_cached_arrays(cache_dir)
+    except FileNotFoundError as e:
+        log.error(str(e))
         sys.exit(1)
-
-    log.info(f"Loading cache from {cache_path} ...")
-    with np.load(cache_path, allow_pickle=True) as npz:
-        features_flat  = npz["features_flat"]
-        offsets        = npz["offsets"]
-        labels         = npz["labels"]
-        snapshot_dates = npz["snapshot_dates"]
-
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-    feat_cols = manifest["feature_cols"]
-    # The manifest carries each snapshot's LABEL_HORIZON_DATE, which is how
-    # filter_matured_instances below tells a real label from a systematically
-    # optimistic one. Without it that falls back to the calendar rule.
-    register_label_horizons(manifest.get("label_horizons", {}))
-
-    log.info(
-        f"Loaded {len(labels):,} portfolio instances, "
-        f"{features_flat.shape[0]:,} loans, {len(feat_cols)} features."
-    )
-    return features_flat, offsets, labels, snapshot_dates, feat_cols
+    return (arrays["features_flat"], arrays["offsets"], arrays["labels"],
+            arrays["snapshot_dates"], feat_cols)
 
 
 def build_portfolio_means(features_flat: np.ndarray, offsets: np.ndarray) -> np.ndarray:
@@ -353,7 +336,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compute OvR IV/WoE for all features. Reads from NPZ cache."
     )
-    parser.add_argument("--data_dir",    type=Path, default=Path(__file__).parent / "data",
+    parser.add_argument("--cache_dir",   type=Path, default=None,
                         help="Directory containing the NPZ cache (default: ./data/)")
     parser.add_argument("--output_dir",  type=Path, default=Path(__file__).parent / "explore_output",
                         help="Output directory (default: ./explore_output/)")
@@ -366,7 +349,7 @@ def main():
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    features_flat, offsets, labels, snapshot_dates, feat_cols = load_cache(args.data_dir)
+    features_flat, offsets, labels, snapshot_dates, feat_cols = load_cache(args.cache_dir)
     X_mean = build_portfolio_means(features_flat, offsets)
     X_mean, labels = filter_matured_instances(X_mean, labels, snapshot_dates)
 
