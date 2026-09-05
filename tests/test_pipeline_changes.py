@@ -1398,3 +1398,35 @@ def test_full_evaluation_reports_single_loan_slice():
 
     # Omitting portfolio_sizes leaves the block out entirely (back-compatible).
     assert "ranking_single_loan" not in full_evaluation(y, probs, strata=strata)
+
+
+# ── explore_snapshot_drift: trend detection (§24) ─────────────────────────────
+
+def test_spearman_vs_order_handles_ties_and_constants():
+    """
+    The deletion signature (§24) is read off a Spearman rho against snapshot
+    order, so a rho that lies is worse than no rho at all.
+
+    Ranking with argsort(argsort(x)) breaks ties by POSITION, which hands a
+    constant series a fake perfect ranking and reports rho = +1.0 -- i.e. "this
+    feature rises monotonically with snapshot recency" for a feature that never
+    moves. Average ranks plus a constant guard are what stop that.
+    """
+    import numpy as np
+    from explore_snapshot_drift import _spearman_vs_order as rho
+
+    assert rho(np.array([1., 2, 3, 4, 5])) == pytest.approx(1.0)
+    assert rho(np.array([5., 4, 3, 2, 1])) == pytest.approx(-1.0)
+
+    # The regression: a flat series has no trend, and must not report one.
+    assert np.isnan(rho(np.array([2., 2, 2, 2, 2])))
+
+    # Ties inside a real trend are averaged, not order-broken.
+    assert rho(np.array([1., 1, 2, 2, 3])) == pytest.approx(0.9487, abs=1e-3)
+
+    # Too few points, or nothing finite, is unknown rather than zero.
+    assert np.isnan(rho(np.array([1., 2])))
+    assert np.isnan(rho(np.array([np.nan] * 5)))
+
+    # The Run-7 severe-rate windows: 8.37% -> 9.96% -> 12.95%.
+    assert rho(np.array([0.0837, 0.0996, 0.1295])) == pytest.approx(1.0)

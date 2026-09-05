@@ -28,20 +28,28 @@ A bank needs to predict the **worst future delinquency state** of a customer's e
 - After the first database load, portfolios are cached to disk **one NPZ per snapshot** under `data/snapshots/<stage>_<key>/`, each with its own manifest for cache invalidation (`DATA_VERSION` in config). Subsequent runs load from this cache instead of hitting the DB. Snapshot-level granularity mirrors the ETL: a matured snapshot is never recomputed upstream so its file is permanent, while the newest 7 (immature) snapshots are rewritten on every monthly load and their caches are provisional.
 
 ### Snapshots & Timeline
-The data contains **8 raw snapshot dates** in format `YYYYMMDD` as floats:
+Snapshot dates are `YYYYMMDD` floats. The figures below are **what Run 7 actually
+loaded on 2026-09-05** (§23); they move every month as snapshots mature, so read
+them from the run log rather than from this table.
 
-| Snapshot | Date | Status |
-|----------|------|--------|
-| S1 | `20241021` | Usable — used for training |
-| S2 | `20250119` | Usable — used for training |
-| S3 | `20250420` | Usable — used for training |
-| S4 | `20250621` | Usable — dropped (within 6-month gap window before val/test) |
-| S5 | `20250922` | Usable — dropped (within 6-month gap window before val/test) |
-| S6 | `20251022` | Usable — used as Val (when enabled) |
-| S7 | `20251121` | Usable — used as Test |
-| S8 | `20260521` | **Dropped** — labels not yet mature (< 6 months old) |
+| | |
+|---|---|
+| Rows in `D_ANALYTICS.EDP_LOAN_FEATURES` | ~42.7 M (all snapshots, mature + immature) |
+| Mature snapshots loaded | **23**, `20240419` … `20260219` |
+| Mature loan instances | **32,538,715** |
+| Columns | 71 contract columns = 64 features + 7 meta |
+| Train / Val / Test instances | 16,872,770 / 4,204,534 / 1,655,036 |
 
-Total usable span: ~13 months (Oct 2024 – Nov 2025). Total volume: **~5 million** customer-portfolio instances across all usable snapshots, **~64 features** per loan.
+Run 7's split shape: test is the newest mature snapshot (`20260219`); the six
+snapshots from `20250822` to `20260120` are dropped to enforce the 6-month label
+gap; the remaining 16 (`20240419`…`20250722`) are train, from which the
+customer-disjoint 20% validation carve-out is taken. `VAL_SPLIT_MODE="customer"`
+is why the log's "Val snapshots" line is empty — that is correct, not a bug.
+
+Both ends of the range have moved since earlier runs: the ≤7B rebuild (§21)
+backfilled history to 2024-04, and calendar time keeps maturing snapshots at the
+front. The pre-rebuild 8-snapshot / ~5 M-instance shape this section used to
+document is gone, and is not a baseline for anything (§20, §21).
 
 ### Feature Schema
 All **~64 features are strictly numeric**. No categorical features exist in this dataset. Features are grouped into:
@@ -63,7 +71,9 @@ Meta/excluded columns (`META_COLS` in config): `LOAN_ID`, `CONTRACT_NUMBER`, `NA
 > **Note:** `RECORD_STATUS_CODE` was originally in META_COLS but was removed — the column does not exist in the current dataset. If it reappears, check with stakeholders whether inactive/closed records should be filtered.
 
 ### Critical Data Shape: MAX_LOANS = 2
-Data profiling revealed the **99th percentile of loans per customer is 2**. The vast majority of customers have only 1 active loan. This has major architectural implications (see Section 3).
+Data profiling revealed the **99th percentile of loans per customer is 2**. The vast majority of customers have only 1 active loan. This has major architectural implications (see Section 3) — it is why DeepSets ≈ baseline and why attention was abandoned.
+
+At `PREDICTION_GRAIN="loan"` (the default since §19) the runtime value is mechanically **1** — one loan per instance, nothing to truncate — as Run 7's log shows. `MAX_LOANS_PER_CUSTOMER` is inert there; it only gates the legacy DeepSets padding width. The "2" above is the portfolio-grain figure and the reason the portfolio detour bought so little.
 
 ---
 
@@ -265,7 +275,7 @@ Four standalone scripts exist in the project root for data quality analysis. The
 | `explore_iv_woe.py` | Information Value & Weight of Evidence per feature, One-vs-Rest for all `config.NUM_CLASSES` classes. Reads from NPZ cache (no DB needed). |
 | `explore_umap.py` | UMAP projection of raw features or model embeddings with CLI-tunable hyperparameters. |
 | `explore_shap.py` | SHAP TreeExplainer on XGBoost meta-learner. Needs `.npy` embeddings copied from the training server. |
-| `explore_clip_impact.py` | Whether `OutlierClipper`'s `[p1, p99]` clip merges away a risk-bearing tail. Reads `tail_lift` = `P(severe \| x > p99) / P(severe)`. Reads from NPZ cache (no DB needed). Added for the 700M→7B population widening (§21). |
+| `explore_clip_impact.py` | Whether `OutlierClipper`'s `[p1, p99]` clip merges away a risk-bearing tail. Reads `tail_lift` = `P(severe \| x > p99) / P(severe)`. Reads from NPZ cache (no DB needed). Added for the 700M→7B population widening (§21); first run in Run 7, which closed that question (§23). **Caveat:** it measures over all mature rows, not the ranked `current_cat < 3` population, so DPD-family features score at the ceiling for mechanical reasons — see §23. |
 
 **Key finding from IV analysis:** Top features (`LOAN_CATEGORY`, `DPD_DAYS`) had very high IV values (>0.50, which normally signals leakage). After investigation, the conclusion was these are **genuinely strong signals** — they're point-in-time observations available at prediction time. Note this is partly mechanical: DPD is a counter, so for already-delinquent customers the future label is largely predetermined by continued accrual. That is why evaluation is now also reported per current-category slice (the currently-clean slice is the real early-warning task).
 
@@ -294,9 +304,18 @@ Loan Default Classification/
 ├── contract/
 │   ├── columns.json               # ★ The feed's column contract — feature identity
 │   └── README.md                  # What it holds, what reads it, how to refresh it
-├── run.py                         # CLI entry point: train / predict / explore (604 lines)
+├── run.py                         # CLI entry point: train / predict / explore
+├── build_scoring_package.py       # Emit the ~21-file standalone scoring folder
+├── analyze_walk_forward.py        # Recover WF verdicts from fold_results.pkl
+├── explore_iv_woe.py              # ┐
+├── explore_umap.py                # │ standalone diagnostics, read the NPZ
+├── explore_shap.py                # │ cache, no DB needed (see EXPLORATION.md)
+├── explore_clip_impact.py         # ┘
 ├── requirements.txt               # Python dependencies
 ├── AGENT_HANDOFF.md               # This document
+├── CONFIG_REFERENCE.md            # Every project_config.py setting
+├── MODEL_EVALUATION.md            # How to judge a trained model's numbers
+├── DEPLOYMENT.md                  # train --final → bundle → predict runbook
 ├── column_changes.md              # Feature data dictionary (gitignored; the
 │                                  #   authoritative copy is etl_integration/)
 ├── leakage_analysis.md            # Detailed Val-Test leakage analysis
@@ -313,26 +332,31 @@ Loan Default Classification/
 │   │   ├── dataset.py             # PyTorch Dataset + padding/masking
 │   │   ├── preprocessing.py       # Impute → Clip → Scale pipeline
 │   │   └── temporal_split.py      # Static split + walk-forward fold generation
-│   ├── model/
-│   │   ├── deep_sets.py           # ★ Active model (42K params)
-│   │   ├── losses.py              # Cost-Sensitive Focal Loss
-│   │   ├── meta_learner.py        # XGBoost on frozen embeddings + Optuna
-│   │   └── trainer.py             # Training loop with early stopping
+│   ├── model/                     # LEGACY — dead unless DEEPSETS_ENABLED=True
+│   │   ├── deep_sets.py           #   the neural arm (42K params), off by default
+│   │   ├── losses.py              #   Cost-Sensitive Focal Loss
+│   │   ├── meta_learner.py        #   XGBoost on frozen embeddings + Optuna
+│   │   └── trainer.py             #   `TransformerTrainer` — name only, no transformer
 │   ├── evaluation/
-│   │   ├── metrics.py             # Macro F1, QWK, Brier, Bootstrap CI
-│   │   ├── visualization.py       # Confusion matrix, ROC, UMAP, training curves
+│   │   ├── metrics.py             # full_evaluation: ranking + classification blocks
+│   │   ├── ranking.py             # ★ The deliverable's metrics: recall/lift@K, PR-AUC
+│   │   ├── calibration.py         # StratifiedCalibrator (per-current-cat isotonic)
+│   │   ├── decision.py            # mask_monotone, expected-cost decisions
+│   │   ├── visualization.py       # Confusion matrix, ROC, capture curves
 │   │   └── fold_aggregator.py     # Walk-forward fold metric aggregation
 │   ├── baselines/
-│   │   └── aggregated_xgboost.py  # Statistical aggregation + XGBoost baseline
+│   │   └── aggregated_xgboost.py  # ★ THE DEPLOYED MODEL — the four arms + ARM_BUILDERS
 │   └── inference/
-│       ├── predictor.py           # End-to-end scoring pipeline
-│       └── model_loader.py        # Load saved artifacts
+│       ├── predictor.py           # score_instances: calibrate → mask → flag → rank
+│       ├── model_loader.py        # Load bundle or fold dir → (scorer, calibrator, features)
+│       ├── scoring.py             # run_scoring(df, params) — manager-code entry point
+│       └── scoring_params.py      # ScoringParams: explicit knobs + warned config fallback
 │
-├── data/                          # NPZ cache + manifest
+├── data/snapshots/<stage>_<key>/  # NPZ cache, one file + manifest per snapshot
 ├── artifacts/                     # Per-run artifacts (models, plots, reports)
-├── results_1/                     # Logs + plots from Run 1 (initial 5-snapshot run)
-├── results_2/                     # Log from Run 2 (walk-forward attempt, 7 snapshots)
-├── results_3/                     # Log from Run 3 (leakage-free run)
+├── results_1/ … results_6/        # Runs 1–6 — DEAD as a baseline (§20, §21)
+├── results_7/                     # ★ Run 7 (§23): the current baseline. Partial
+│                                  #   console log + clip_impact.csv only
 └── tests/                         # Unit + integration tests
     ├── test_pipeline_changes.py   # The main suite
     └── test_order_independence.py # Permute an input, assert the output is unchanged
@@ -342,18 +366,18 @@ Loan Default Classification/
 
 ## 10. Known Issues & Gotchas
 
-1. **README.md is outdated.** It still references Oracle, `cx_Oracle`, and the Set-Transformer as the active model. The actual DB is MSSQL/pyodbc, and the active model is DeepSets.
+1. **The active model is XGBoost, not DeepSets.** `src/baselines/aggregated_xgboost.py`, arm `"multiclass"`. DeepSets lost the Run-5/Run-6 shootouts and is off by default (`DEEPSETS_ENABLED=False`, §13/§15); it also now *raises* unless `PREDICTION_GRAIN="portfolio"`. Any document in this repo calling DeepSets or the Set-Transformer "active" predates July 2026 — that includes older passages of this file's §3, which is kept for the architecture history rather than as a statement of what runs. `README.md` was corrected in August 2026 (it once claimed Oracle/`cx_Oracle`; the DB is MSSQL/pyodbc).
 2. **`Implementation_plan.md` is the original design doc** — many details have evolved (DeepSets replaced Transformer, Oracle replaced by MSSQL, walk-forward added then found infeasible). Treat it as historical context, not current truth.
 3. **`set_transformer.py` was deleted** (July 26, 2026) — it was never imported by `run.py`. The neural path is `deep_sets.py`; the deployed model is `src/baselines/aggregated_xgboost.py`.
 4. **Snapshot dates are stored as floats** (e.g., `20241021.0`), not integers or datetime. All temporal logic in `temporal_split.py` converts them to `datetime.date` for gap calculations.
-5. **The baseline consistently matches or beats DeepSets+XGB on Macro F1.** This is expected with MAX_LOANS=2. The DeepSets model's Cat-2 recall advantage (87% vs 76-78% in Runs 2-3) was **confounded**: the DeepSets had a cost-sensitive loss while the baseline used plain argmax. Since July 7, 2026 both systems are evaluated under the same expected-cost decision rule (`cost_rule` metrics) — use those for architecture comparisons.
+5. **The baseline consistently matches or beats DeepSets+XGB.** This is expected with MAX_LOANS=2. The DeepSets model's early Cat-2 recall advantage (87% vs 76-78% in Runs 2-3) was **confounded**: DeepSets had a cost-sensitive loss while the baseline used plain argmax. Since July 7, 2026 both are evaluated under the same expected-cost decision rule (`cost_rule` metrics). Run 5 then settled it on the metric that actually matters — ranking, on every slice — which is why the architecture question is closed (§13).
 6. **`torch.compile` is disabled on the Windows training server** (inductor requires MSVC). The model runs in eager mode.
 7. **Label-informed truncation bug (FIXED July 7, 2026):** `process_raw_data` used to sort each customer's loans by `WORST_FUTURE_DPD` (a label) before `MAX_LOANS` truncation — the label selected which loans the model saw, and the predict path crashed because `EDP_Feature_pred` has no `WORST_FUTURE_*` columns. Now sorts by `DPD_DAYS` desc in both paths; unlabelled tables get `label = -1`. Requires cache rebuild (`DATA_VERSION` v1.1).
 8. **`EDP_Feature_pred` never existed as a separate table (FIXED July 7, 2026):** the live DB has one table (`TRAIN_TABLE`) holding matured snapshots plus the newest not-yet-matured one(s). `PRED_TABLE` is gone; `Predictor` now reads `TRAIN_TABLE` for prediction too. Because that table carries `WORST_FUTURE_CAT`/`WORST_FUTURE_DPD` for every row, an immature snapshot's label columns hold a **degenerate** value ("worst category observed so far", not the real future outcome) rather than being absent/NULL — `DataLoader.load_pred_portfolios` now drops those columns before `process_raw_data` so they can't masquerade as real labels.
 
 ---
 
-## 11. Changes of July 7-8, 2026 (methodology overhaul + 4-class bump — not yet run on server)
+## 11. Changes of July 7-8, 2026 (methodology overhaul + 4-class bump — items 1-9 first ran in Run 4, §12; item 10 in Run 5, §13)
 
 All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB).
 
@@ -366,7 +390,7 @@ All verified by `tests/test_pipeline_changes.py` (7 tests, synthetic data, no DB
 7. **IV binning fixed** in `explore_iv_woe.py` (see §7 correction). `explore_output/iv_report.csv` is stale until re-run.
 8. Cost matrix consolidated into `project_config.COST_MATRIX` (was duplicated in `losses.py` and `metrics.py`).
 9. **Prediction unified onto `TRAIN_TABLE`, multi-snapshot + auto-selection** (`project_config.PRED_SNAPSHOT_DATES`, `MSSQLConnector.get_available_snapshots`, `DataLoader.resolve_pred_snapshots`, `Predictor.predict`): `PRED_TABLE`/`EDP_Feature_pred` removed. `--snapshot_date` (CLI, now `nargs="*"`) or `PRED_SNAPSHOT_DATES` (config) pick the snapshot(s) to score; unset or not-found dates fall back to every currently-immature snapshot, then to the single latest snapshot if even that's empty. `--output` is optional, defaulting to `<artifact_dir>/predictions/predictions_<tag>.csv`. See Gotcha 8 for the accompanying degenerate-label fix.
-10. **NUM_CLASSES 3 → 4, single-file deployment bundle (2026-07-08):** `config.NUM_CLASSES=4` — raw cats 0/1/2 pass through 1:1, raw cats 3-4 now collapse into a new class 3 ("Severe Past Due") instead of into class 2. `COST_MATRIX` is now 4×4 (class-3 row/col is a derived, not-yet-business-tuned placeholder — see the table above). Every hardcoded `3`/`range(3)` tied to class count was swept to `config.NUM_CLASSES` (`losses.py`, `deep_sets.py`, `meta_learner.py`, `aggregated_xgboost.py`, `metrics.py`, `visualization.py`, `explore_iv_woe.py`, `explore_shap.py`, `explore_umap.py`); `bootstrap_confidence_intervals` now tracks both `recall_class_2` and `recall_class_3`; `Predictor` emits a 4th probability column `P_SEVERE_PAST_DUE`. `DATA_VERSION` bumped to `v1.2` (labels are baked into the NPZ cache, so this forces a rebuild). Separately, `train_single_fold` now also writes `<fold_dir>/model_bundle.pkl` — everything `Predictor` needs (scaler, DeepSets state_dict + hparams, XGBoost raw model bytes, calibrator) in one file; `ModelLoader.load_pipeline()` dispatches to it when `artifact_dir` points at a file instead of a directory. Pure export convenience — the per-file directory artifacts are unchanged and still used in-pipeline. All verified locally via `tests/test_pipeline_changes.py` (20 tests, synthetic data, no DB) — **not yet run on the training server.**
+10. **NUM_CLASSES 3 → 4, single-file deployment bundle (2026-07-08):** `config.NUM_CLASSES=4` — raw cats 0/1/2 pass through 1:1, raw cats 3-4 now collapse into a new class 3 ("Severe Past Due") instead of into class 2. `COST_MATRIX` is now 4×4 (class-3 row/col is a derived, not-yet-business-tuned placeholder — see the table above). Every hardcoded `3`/`range(3)` tied to class count was swept to `config.NUM_CLASSES` (`losses.py`, `deep_sets.py`, `meta_learner.py`, `aggregated_xgboost.py`, `metrics.py`, `visualization.py`, `explore_iv_woe.py`, `explore_shap.py`, `explore_umap.py`); `bootstrap_confidence_intervals` now tracks both `recall_class_2` and `recall_class_3`; `Predictor` emits a 4th probability column `P_SEVERE_PAST_DUE`. `DATA_VERSION` bumped to `v1.2` (labels are baked into the NPZ cache, so this forces a rebuild). Separately, `train_single_fold` now also writes `<fold_dir>/model_bundle.pkl` — everything `Predictor` needs (scaler, DeepSets state_dict + hparams, XGBoost raw model bytes, calibrator) in one file; `ModelLoader.load_pipeline()` dispatches to it when `artifact_dir` points at a file instead of a directory. Pure export convenience — the per-file directory artifacts are unchanged and still used in-pipeline. All verified locally via `tests/test_pipeline_changes.py` (20 tests, synthetic data, no DB); first run on the server in Run 5 (§13).
 
 ## 12. Objective Reframe & Ranked API Queue (July 8, 2026 — after Run 4)
 
@@ -471,14 +495,24 @@ All verified locally (new tests + full suite); see `tests/test_pipeline_changes.
 
 ## 18. What's Next (Prioritized)
 
-1. **Optuna** (optional): set `ARM_OPTUNA_TRIALS=20` for a tuned `--final` fit — headroom likely small given how tightly the arms cluster.
-2. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` on 2026-06 → queue CSV to the API caller at 240/h (`RISK_RANK` order). For the tech team's manager code: `build_scoring_package.py` → `run_scoring(df, ScoringParams(...))`.
-3. **Business items (non-blocking):** `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted; survivorship in the ETL sample remains the main open data question.
-4. **Nice-to-have:** update walk-forward's `build_fold_instances` to use customer-disjoint validation, matching the single-split path — only worth it if walk-forward becomes a routine check rather than an occasional one.
+*Rewritten 2026-09-05 after Run 7 (§23), reprioritised the same day after §24.*
+
+0. **Establish how much of the base-rate drift is retroactive source deletion (§24).** The severe rate runs 8.37% → 9.96% → 12.95% across the train / dropped / test windows, the ETL owner has confirmed hard deletion of closed and post-NPL installments, and one as-of rebuild of every snapshot makes old snapshots systematically depleted of exactly the class-3 rows. This gates what the training labels *mean*, so it comes before any modelling decision below — including item 2. Cheapest first move: `python explore_snapshot_drift.py` (cache only, no DB). Then a cohort-persistence count for `d(age)`. **Also: copy the snapshot cache aside before the next rebuild** — the two-vintage comparison, the conclusive test, was lost this cycle because the cache path is reused.
+1. **Pull Run 7's artifacts off the server.** `F:\EDP\Loan Default Classification\artifacts\20260905_133423\` — `metrics.json`, `arms_metrics.json`, `model_bundle.pkl`, `plots/`. `results_7/` currently holds only a partial console log (capture starts after the load stage) and `clip_impact.csv`; several questions below need numbers that log does not print, including the whole `ranking_single_loan` block and every bootstrap CI.
+2. **Settle `DEPLOY_ARM`.** Run 7 has `per_cat` beating the hard-locked `multiclass` on pooled AP (0.6721 vs 0.6555) *and* on the cat_0 early-warning slice (0.1780 vs 0.1460) — the exact slice the Run-6 lock was justified by (§23). One snapshot is not enough to reverse a verdict that §16 confirmed across 15 folds. Re-check with `WALK_FORWARD_ENABLED=True`, `MODEL_ARMS=["multiclass","per_cat"]`, then `analyze_walk_forward.py --min_train_snaps 3`. With 23 mature snapshots and a warm cache this is now an overnight job, not the 1.5–2 h/fold §16-era estimate.
+3. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` → queue CSV to the API caller at 240/h (`RISK_RANK` order). For the tech team's manager code: `build_scoring_package.py` → `run_scoring(df, ScoringParams(...))`.
+4. **Contract edits, batched — they bump `contract_version` and invalidate the whole cache, so they land together or not at all (§23):** `clip: false` on `COUNT_90PLUS_DPD_LAST_3M`, which `p1 == p99 == 0` currently reduces to a **constant** in all four arms; then the other bounded small counts (`max <= 14`, nothing to protect against); then `CATEGORY_TREND_1M`/`_3M` if the carve-aware rerun keeps them. If a rebuild is happening anyway, copy the old cache aside first (item 0).
+5. **Make `explore_clip_impact.py` carve-aware** (a `--ranked_only` flag mirroring `ranking_metrics`' `current_cat < CARVE_CURRENT_CAT_GE` filter) **and add a `head_lift` for the p1 side** — `PAYED_OVERDUE_INST_CNT` (`p1 = 3`) and `HIST_MAX_DPD_DAYS` (`p1 = 1`) are collapsing the clean end of the distribution, which is the `current_cat_0` population the whole task lives in, and nothing currently measures it. Small; the amount-feature question the tool was built for is already closed (§23), though §24 downgrades that answer to provisional.
+6. **Refit calibration on the newest mature snapshot** rather than on val (§24). Cheapest real mitigation for the drift, strictly an improvement, and it does not touch ranking. Not a substitute for item 0 — it corrects the output layer while the training labels stay depleted.
+7. **Before considering amount banding, test whether the interaction exists** (§24): add an amount-decile stratification to the ranking block, mirroring `by_current_cat` (`ranking_metrics` already takes `strata` and recurses). Flat lift@K across deciles ⇒ banding buys nothing, and a base-rate shift alone is one tree split. Don't build 2× the arms on a hunch.
+8. **Re-read `assert_feed_invariants`' load-stage output** against the ≤7B population — §21 flagged it and Run 7's captured log starts one stage too late to show it. Costs one `grep` of the next run's log.
+9. **Optuna** (optional): `ARM_OPTUNA_TRIALS=20` on the `--final` fit. All four Run-7 arms sit within ~1.7 pt pooled AP on `XGB_DEFAULTS`, so headroom is probably small — but it has never been measured on this population.
+10. **Business items (non-blocking):** exposure-weighted ranking (§21 — a 10× exposure range makes "every queue slot is worth the same" a real distortion now; raised with business, pending); `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted. *(Survivorship in the ETL sample is no longer an open question filed here — it is item 0 and §24.)*
+11. **Nice-to-have, promoted by item 2:** update walk-forward's `build_fold_instances` to use customer-disjoint validation, matching the single-split path (§16). §16 rated this low priority *because walk-forward was off by default* — if walk-forward is now going to decide the arm question, it should run the same validation scheme as the path it is deciding for.
 
 ---
 
-## 19. Prediction Grain: Customer → Loan (July 26, 2026 — not yet run on server)
+## 19. Prediction Grain: Customer → Loan (July 26, 2026 — first ran on the server in Run 7, §23)
 
 **Decision:** business wants risk and a prediction for **each individual loan**, so `PREDICTION_GRAIN = "loan"` is now the default. One scored row = one (`LOAN_ID`, `SNAPSHOT_DATE`).
 
@@ -504,11 +538,13 @@ All verified locally (new tests + full suite); see `tests/test_pipeline_changes.
 
 ---
 
-## 20. ETL Feed Alignment + Order Independence (August 26, 2026 — not yet run on server)
+## 20. ETL Feed Alignment + Order Independence (August 26, 2026 — first ran on the server in Run 7, §23)
 
 The upstream ETL was rebuilt. Two work orders landed together, because the column contract they share makes them one change: `etl_integration/SESSION_HANDOFF.md` (align with the new feed) and `etl_integration/ORDER_INDEPENDENCE_ML_PLAN.md` (stop depending on row/column order). Both are local-only documents; this section is the tracked record.
 
-**Still blocked, unchanged by any of this:** do **not** retrain, and do **not** compare any metric against `results_1`…`results_6`. The upstream validation gate has not passed and the 12-snapshot rebuild has not happened. Several features changed *meaning*, not just value, so a model trained on the new table is not comparable to one trained on the old — and the difference is not noise. Everything below is a correctness and reproducibility change to the code that *will* do that training; the point of landing it now is that the rebuild becomes the first result this project can reproduce.
+**Status (2026-09-05):** the block described below has lifted — the rebuild landed and Run 7 (§23) trained against it successfully. The *comparability* half of it has not and never will: **do not compare any metric against `results_1`…`results_6`.** Several features changed *meaning*, not just value, so a model trained on the new table is not comparable to one trained on the old, and the difference is not noise. §21 then added a second, independent reason (the population widened). Run 7 is the new baseline.
+
+*Original wording, kept because it states the reasoning:* "do not retrain, and do not compare any metric against `results_1`…`results_6`. The upstream validation gate has not passed and the 12-snapshot rebuild has not happened. […] Everything below is a correctness and reproducibility change to the code that *will* do that training; the point of landing it now is that the rebuild becomes the first result this project can reproduce." — that is exactly what happened.
 
 ### The table
 
@@ -560,7 +596,7 @@ Judge it on its own terms. `results_1`…`results_6` are not a baseline for it. 
 
 ---
 
-## 21. Population Widened: contract amount ≤ 700M → ≤ 7B (September 2, 2026 — not yet run on server)
+## 21. Population Widened: contract amount ≤ 700M → ≤ 7B (September 2, 2026 — first ran on the server in Run 7, §23)
 
 The ETL's `q1` scope filter changed. A loan enters a snapshot if its contract amount is **≤ 7,000,000,000** rials, where the ceiling used to be 700,000,000. Everything else about the filter is unchanged: first installment on or before T−6, last installment on or after T+6, monthly repayment schedule, individual customer.
 
@@ -583,13 +619,17 @@ The tables and **all** snapshots are being rebuilt under the new filter. This is
 
 This compounds with §20 — the feed alignment already made old results non-comparable because several features changed meaning. Two independent reasons now, same conclusion.
 
-### The clipping question (open, has a tool)
+### The clipping question — ANSWERED in Run 7 (§23): no change, leave `clip: true`
+
+> **Outcome first:** measured on the Run-7 cache, all three amount features have `tail_lift` **below 1.0** (`REMAINING_AMNT` 0.588, `UPCOMING_AMNT` 0.470, `PAYED_OVERDUE_AMNT` 0.264) — the tail the widening admitted is *less* likely to go severe than the population average. Large loans here are safer, not riskier. `clip: true` stays on all three. The reasoning below is retained because it is the template for the next time a feature's distribution moves; the numbers and the one remaining candidate are in §23.
 
 `OutlierClipper` clips every non-binary, non-`NO_CLIP` feature to `[p1, p99]` fit on train. **Clipping is the one preprocessing step XGBoost cannot shrug off.** Imputation and `PortfolioRobustScaler` are monotone and trees split on order, so they are invisible to the model; clipping merges every value above p99 into a single number and destroys the ordering up there.
 
 Three features are amount-scaled and inherit the 10× wider range directly: `PAYED_OVERDUE_AMNT` (8), `UPCOMING_AMNT` (14), `REMAINING_AMNT` (66). The concern is structural, not hypothetical: the newly admitted large loans are a *minority* sitting at the *top* of the distribution, which is precisely the region clipping flattens. If severe events concentrate there, the clip is deleting the signal the widening was meant to add. Note the shape of this is the same trap as the `DAYS_SINCE_LAST_*` sentinels in §20 — harmless in the columns where the extreme value is the majority, destructive where it is a minority — which is why it gets measured rather than assumed.
 
 **Not pre-emptively changed.** Setting `clip: false` on those three in `contract/columns.json` is a one-line fix and it is the wrong move to make blind: clipping exists because unbounded tails hurt, and the tail could as easily be noise as risk. Measure first with `explore_clip_impact.py`, then A/B on validation lift@K before committing. Whichever way it goes, changing a `clip` flag bumps `contract_version` and invalidates the cache on its own.
+
+**That is what happened, and "the tail could as easily be noise as risk" is the half that came true.** Had the flags been flipped pre-emptively the model would have gained three unbounded features for a tail that is *below* base rate. See §23 for the full table, for why the 22 features that tripped the tool's 1.5 warning threshold are mostly an artifact of measuring over the un-carved population, and for the one column (`CATEGORY_TREND_1M/3M`) still worth an A/B.
 
 ### Secondary consequences, no action
 
@@ -605,7 +645,7 @@ The queue ranks by P(severe) alone and `recall@K` counts loans, so a 7B loan and
 
 ---
 
-## 22. Load Stage Rebuilt for the ≤7B Row Volume (September 5, 2026 — not yet run on server)
+## 22. Load Stage Rebuilt for the ≤7B Row Volume (September 5, 2026 — held up in Run 7, §23)
 
 ### What happened
 
@@ -670,7 +710,12 @@ they would have before**, so a pre- and post-September-2026 run are not
 bit-comparable even on identical data. Accepted — `results_1`…`results_6` are
 already dead as a baseline (§21), so nothing was being compared against.
 
-### Residual risk — the next wall
+### Residual risk — the next wall (did NOT arrive in Run 7)
+
+> **Outcome:** Run 7 (§23) carried ~32.5 M loan instances through load, preprocessing
+> and four arms on the 128 GB server in 74 minutes without falling over. The
+> array-native refactor below stays unnecessary — keep it as the known fix if a
+> future population change pushes it over, not as pending work.
 
 The read is fixed; the **instance representation is not**. At loan grain,
 ~32M mature rows become ~32M instance dicts: roughly 19 GB of dict and array
@@ -697,3 +742,373 @@ costs exactly one DB read; an immature prediction cache is rebuilt when the ETL
 run tag moves and reused when it does not; `load_cached_arrays` rebases
 `offsets` correctly across snapshot files (portfolio grain, variable group
 sizes — the case that can silently be wrong).
+
+---
+
+## 23. Run 7 — First Result on the Rebuilt ≤7B Feed (September 5, 2026)
+
+Everything landed in §19–§22 has now actually run. Run 7 is the first end-to-end
+training pass against the rebuilt `D_ANALYTICS.EDP_LOAN_FEATURES` at loan grain,
+and it is **the project's new and only baseline** — `results_1`…`results_6` are
+dead for the two independent reasons in §20 (features changed meaning) and §21
+(the population widened).
+
+**What is local vs. what is on the server.** `results_7/` holds the console log
+*from the end of the load stage onward* and `clip_impact.csv`. The run's own
+artifacts — `metrics.json`, `arms_metrics.json`, `model_bundle.pkl`, the plots,
+the `ranking_single_loan` block and every bootstrap CI — are on the server under
+`artifacts/20260905_133423/` and have not been pulled. Everything below is read
+off the log and the CSV; anything not stated here needs those files.
+
+### It ran, and the §22 memory wall did not arrive
+
+| Stage | Wall time |
+|---|---|
+| Load — 23 mature snapshots, DB read + NPZ write | 2,271 s |
+| Temporal split | 38 s |
+| Preprocessing — fit on train, transform 22.7 M instances | 783 s |
+| Build features | 34 s |
+| Arms: multiclass / binary / ordinal / per_cat | 366 / 78 / 269 / 290 s |
+| Deployed-arm CI + plots | 316 s |
+| **Total** | **4,445 s (74 min)** |
+
+32,538,715 loan instances × 64 features, on the 128 GB / 20-core server. §22's
+residual risk — ~32 M instance dicts at ~19 GB plus the array blocks alive
+underneath them — fit. The array-native refactor is not pending work; it is the
+known fix if a future population change pushes it over.
+
+Note the shape of the bill has changed: **the load stage is now 51% of wall
+time, and it is the part that mostly disappears next month.** 22 of the 23
+snapshot NPZs are permanent (a matured snapshot is never recomputed upstream),
+so the next monthly run reads one snapshot from the DB and the rest from disk.
+That is exactly what the §22 rebuild was for.
+
+### Results
+
+Ranking block. Test = `20260219`; 1,583,717 ranked rows (`current_cat < 3`, the
+rest rule-flagged); severe base rate **0.0903**. K = `API_RATE_PER_HOUR` × window
+⇒ 5,760 / 40,320 / 172,800.
+
+| Arm | pooled AP | cat_0 AP | cat_1 AP | cat_2 AP | R@1d | R@1w | R@1m |
+|---|---|---|---|---|---|---|---|
+| **multiclass** (deployed) | 0.6555 | 0.1460 | 0.4660 | 0.8196 | 0.037 | 0.228 | 0.678 |
+| per_cat | **0.6721** | **0.1780** | 0.4732 | 0.8212 | 0.037 | 0.234 | 0.693 |
+| binary (diagnostic, never deployed) | 0.6693 | 0.1538 | 0.4705 | 0.8209 | 0.037 | 0.235 | 0.688 |
+| ordinal | 0.6563 | 0.1498 | 0.4724 | 0.8211 | 0.037 | 0.231 | 0.677 |
+
+Classification block, secondary: multiclass F1 0.6362 / QWK 0.7154 / cost 0.4203;
+ordinal F1 0.6366 / QWK 0.7215 / cost 0.3577; per_cat F1 0.6370 / QWK 0.7136 /
+cost 0.4416. Read these as diagnostics only — the cost matrix is guessed, and the
+aggregate F1 is inflated by the `current_cat_3` slice, where F1 is 1.0000 by the
+`label >= current_cat` identity rather than by anything the model did.
+
+Judged on its own terms (the only way it can be judged): the queue finds **67.8%
+of future-severe loans in the first month of calling at 240/h**, 6.2× better than
+random, and on the cat_0 early-warning slice — healthy loans today, severe within
+six months — **59.8% land inside one week of calling, a 15.0× lift**.
+
+> **Read this block against §24.** The test snapshot's severe base rate (0.0903
+> ranked) is roughly twice the training window's (0.0463), because the upstream
+> installment table is hard-deleted for closed and post-NPL loans and older
+> snapshots were rebuilt after more of their rows had gone. The ranking numbers
+> above survive it — isotonic calibration is monotone, so the ordering is
+> untouched — but the calibrated probabilities are biased low, which is why the
+> classification block's cat-0 Cat-3 recall looks as weak as it does.
+
+### The one decision Run 7 forces: `DEPLOY_ARM`
+
+`DEPLOY_ARM` is hard-locked to `"multiclass"` on Run-6 evidence, and Run 7
+contradicts that on both metrics the lock was justified by. **`per_cat` wins
+pooled AP (0.6721 vs 0.6555) and wins the cat_0 slice by 22% relative (0.1780 vs
+0.1460)** — the exact slice §15 recorded per_cat as *worst* on. Had `DEPLOY_ARM`
+been `"auto"`, this run would have deployed per_cat. It did not, because the
+config says `"multiclass"`; the log's "Deployed arm (configured)" line is the
+tell.
+
+Reasons not to flip the lock on this alone:
+
+- One test snapshot, one split, and **no tuning** — `ARM_OPTUNA_TRIALS=0`, so all
+  four arms ran on `XGB_DEFAULTS`. The spread across arms (~1.7 pt pooled AP) is
+  within the range a tuning pass could reshuffle.
+- The cat_0 gap is concentrated at the sharpest end of the queue (`R@1_day` 0.127
+  vs 0.073, lift 22.3× vs 12.9×) and has closed by `1_month` (0.998 vs 0.991).
+  That is the least stable part of a single-snapshot estimate: ~9,600 severe
+  cat-0 rows competing for the first 5,760 slots.
+- §15's per_cat verdict was itself confirmed across 15 walk-forward folds (§16).
+  Reversing it deserves the same standard, not a lower one.
+
+**Recommended:** `WALK_FORWARD_ENABLED=True`, `MODEL_ARMS=["multiclass","per_cat"]`,
+then `analyze_walk_forward.py --min_train_snaps 3`. Walk-forward is well-supplied
+now — §16's alarming fold spread was a 1–2-training-snapshot artifact, and there
+are 23 mature snapshots. With the load stage cached, a fold costs roughly
+preprocessing + 2 arms + eval ≈ 30 min, so this is an overnight job. If per_cat
+holds across folds, flip the lock; if it does not, record that its cat_0 win was
+snapshot noise so the question does not get reopened every run.
+
+### Clipping: §21's question is answered, and not the way it was expected
+
+`explore_clip_impact.py` on the Run-7 cache → `results_7/clip_impact.csv`. 53
+rows (64 features − 4 `NO_CLIP` − 7 binary), of which the clip actually moves a
+value on 43 and is a no-op on 10 bounded categoricals;
+`tail_lift = P(severe | x > p99) / base_rate`, base rate 9.08% over all mature
+loan-rows.
+
+**The three amount-scaled features that motivated the tool come back below 1.0.**
+The tail the ≤7B widening admitted is *less* likely to go severe than the
+population average:
+
+| Feature | p1 | p99 | max | tail_lift |
+|---|---|---|---|---|
+| `REMAINING_AMNT` | 3.42e7 | 4.04e9 | 2.90e10 | **0.588** |
+| `UPCOMING_AMNT` | 2.96e7 | 3.99e9 | 2.85e10 | **0.470** |
+| `PAYED_OVERDUE_AMNT` | 1.96e7 | 1.99e9 | 7.86e9 | **0.264** |
+
+**Decision: leave `clip: true` on all three.** Big loans in this population are
+safer, not riskier; exempting them would hand the model three unbounded features
+to buy nothing. §21's concern was the right one to have and is now closed. (The
+p99s incidentally confirm the population really did widen — they sit ~6× above
+anywhere a ≤700M filter could have put them.)
+
+**31 features trip the tool's 1.5 warning threshold (22 of them exceed 5×), and
+the warning is largely an artifact.** The top of the list is the DPD family — `DPD_DAYS` 11.01,
+`UNPAYED_INST_CNT` 11.01, `DPD_DAYS_T1`…`T5` 10.88–10.98, `MAX_DPD_LAST_6M`
+10.83, `HIST_MAX_DPD_DAYS` 10.17. **11.01 is the arithmetic ceiling** (1 /
+0.0908): *every* row above p99 is severe. That is the `label >= current_cat`
+identity, not discovered signal — a loan 700 days past due is already class 3,
+and `CARVE_CURRENT_CAT_GE=3` removes those rows from the queue before the
+model's ordering up there could matter.
+
+**Tool limitation, fix before trusting the number again:** `load_loan_rows`
+computes `tail_lift` over *all* mature rows, not over the ranked
+(`current_cat < 3`) population, so it cannot distinguish "this tail predicts
+severity" from "this tail *is* severity". A `--ranked_only` flag mirroring
+`ranking_metrics`' carve would make it answer the question the deliverable
+actually asks. Until then, read the DPD-family rows as uninformative — the
+amount-feature rows are unaffected, since those tails are not mechanically
+severe.
+
+**One row is not obviously mechanical:** `CATEGORY_TREND_1M` (p1 −1, p99 1, max
+2, `tail_lift` 11.01 on 0.11% of rows) and `CATEGORY_TREND_3M` (10.53 on 0.95%).
+The clip merges "jumped 2 categories" into "jumped 1" — a *deterioration* signal
+rather than a current-state one, which is precisely what the cat_0 slice is short
+of. It may still be mechanical (a +2 jump probably lands you at cat ≥ 2 already);
+the carve-aware rerun settles it. If it survives, it is the cheapest A/B on the
+list: a one-line `clip: false` on a 3-valued column with no unbounded-tail risk
+to speak of. It bumps `contract_version` and invalidates the whole cache, so
+batch it with something else.
+
+**`COUNT_90PLUS_DPD_LAST_3M` is destroyed outright — `p1 == p99 == 0`.**
+`OutlierClipper` clips it to `[0, 0]`, so every row becomes 0 and the column
+enters all four arms as a **constant**. Its `tail_lift` (8.19 on the 0.36% of
+rows above 0) is carve-contaminated like the rest of the DPD family and is
+beside the point: a feature reduced to a constant is a defect whatever its
+signal was. This one does not need the carve-aware rerun to justify a fix — it
+is a bounded 0–3 count with no tail to protect against. **`clip: false`.**
+
+That generalises to **12 columns with `max <= 14`** where clipping is merging
+values it was never meant to touch: `COUNT_90PLUS/60PLUS/30PLUS_DPD_LAST_3M`,
+`PRE_UPTO30/60/120/150_DPD_LOANS`, `COUNT_ACTIVE_CONTRACTS`,
+`COUNT_DELINQUENT_CONTRACTS`, `CATEGORY_TREND_1M`/`_3M`, `PCT_COMPLETED`.
+Clipping exists to bound unbounded tails; a 0–3 count has none, so `clip: false`
+on bounded integer counts is defensible on principle without waiting on the
+lift numbers.
+
+**The low side is unmeasured and is doing damage in the direction that matters.**
+`tail_lift` only looks above p99, but `pct_lo` shows the p1 clip collapsing the
+*clean* end — `PAYED_OVERDUE_INST_CNT` has `p1 = 3`, so 0.91% of rows are pushed
+**up** to 3, merging "never paid an overdue installment" with "paid three";
+`HIST_MAX_DPD_DAYS` has `p1 = 1`, pushing 0.83% of rows at 0 ("never any DPD")
+up to 1. Both collapse exactly the `current_cat_0` population the early-warning
+task lives in. A `head_lift` mirroring `tail_lift` on `x < p1` is four lines and
+belongs in the same edit as `--ranked_only`.
+
+### Loose ends this run left
+
+- **`assert_feed_invariants`' first report against the ≤7B population was not
+  seen** — the captured log starts at "Stage 1 completed". §21 flagged re-reading
+  it; still outstanding, and free on the next run.
+- **`ranking_single_loan` is computed but never logged** (`metrics.py:107` writes
+  it to `metrics.json`; `run.py` prints only the `ranking` block). It is moot as a
+  cross-run comparison now (§21 killed that), but it is still the cleanest
+  within-run read of what the grain change did. Consider logging it, or stop
+  documenting it as the comparison to make.
+- **Two sklearn warnings repeat on every arm** — `confusion_matrix` and
+  `cohen_kappa_score` seeing a single label in `y_true`/`y_pred`. Benign given the
+  `current_cat_3` slice is a single class by definition, but they are noise in
+  every log and are fixed by passing `labels=range(NUM_CLASSES)`.
+
+---
+
+## 24. Label Base-Rate Drift and Retroactive Source Deletion (September 5, 2026)
+
+The largest finding in Run 7 is not in the metrics block. **The severe base rate
+rises monotonically with snapshot recency, and the training window sits at the
+bottom of that trend.**
+
+### The measurement
+
+Three disjoint windows, reconstructed from the Run-7 log (the ordinal arm's
+`P(y > 2)` positive count gives the train label distribution; the per-cat arm's
+strata give train `current_cat`; the classification block gives the test slice
+counts) and cross-checked against `explore_clip_impact.py`'s independently
+computed pooled figure:
+
+| Window | Snapshots | Rows | Severe (class-3) rate |
+|---|---|---|---|
+| 2024-04 … 2025-07 — train + val | 16 | 21,077,304 | **8.37%** |
+| 2025-08 … 2026-01 — dropped for the 6-month gap | 6 | 9,806,375 | **9.96%** |
+| 2026-02-19 — test | 1 | 1,655,036 | **12.95%** |
+| pooled, all mature | 23 | 32,538,715 | 9.08% |
+
+The reconstruction closes to 9.0805%, exactly the figure `explore_clip_impact.py`
+prints from the cache, so the decomposition is sound. On the ranked
+(`current_cat < 3`) population the gap is starker still: **train 4.63% vs test
+9.03%, a factor of 1.95.**
+
+This is not composition. The test snapshot's `current_cat` mix is *healthier*
+than train's (61.2% vs 56.6% cat-0). Had train's strata carried test's
+conditional rates it would hold 1,484,256 severe rows; it holds 749,762 — train
+rates average **50.5% of test rates**, and the shortfall survives any
+reallocation across strata (give train's cat-2 the full test rate of 0.5939 and
+cat-0+cat-1 are still left at 0.97% against test's 4.99%).
+
+### The mechanism: hard deletion upstream, one as-of rebuild
+
+Confirmed with the source-data owner: **the installment table is hard-deleted for
+loans the bank is done with — fully paid, or post-NPL.** No soft delete, no
+status flag, nothing recoverable, and not reliably applied either (loans have
+been found retaining full installment history after payoff, alongside loans with
+none). Every snapshot in `EDP_LOAN_FEATURES` was rebuilt from a single as-of view
+during the ≤7B backfill (§21), so **an old snapshot was reconstructed after more
+of its loans had been deleted than a recent one.**
+
+The bias is one-directional, and the scope filter is why. `q1` requires **last
+installment ≥ T+6**:
+
+- **Payoff-driven removal is structurally suppressed.** To be in snapshot T a
+  loan needed ≥ 6 months of remaining schedule, so it cannot have reached
+  scheduled maturity by T. Only genuine prepayment escapes that, and it is the
+  weaker channel.
+- **NPL-driven removal is not.** A loan can go NPL at any point with years of
+  schedule left. Deleting it removes a row that *would* have satisfied the
+  filter — and whose `WORST_FUTURE_CAT` would have been 3.
+
+So the deletion **selectively removes positive labels**, and removes more of them
+the older the snapshot. That is exactly the observed shape.
+
+The magnitude is consistent too. If a fraction `d` of rows is deleted and
+essentially all carried label 3, then `observed = (s − d)/(1 − d)`. Taking the
+test window as the least-biased estimate of `s`:
+
+| Window | Age at rebuild | Observed | Implied `d` |
+|---|---|---|---|
+| 2024-04 … 2025-07 | 17–29 months | 8.37% | **5.0%** |
+| 2025-08 … 2026-01 | 8–13 months | 9.96% | **3.3%** |
+
+Deletion roughly linear in snapshot age, at ~5% attrition over two years of NPL
+workout. Ordinary numbers. Genuine portfolio deterioration is not excluded and
+the two are not mutually exclusive — but deletion alone reconciles the windows,
+and it is the hypothesis with a confirmed mechanism behind it.
+
+### Why this is worse than a drifting base rate
+
+**It hits features, not just labels.** Ten of the 64 features are customer-level,
+computed over the customer's *other* loans — `AVG_DPD_OTHER_LOANS`,
+`COUNT_ACTIVE_CONTRACTS`, `COUNT_DELINQUENT_CONTRACTS`, `MAX_DPD_ANY_PAST_LOAN`,
+`PRE_UPTO*_DPD_LOANS`, `CNT_RECOVERED_BEFORE`, and the two `*_CLOSE*_LOAN_DPD`
+columns that are *about closed loans specifically*. If siblings were deleted these
+are computed over a survivor subset and biased low, worst in the oldest
+snapshots. At serving time you score the newest immature snapshot, where nothing
+has been deleted yet — so those features arrive **higher than anything the model
+was trained on**. Train/serve skew in the cross-loan risk signal, silent, and in
+the same direction as the label bias.
+
+**The 6-month gap guarantees the training data is contaminated.** Horizon 6
+months plus gap 6 months means the freshest usable training snapshot is ~7 months
+before test — precisely the region where deletion has had time to bite. *There is
+no configuration of this pipeline that trains on clean data.* That tension may be
+the defining constraint of the project and belongs in front of the business, not
+buried in a config note.
+
+**It compounds the `LABEL_HORIZON_DATE` hazard.** That column is kept out of
+`FEATURE_COLS` because it proxies snapshot recency. Snapshot recency now also
+predicts label prevalence for a second, independent reason. Any feature that
+leaks recency leaks more than it used to.
+
+### What this changes
+
+- **Calibration.** `StratifiedCalibrator` is fit on val — customer-disjoint, but
+  drawn from the *train* snapshots, i.e. the lowest window — and applied to a fold
+  running at ~2× those rates. Per-stratum isotonic maps onto the training
+  window's base rates precisely, so calibrated `P(severe)` is biased low by
+  roughly the window ratio. **Ranking is unaffected** (isotonic is monotone, so
+  `RISK_SCORE` order, PR-AUC, recall@K and lift all stand). `PREDICTED_CLASS`,
+  `EXPECTED_COST` and any future `CERTAINTY_ACT_THRESHOLD` are not — this is the
+  mechanical explanation for multiclass's cat-0 Cat-3 recall of 0.1127, and it
+  makes the `Cost:` column uninterpretable as a cross-arm comparison.
+  Refitting calibration on the newest mature snapshot is necessary but **not
+  sufficient**: it corrects the output layer while the training labels stay
+  depleted.
+- **`results_7` remains the baseline** — every alternative is worse, and the
+  ranking block is the metric that survives.
+- **Nothing here changes the `DEPLOY_ARM` question** (§23), which is a
+  within-fold comparison under identical contamination.
+- **The amount-feature clip verdict (§23) stands but its measurement is now
+  provisional.** `tail_lift < 1` on the three amount columns comes from the same
+  contaminated population; if large NPL loans are written off faster because they
+  are material, large loans would *look* safer than they are. The recommendation
+  does not move — `clip: true` is the safe default either way — but treat "big
+  loans are safer" as unestablished.
+- **Amount banding (2B split, or any other) is premature.** The case for a
+  segmented model is that the feature→target *relationship* differs, not that the
+  base rate does; a base-rate shift is one tree split, which XGBoost finds on its
+  own at a learned threshold. `per_cat` is the precedent and it works because
+  `current_cat` changes the label *mechanics* (the monotone floor). Amount does
+  not. Test the interaction before building anything: add an amount-decile
+  stratification to the ranking block, mirroring `by_current_cat` —
+  `ranking_metrics` already takes `strata` and recurses. Flat lift@K across
+  deciles ⇒ banding buys nothing. Note also that if the real concern is "big
+  loans matter more", exposure-weighted ranking (§21, already with the business)
+  is the cheaper and more direct lever.
+
+### How to test it — status
+
+1. **Ask the ETL owner.** ✅ Done — hard delete, confirmed, not consistently
+   applied, nothing available upstream to fix it with as of now.
+2. **Same snapshot, two vintages.** ❌ Dead. `explore_clip_impact.py --baseline`
+   returns "no cached snapshot in …" — no pre-v1.5 cache survived the rebuild.
+   The script's own docstring warns the cache path is reused; that warning was
+   the one to act on and it is now too late for this cycle. **Copy the cache
+   aside before the next rebuild** and this becomes the conclusive test.
+3. **Feature-recency test.** ▶ Tool written: `explore_snapshot_drift.py` (cache
+   only, no DB). Reports per-snapshot row count, severe rate, mean portfolio
+   size and the mean of 11 customer-history "canary" columns, then Spearman rho
+   of each series against snapshot order. The discriminator: **deletion moves the
+   severe rate AND drags the customer-history means along with it; genuine
+   deterioration moves the severe rate alone.** Portfolio growth confounds the
+   feature means (row volume is already up ~25% across the range), so this is
+   strong evidence, not proof.
+4. **Cohort persistence.** Loans present in snapshot T whose schedule also spans
+   T−1, checked for presence in T−1. Measures the deletion rate directly and
+   gives `d` per snapshot age empirically. It diagnoses rather than fixes — but
+   `d(age)` is the input any reweighting scheme would need, so it is the
+   prerequisite for the only mitigation that addresses the training labels
+   themselves rather than the output layer.
+
+### Mitigations, none free
+
+- **Restrict or downweight old snapshots.** Cleanest in principle, and directly
+  opposed by the 6-month gap: the snapshots nearest the test window are exactly
+  the ones the gap forbids. Cutting the 16 train snapshots to the newest few
+  trades bias for variance, and §16 already established that folds trained on
+  1–2 snapshots are unstable.
+- **Reweight by estimated `d(age)`.** Needs test 4 first, and rests on deletion
+  being a smooth function of age — which the "some paid-off loans keep full
+  history, some do not" report argues against. Partial, inconsistent deletion is
+  harder to correct than systematic deletion, because absence is unobservable
+  and cannot be distinguished from a loan that was never there.
+- **Refit calibration on the newest mature snapshot.** Cheapest, safest, and
+  strictly an improvement — but it corrects the output layer only.
+- **Fix it upstream.** Not available now. Worth standing as a request: a
+  soft-delete flag or a tombstone row would make the whole problem measurable and
+  most of it correctable.
