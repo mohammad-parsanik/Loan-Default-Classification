@@ -1,6 +1,6 @@
 {
   "_comment": "Machine-readable column contract for the upstream feed. Code fields only: no column semantics (see etl_integration/, local-only, for those). Refresh by re-running the same projection over the vendored ETL copy; src/data/column_contract.py cross-checks the two when both are present.",
-  "contract_version": 1,
+  "contract_version": 2,
   "table": "D_ANALYTICS.EDP_LOAN_FEATURES",
   "etl_commit": "98a67ac",
   "columns": [
@@ -328,7 +328,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 42,
@@ -336,7 +337,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 43,
@@ -344,7 +346,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 44,
@@ -468,7 +471,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 58,
@@ -476,7 +480,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 59,
@@ -484,7 +489,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 60,
@@ -492,7 +498,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 61,
@@ -500,7 +507,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 62,
@@ -508,7 +516,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 63,

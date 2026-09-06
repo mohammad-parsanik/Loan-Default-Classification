@@ -35,6 +35,28 @@ _ROLES = {"key", "feature", "label", "meta"}
 _CODE_FIELDS = ("ordinal", "name", "type", "role", "nullable",
                 "binary", "sentinel", "clip", "scale")
 
+# Fields where the tracked contract DELIBERATELY disagrees with the vendored
+# ETL copy, pending upstream adopting them. The vendored copy stays
+# authoritative for everything not listed here.
+#
+# These nine are bounded integer counts (observed max <= 14). Clipping exists
+# to bound unbounded tails; they have none, so [p1, p99] only merges legitimate
+# values. `COUNT_90PLUS_DPD_LAST_3M` is the proof: measured p1 == p99 == 0, so
+# the clip reduced it to a CONSTANT in every arm (AGENT_HANDOFF.md §23).
+# `clip` only — scaling is monotone and XGBoost splits on order, so there is no
+# reason to claim these must reach the model unscaled.
+#
+# Delete an entry once upstream ships it; _check_vendored_copy says when.
+_LOCAL_OVERRIDES: dict[str, dict] = {
+    name: {"clip": False} for name in (
+        "COUNT_90PLUS_DPD_LAST_3M", "COUNT_60PLUS_DPD_LAST_3M",
+        "COUNT_30PLUS_DPD_LAST_3M", "PRE_UPTO30_DPD_LOANS",
+        "PRE_UPTO60_DPD_LOANS", "PRE_UPTO120_DPD_LOANS",
+        "PRE_UPTO150_DPD_LOANS", "COUNT_ACTIVE_CONTRACTS",
+        "COUNT_DELINQUENT_CONTRACTS",
+    )
+}
+
 
 def _load(path: Path) -> dict:
     with open(path) as f:
@@ -84,15 +106,39 @@ def _check_vendored_copy(cols: list[dict], version: int) -> None:
         logger.warning(f"Could not read {VENDORED_PATH}: {e}")
         return
 
-    def projection(rows):
-        return [tuple(c.get(f) for f in _CODE_FIELDS) for c in rows]
+    def projection(rows, apply_overrides=False):
+        out = []
+        for c in rows:
+            c = {**c, **_LOCAL_OVERRIDES[c["name"]]} if (
+                apply_overrides and c["name"] in _LOCAL_OVERRIDES) else c
+            out.append(tuple(c.get(f) for f in _CODE_FIELDS))
+        return out
 
-    if vendored.get("contract_version") != version or projection(v_cols) != projection(cols):
+    # An override that upstream has since adopted is dead weight — say so, so
+    # it gets deleted rather than accumulating.
+    adopted = [n for n, o in _LOCAL_OVERRIDES.items()
+               for c in v_cols if c["name"] == n
+               and all(c.get(k) == v for k, v in o.items())]
+    if adopted:
+        logger.info(
+            f"Vendored contract has adopted {len(adopted)} local override(s) "
+            f"({', '.join(sorted(adopted))}) — drop them from _LOCAL_OVERRIDES."
+        )
+
+    # Compare with the overrides applied to the vendored side: the tracked file
+    # is *expected* to differ exactly there, and nowhere else.
+    if projection(v_cols, apply_overrides=True) != projection(cols):
         logger.warning(
             f"{CONTRACT_PATH.name} disagrees with the vendored ETL copy at "
-            f"{VENDORED_PATH}. The vendored copy is the newer of the two by "
+            f"{VENDORED_PATH} beyond the {len(_LOCAL_OVERRIDES)} documented "
+            "local override(s). The vendored copy is the newer of the two by "
             "convention — refresh the tracked file (code fields only, no notes) "
             "before training or scoring."
+        )
+    elif (v_ver := vendored.get("contract_version")) != version and not _LOCAL_OVERRIDES:
+        logger.warning(
+            f"{CONTRACT_PATH.name} is at contract_version {version}, the "
+            f"vendored copy at {v_ver}, with identical code fields."
         )
 
 
@@ -108,7 +154,9 @@ FEATURE_ORDER: list[str] = [c["name"] for c in _cols if c["role"] == "feature"]
 META_COLS: list[str] = [c["name"] for c in _cols if c["role"] != "feature"]
 #: 0/1 features — exempt from clipping and scaling.
 BINARY_FEATURES: list[str] = [c["name"] for c in _cols if c.get("binary")]
-#: Features carrying a coded value that percentile-clipping would destroy.
+#: Features `OutlierClipper` must leave alone. Two populations, both real:
+#: sentinel-bearing columns whose coded value clipping would destroy, and
+#: bounded integer counts with no tail to bound (see _LOCAL_OVERRIDES).
 NO_CLIP: set[str] = {c["name"] for c in _cols if c.get("clip") is False}
 #: Features whose raw value must reach the model unscaled.
 NO_SCALE: set[str] = {c["name"] for c in _cols if c.get("scale") is False}
@@ -132,9 +180,14 @@ if __name__ == "__main__":
     assert len(FEATURE_ORDER) == 64, len(FEATURE_ORDER)
     assert len(META_COLS) == 7, META_COLS
     assert len(FEATURE_ORDER) + len(META_COLS) == len(_cols)
-    assert NO_CLIP == NO_SCALE, "clip/scale exemptions diverged — check the contract"
-    assert set(SENTINELS) == NO_CLIP
+    # Scaling is monotone, clipping is not — so an unscaled column must also be
+    # unclipped, but not the reverse. The sentinel-bearing columns are exactly
+    # the unscaled ones; anything else in NO_CLIP is a bounded count.
+    assert NO_SCALE <= NO_CLIP, sorted(NO_SCALE - NO_CLIP)
+    assert set(SENTINELS) == NO_SCALE, sorted(set(SENTINELS) ^ NO_SCALE)
     assert not (set(BINARY_FEATURES) & NO_CLIP)
     print(f"contract v{CONTRACT_VERSION} for {TABLE}: "
           f"{len(FEATURE_ORDER)} features, {len(META_COLS)} meta, "
-          f"{len(BINARY_FEATURES)} binary, {len(NO_CLIP)} sentinel-bearing — OK")
+          f"{len(BINARY_FEATURES)} binary, {len(NO_SCALE)} sentinel-bearing, "
+          f"{len(NO_CLIP) - len(NO_SCALE)} bounded-count clip exemption(s), "
+          f"{len(_LOCAL_OVERRIDES)} local override(s) — OK")
