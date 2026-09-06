@@ -198,10 +198,21 @@ Reads the per-snapshot cache `data/snapshots/train_<key>/` (override with
 same table.
 
 ```bash
-python explore_clip_impact.py
+python explore_clip_impact.py --ranked_only
 python explore_clip_impact.py --only REMAINING_AMNT,UPCOMING_AMNT,PAYED_OVERDUE_AMNT
 python explore_clip_impact.py --baseline data/cache_700m.npz
 ```
+
+**Always pass `--ranked_only`.** Without it both lifts are computed over every
+mature row, including the `current_cat >= CARVE_CURRENT_CAT_GE` rows that are
+rule-flagged and never enter the queue. Those are severe *by definition*
+(`label >= current_cat`), so any delinquency-ranking column pins at the
+arithmetic ceiling `1 / base_rate` and looks like discovered signal — that is
+what made 22 features read above 5x lift in Run 7. `head_lift` is the same
+question at the p1 end, which `tail_lift` cannot see and which matters more:
+`PAYED_OVERDUE_INST_CNT` (`p1 = 3`) and `HIST_MAX_DPD_DAYS` (`p1 = 1`) push
+"never overdue" up into the delinquent bins, collapsing the clean end of the
+distribution that the `current_cat_0` task lives in.
 
 `--baseline` diffs `p99` and `max` against an older cache and adds a
 `p99_ratio` column — how far the bound moved when the population changed.
@@ -214,6 +225,8 @@ rebuild overwrites the only copy of the comparison.
 |---|---|---|
 | `tail_lift ≈ 1`, small `tail_span` | clip bound is benign | leave it alone |
 | `tail_lift > 1.5`, large `n_merged` | the clip is merging a risk-bearing tail into one value | candidate for `clip: false` in `contract/columns.json` — **then A/B it on validation lift@K**, don't ship on this number alone |
+| `p1 >= p99` | clipping makes the column a **constant** — it carries nothing into any arm | `clip: false`, no A/B needed; this is a defect, not a trade-off |
+| `head_lift > 1.5` | severe events concentrate *below* p1; the low clip folds them into the bottom bin | candidate for `clip: false` — and check whether p1 sits on a semantic boundary like "never delinquent" |
 | `tail_lift < 1` | large values are the *safe* end | leave it alone; this is the `DAYS_SINCE_LAST_*` shape, where high = healthy |
 | `p99_ratio` ≫ 1 under `--baseline` | the population change moved the bound | expected after a scope-filter change; read `tail_lift` on the new cache to decide whether it matters |
 

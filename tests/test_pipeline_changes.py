@@ -1430,3 +1430,95 @@ def test_spearman_vs_order_handles_ties_and_constants():
 
     # The Run-7 severe-rate windows: 8.37% -> 9.96% -> 12.95%.
     assert rho(np.array([0.0837, 0.0996, 0.1295])) == pytest.approx(1.0)
+
+
+# ── Train-window knob (§24 recency A/B) ───────────────────────────────────────
+
+def test_train_window_selects_newest_or_oldest(monkeypatch):
+    """
+    TRAIN_WINDOW_SNAPSHOTS is the §24 recency experiment: train on the newest N
+    vs the oldest N, score both on the same test fold, and see whether the
+    upstream deletion bias costs RANKING or only calibration. The two halves
+    must actually be disjoint, or the experiment compares nothing.
+    """
+    from src.data import temporal_split as ts
+
+    snaps = {20240419, 20240520, 20240620, 20240721, 20240821}
+
+    monkeypatch.setattr(config, "TRAIN_WINDOW_SNAPSHOTS", None, raising=False)
+    assert ts._apply_train_window(set(snaps)) == snaps       # default: untouched
+
+    monkeypatch.setattr(config, "TRAIN_WINDOW_SNAPSHOTS", 2, raising=False)
+    newest = ts._apply_train_window(set(snaps))
+    assert newest == {20240721, 20240821}
+
+    monkeypatch.setattr(config, "TRAIN_WINDOW_SNAPSHOTS", -2, raising=False)
+    oldest = ts._apply_train_window(set(snaps))
+    assert oldest == {20240419, 20240520}
+
+    assert not (newest & oldest), "the two arms of the A/B must be disjoint"
+
+    # Asking for more than exist is a no-op, not a crash or a silent empty set.
+    monkeypatch.setattr(config, "TRAIN_WINDOW_SNAPSHOTS", 99, raising=False)
+    assert ts._apply_train_window(set(snaps)) == snaps
+
+
+# ── Exposure-decile ranking slice ─────────────────────────────────────────────
+
+def test_exposure_decile_ranking_excludes_carved_and_bins_by_amount():
+    """
+    The banding question: does queue quality depend on loan size? Deciles must
+    be cut on the RANKED population only — carved rows never reach the queue,
+    so letting them move the bin boundaries would answer a different question.
+    """
+    import numpy as np
+    from src.evaluation.metrics import exposure_decile_ranking
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    strata = rng.integers(0, 4, n)                     # includes carved cat-3
+    exposure = rng.lognormal(18, 2, n)
+    y = np.where(strata >= config.CARVE_CURRENT_CAT_GE,
+                 config.NUM_CLASSES - 1, rng.integers(0, 3, n))
+    y[:400] = config.NUM_CLASSES - 1                   # some genuine positives
+    scores = rng.random(n)
+
+    out = exposure_decile_ranking(y, scores, strata, exposure, n_bins=5)
+    assert set(out) == {f"decile_{i}" for i in range(1, 6)}
+
+    ranked_n = int((strata < config.CARVE_CURRENT_CAT_GE).sum())
+    assert sum(b["n_ranked"] for b in out.values()) == ranked_n, \
+        "deciles must partition the ranked population exactly — no carved rows"
+
+    # Bins are ordered and non-overlapping in exposure.
+    bounds = [(out[f"decile_{i}"]["exposure_min"], out[f"decile_{i}"]["exposure_max"])
+              for i in range(1, 6)]
+    for (_, hi), (lo_next, _) in zip(bounds, bounds[1:]):
+        assert lo_next >= hi
+
+    # Balanced within one row, whatever the amount distribution looks like.
+    sizes = [b["n_ranked"] for b in out.values()]
+    assert max(sizes) - min(sizes) <= 1
+
+
+def test_compute_metrics_scores_degenerate_slice_against_all_classes():
+    """
+    The current_cat_3 slice is a single class by the `label >= current_cat`
+    identity. Without labels=, sklearn macro-averages over the ONE observed
+    class and hands back a free F1 of 1.0000 -- which reads as a perfect
+    model on 4% of the test set -- plus a NaN QWK and two warnings per arm.
+    """
+    import numpy as np
+    from src.evaluation.metrics import compute_metrics
+
+    y = np.full(200, config.NUM_CLASSES - 1)
+    m = compute_metrics(y, y.copy())
+
+    assert m["accuracy"] == 1.0                     # it IS perfectly predicted
+    assert m["macro_f1"] == pytest.approx(1 / config.NUM_CLASSES), \
+        "macro-F1 must average over all NUM_CLASSES, not just the observed one"
+    assert np.isnan(m["qwk"]), "kappa is undefined when nothing varies"
+
+    # And the fix must not disturb the ordinary case.
+    y2 = np.tile(np.arange(config.NUM_CLASSES), 50)
+    assert compute_metrics(y2, y2.copy())["macro_f1"] == pytest.approx(1.0)

@@ -497,14 +497,14 @@ All verified locally (new tests + full suite); see `tests/test_pipeline_changes.
 
 *Rewritten 2026-09-05 after Run 7 (§23), reprioritised the same day after §24.*
 
-0. **Establish how much of the base-rate drift is retroactive source deletion (§24).** The severe rate runs 8.37% → 9.96% → 12.95% across the train / dropped / test windows, the ETL owner has confirmed hard deletion of closed and post-NPL installments, and one as-of rebuild of every snapshot makes old snapshots systematically depleted of exactly the class-3 rows. This gates what the training labels *mean*, so it comes before any modelling decision below — including item 2. Cheapest first move: `python explore_snapshot_drift.py` (cache only, no DB). Then a cohort-persistence count for `d(age)`. **Also: copy the snapshot cache aside before the next rebuild** — the two-vintage comparison, the conclusive test, was lost this cycle because the cache path is reused.
+0. **Establish how much of the base-rate drift is retroactive source deletion (§24).** *(Confirmed with the source owner: hard delete, inconsistently applied, nothing available upstream to fix it with today.)* The severe rate runs 8.37% → 9.96% → 12.95% across the train / dropped / test windows, the ETL owner has confirmed hard deletion of closed and post-NPL installments, and one as-of rebuild of every snapshot makes old snapshots systematically depleted of exactly the class-3 rows. This gates what the training labels *mean*, so it comes before any modelling decision below — including item 2. Cheapest first move: `python explore_snapshot_drift.py` (cache only, no DB). Then a cohort-persistence count for `d(age)`. **Also: copy the snapshot cache aside before the next rebuild** — the two-vintage comparison, the conclusive test, was lost this cycle because the cache path is reused.
 1. **Pull Run 7's artifacts off the server.** `F:\EDP\Loan Default Classification\artifacts\20260905_133423\` — `metrics.json`, `arms_metrics.json`, `model_bundle.pkl`, `plots/`. `results_7/` currently holds only a partial console log (capture starts after the load stage) and `clip_impact.csv`; several questions below need numbers that log does not print, including the whole `ranking_single_loan` block and every bootstrap CI.
 2. **Settle `DEPLOY_ARM`.** Run 7 has `per_cat` beating the hard-locked `multiclass` on pooled AP (0.6721 vs 0.6555) *and* on the cat_0 early-warning slice (0.1780 vs 0.1460) — the exact slice the Run-6 lock was justified by (§23). One snapshot is not enough to reverse a verdict that §16 confirmed across 15 folds. Re-check with `WALK_FORWARD_ENABLED=True`, `MODEL_ARMS=["multiclass","per_cat"]`, then `analyze_walk_forward.py --min_train_snaps 3`. With 23 mature snapshots and a warm cache this is now an overnight job, not the 1.5–2 h/fold §16-era estimate.
 3. **Ship:** `python run.py train --final` → move `artifacts/<ts>_final/fold_01/model_bundle.pkl` to production → `python run.py predict` → queue CSV to the API caller at 240/h (`RISK_RANK` order). For the tech team's manager code: `build_scoring_package.py` → `run_scoring(df, ScoringParams(...))`.
-4. **Contract edits, batched — they bump `contract_version` and invalidate the whole cache, so they land together or not at all (§23):** `clip: false` on `COUNT_90PLUS_DPD_LAST_3M`, which `p1 == p99 == 0` currently reduces to a **constant** in all four arms; then the other bounded small counts (`max <= 14`, nothing to protect against); then `CATEGORY_TREND_1M`/`_3M` if the carve-aware rerun keeps them. If a rebuild is happening anyway, copy the old cache aside first (item 0).
-5. **Make `explore_clip_impact.py` carve-aware** (a `--ranked_only` flag mirroring `ranking_metrics`' `current_cat < CARVE_CURRENT_CAT_GE` filter) **and add a `head_lift` for the p1 side** — `PAYED_OVERDUE_INST_CNT` (`p1 = 3`) and `HIST_MAX_DPD_DAYS` (`p1 = 1`) are collapsing the clean end of the distribution, which is the `current_cat_0` population the whole task lives in, and nothing currently measures it. Small; the amount-feature question the tool was built for is already closed (§23), though §24 downgrades that answer to provisional.
+4. ~~**Contract edits, batched.**~~ **DONE** (contract v2, §24): `clip: false` on the nine bounded integer counts, including the `COUNT_90PLUS_DPD_LAST_3M` constant. **The next run rebuilds the cache** — copy the existing snapshot dir aside first (item 0), it is the two-vintage deletion test. The ETL team still needs to mirror the flags upstream.
+5. ~~**Make `explore_clip_impact.py` carve-aware.**~~ **DONE** (§24): `--ranked_only`, a `head_lift` column for the p1 side, and a hard error on any `p1 >= p99`. Re-run it with `--ranked_only` after the next cache rebuild and re-read the DPD family and `CATEGORY_TREND_1M`/`_3M` — those numbers were never trustworthy without the carve.
 6. **Refit calibration on the newest mature snapshot** rather than on val (§24). Cheapest real mitigation for the drift, strictly an improvement, and it does not touch ranking. Not a substitute for item 0 — it corrects the output layer while the training labels stay depleted.
-7. **Before considering amount banding, test whether the interaction exists** (§24): add an amount-decile stratification to the ranking block, mirroring `by_current_cat` (`ranking_metrics` already takes `strata` and recurses). Flat lift@K across deciles ⇒ banding buys nothing, and a base-rate shift alone is one tree split. Don't build 2× the arms on a hunch.
+7. ~~**Test whether an amount interaction exists before banding.**~~ **DONE** (§24): the deployed arm now reports `ranking_by_exposure` — pooled AP and lift per `REMAINING_AMNT` decile — and logs the AP spread. Read it off the next run: flat ⇒ banding buys nothing and a base-rate shift is one tree split; a dip in one decile ⇒ a real interaction, and the first thing to rule out is that post-NPL deletion varies with loan size.
 8. **Re-read `assert_feed_invariants`' load-stage output** against the ≤7B population — §21 flagged it and Run 7's captured log starts one stage too late to show it. Costs one `grep` of the next run's log.
 9. **Optuna** (optional): `ARM_OPTUNA_TRIALS=20` on the `--final` fit. All four Run-7 arms sit within ~1.7 pt pooled AP on `XGB_DEFAULTS`, so headroom is probably small — but it has never been measured on this population.
 10. **Business items (non-blocking):** exposure-weighted ranking (§21 — a 10× exposure range makes "every queue slot is worth the same" a real distortion now; raised with business, pending); `CERTAINTY_ACT_THRESHOLD` (Run-5 evidence: 88% of day-one calls confirm near-certainties); real cost numbers only if the cost rule is ever promoted. *(Survivorship in the ETL sample is no longer an open question filed here — it is item 0 and §24.)*
@@ -1094,6 +1094,61 @@ leaks recency leaks more than it used to.
    `d(age)` is the input any reweighting scheme would need, so it is the
    prerequisite for the only mitigation that addresses the training labels
    themselves rather than the output layer.
+
+### Landed 2026-09-05 (contract v2 — the cache is invalidated)
+
+Implemented against §23/§24; none of it has run on the server yet.
+
+- **`contract_version` 1 → 2**, `clip: false` on the **nine bounded integer
+  counts** (`COUNT_90PLUS/60PLUS/30PLUS_DPD_LAST_3M`,
+  `PRE_UPTO30/60/120/150_DPD_LOANS`, `COUNT_ACTIVE_CONTRACTS`,
+  `COUNT_DELINQUENT_CONTRACTS`). `COUNT_90PLUS_DPD_LAST_3M` was the proof —
+  `p1 == p99 == 0` made it a constant in every arm — and the rest follow on
+  principle: clipping bounds unbounded tails, and a 0–3 count has none.
+  **`clip` only, not `scale`**: scaling is monotone and XGBoost splits on
+  order, so exempting them from it would claim something untrue.
+- **`NO_CLIP` now has two populations**, so `column_contract`'s self-check moved
+  from `NO_CLIP == NO_SCALE` to `NO_SCALE <= NO_CLIP` with
+  `set(SENTINELS) == NO_SCALE`. Sentinel-bearing columns are exactly the
+  unscaled ones; anything else in `NO_CLIP` is a bounded count.
+- **`_LOCAL_OVERRIDES` in `column_contract.py`** records the nine as a deliberate
+  divergence from the vendored ETL copy. `_check_vendored_copy` compares with
+  the overrides applied, so it still catches *unexpected* drift, and it now logs
+  when upstream adopts one so the entry gets deleted rather than accumulating.
+  **The ETL team should mirror this** — until they do, the tracked contract is
+  ahead of the vendored copy by exactly these nine flags.
+- **`TRAIN_WINDOW_SNAPSHOTS`** (`project_config`, default `None`): positive N
+  keeps the newest N eligible training snapshots, negative N the oldest N. This
+  is the §24 recency A/B — train both, score on the same test fold, and see
+  whether depletion costs ranking or only calibration. Applied in both the
+  single-split and walk-forward paths, and in walk-forward it narrows *before*
+  the `MIN_TRAIN_SNAPSHOTS` check so the minimum means what it says.
+- **`ranking_by_exposure`** — the ranking block cut by `EXPOSURE_FEATURE`
+  (`REMAINING_AMNT`) decile, via `metrics.exposure_decile_ranking`, logged for
+  the deployed arm with the AP spread across deciles. Deciles are cut on the
+  ranked population only and are rank-based, so a skewed amount distribution
+  still yields balanced bins. **Read `pr_auc` and `lift`, not `recall`** — K is
+  the whole API budget spent inside one decile. This is the banding test: flat
+  ⇒ an amount-banded model buys nothing.
+- **`compute_metrics` passes `labels=range(NUM_CLASSES)`** to `f1_score` and
+  `cohen_kappa_score`, and returns `nan` for QWK directly when nothing varies.
+  Fixes the two sklearn warnings per arm, and makes the `current_cat_3` slice
+  report macro-F1 **0.25** instead of a free **1.0000** — that slice is one
+  class by the label identity, and scoring it over the single observed class
+  read as a perfect model on 4% of the test set. **Pooled numbers are
+  unchanged** (all four classes are present, so `labels=` is a no-op there).
+- **`explore_clip_impact.py`**: `--ranked_only` (carve to `current_cat <
+  CARVE_CURRENT_CAT_GE`, which is what makes `tail_lift` answer the
+  deliverable's question), a `head_lift` column for the p1 side, an error on
+  any `p1 >= p99` column, and a warning when run without `--ranked_only`.
+- **`MAX_LOANS (99th pct on train)`** now says `[inert at loan grain]`, because
+  `n_loans` is 1 by construction there and the line otherwise reads as a claim
+  about how many loans customers hold.
+
+Regression tests in `tests/test_pipeline_changes.py`: the window knob's two arms
+are disjoint and over-asking is a no-op; exposure deciles partition the ranked
+population exactly and stay balanced; the degenerate slice scores against all
+`NUM_CLASSES`.
 
 ### Mitigations, none free
 

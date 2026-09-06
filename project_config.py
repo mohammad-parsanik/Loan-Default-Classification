@@ -119,6 +119,22 @@ WALK_FORWARD_ENABLED  = False
 # Folds with fewer training snapshots are skipped.
 MIN_TRAIN_SNAPSHOTS   = 1
 
+# Keep only part of the eligible training window. None = every snapshot that
+# clears the LABEL_HORIZON_MONTHS gap (the default, and what every run so far
+# used). A positive N keeps the NEWEST N; a negative N keeps the OLDEST N.
+#
+# This exists for one experiment: the upstream installment table is hard-deleted
+# for closed and post-NPL loans, so an old snapshot was rebuilt after more of
+# its future-severe rows had vanished — the measured severe rate runs 8.37% ->
+# 9.96% -> 12.95% across the train / gap-dropped / test windows
+# (AGENT_HANDOFF.md §24). Training on the newest N vs the oldest N and scoring
+# both on the same test fold says whether that depletion costs RANKING quality,
+# or only calibration. Uniform undersampling of positives shifts the intercept
+# and leaves the ordering alone; feature-dependent deletion does not.
+#
+# Leave at None for production runs — it throws away training data by design.
+TRAIN_WINDOW_SNAPSHOTS = None
+
 # Set OPTIMIZE_ON_VALIDATION = True to use a validation set for early
 # stopping and Optuna hyperparameter tuning. Set to False to train on
 # more data and test directly without any validation set.
@@ -210,6 +226,16 @@ RANKING_REF_WINDOWS = {          # label -> hours of continuous calling
     "1_week":  168,
     "1_month": 720,
 }
+
+# The ranking block is also cut by decile of this feature, to answer whether
+# the queue ranks equally well at every loan size. That is the precondition for
+# an amount-banded model: a band is worth building when the feature->target
+# RELATIONSHIP differs, not when the base rate does (one tree split handles a
+# base-rate shift, at a threshold the data picks). Flat lift@K across deciles
+# means banding buys nothing. It also watches the §24 deletion bias — if
+# post-NPL deletion upstream varies with loan size, the model learns a
+# size-dependent distortion as if it were signal. Set to None to skip.
+EXPOSURE_FEATURE = "REMAINING_AMNT"
 
 # Per-current-cat calibration: P(severe) is a rare event for cat-0 but a
 # common one for cat-2 — pooled isotonic miscalibrates the strata against
