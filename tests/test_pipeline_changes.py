@@ -1522,3 +1522,42 @@ def test_compute_metrics_scores_degenerate_slice_against_all_classes():
     # And the fix must not disturb the ordinary case.
     y2 = np.tile(np.arange(config.NUM_CLASSES), 50)
     assert compute_metrics(y2, y2.copy())["macro_f1"] == pytest.approx(1.0)
+
+
+def test_clip_report_bounds_ignore_the_ranked_mask():
+    """
+    --ranked_only must narrow the LIFT, never the clip bounds.
+
+    OutlierClipper fits on the whole training split (run.py:262, no carve), so
+    percentiles taken over the carved-out subset would describe a clip the
+    pipeline never performs. For a DPD-shaped column that is not a rounding
+    difference: carved rows are exactly the large ones, so a ranked-only p99
+    lands an order of magnitude below the real bound.
+    """
+    from explore_clip_impact import clip_report
+
+    # 900 queued rows in [0, 155]; 100 carved rows in [156, 700] -- the shape of
+    # DPD_DAYS under CARVE_CURRENT_CAT_GE, where cat >= 3 <=> DPD >= 156.
+    queued = np.linspace(0, 155, 900)
+    carved = np.linspace(156, 700, 100)
+    flat = np.concatenate([queued, carved]).reshape(-1, 1).astype(np.float32)
+    rankable = np.arange(1000) < 900
+    severe = ~rankable                      # carved rows are severe by identity
+    severe[:90] = True                      # 10% base rate among the queued
+    cols = ["DPD_DAYS"]
+
+    full = clip_report(flat, severe, cols).iloc[0]
+    ranked = clip_report(flat, severe, cols, lift_mask=rankable).iloc[0]
+
+    assert ranked["p1"] == full["p1"] and ranked["p99"] == full["p99"], \
+        "the ranked mask must not move the clip bounds"
+    assert full["p99"] > 155, "bounds must come from the full population"
+    for col in ("max", "pct_hi", "pct_lo", "n_merged", "tail_span"):
+        assert ranked[col] == full[col] or (
+            np.isnan(ranked[col]) and np.isnan(full[col])
+        ), f"{col} describes the clip, not the scored population"
+
+    # Pooled, the tail is 100% severe -- the label identity, at the ceiling.
+    assert full["tail_lift"] == pytest.approx(1 / severe.mean())
+    # Masked, no queued row reaches p99, so the clip cannot touch the ranking.
+    assert np.isnan(ranked["tail_lift"])
