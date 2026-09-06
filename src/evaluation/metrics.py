@@ -16,10 +16,22 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     Computes all required metrics for the Loan Default Classification project.
     """
     metrics = {}
-    
-    # Standard metrics
-    metrics['macro_f1'] = float(f1_score(y_true, y_pred, average='macro'))
-    metrics['qwk'] = float(cohen_kappa_score(y_true, y_pred, weights='quadratic'))
+    labels = list(range(config.NUM_CLASSES))
+
+    # Standard metrics. `labels=` matters on the current-cat slices: the
+    # current_cat_3 stratum is a single class by the `label >= current_cat`
+    # identity, and without it sklearn scores macro-F1 over the ONE observed
+    # class (a free 1.0000, not comparable to the other slices) and returns a
+    # NaN QWK with two warnings per arm.
+    metrics['macro_f1'] = float(f1_score(y_true, y_pred, average='macro',
+                                         labels=labels, zero_division=0))
+    # Kappa is undefined when nothing varies — chance agreement is already 1.
+    # Say so directly instead of letting a 0/0 inside sklearn say it.
+    metrics['qwk'] = (
+        float('nan') if len(np.unique(np.concatenate([y_true, y_pred]))) < 2
+        else float(cohen_kappa_score(y_true, y_pred, weights='quadratic',
+                                     labels=labels))
+    )
     metrics['accuracy'] = float(accuracy_score(y_true, y_pred))
     
     # Per-class recall (explicit labels: keeps indices right on strata where
@@ -43,8 +55,61 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     return metrics
 
 
+def exposure_decile_ranking(y_true, scores, strata, exposure, tie_break=None,
+                            n_bins: int = 10) -> dict:
+    """
+    The ranking block, cut by exposure (REMAINING_AMNT) decile.
+
+    Answers whether the queue ranks equally well at every loan size, which is
+    the precondition for two things the project keeps being asked about:
+
+      * **Banding.** A separate model per amount band is only worth building if
+        the feature->target relationship differs across bands. A different base
+        rate is not that — one tree split handles it, at a threshold the data
+        picks. Flat lift@K across deciles means banding buys nothing.
+      * **Deletion bias (§24).** The upstream table is hard-deleted for
+        post-NPL loans. If that deletion rate varies with loan size, the
+        model learns a size-dependent distortion as if it were signal, and
+        "large loans are safer" (clip_impact tail_lift 0.26-0.59) is an
+        artifact rather than a fact.
+
+    Deciles are cut on the RANKED population only — carved rows never reach the
+    queue, so including them would move the boundaries for nothing. Each
+    decile's block is a full `ranking_metrics` call, so `pr_auc` and `lift` are
+    comparable across deciles; the raw `recall` is not, because K is the whole
+    API budget spent inside one decile. Read `pr_auc` and `lift`.
+    """
+    from src.evaluation.ranking import ranking_metrics
+
+    y_true, scores = np.asarray(y_true), np.asarray(scores)
+    strata, exposure = np.asarray(strata), np.asarray(exposure, dtype=np.float64)
+    idx = np.flatnonzero(strata < config.CARVE_CURRENT_CAT_GE)
+    if len(idx) < n_bins:
+        return {}
+
+    # Rank-based cut, so a heavily tied or skewed amount distribution still
+    # yields balanced bins. Ties land in the same bin by construction.
+    order = np.argsort(exposure[idx], kind="stable")
+    bin_of = np.empty(len(idx), dtype=np.int32)
+    bin_of[order] = (np.arange(len(idx)) * n_bins) // len(idx)
+
+    out = {}
+    for b in range(n_bins):
+        sel = idx[bin_of == b]
+        if not len(sel):
+            continue
+        block = ranking_metrics(
+            y_true[sel], scores[sel], strata=strata[sel],
+            tie_break=None if tie_break is None else np.asarray(tie_break)[sel],
+        )
+        block["exposure_min"] = float(exposure[sel].min())
+        block["exposure_max"] = float(exposure[sel].max())
+        out[f"decile_{b + 1}"] = block
+    return out
+
+
 def full_evaluation(y_true, probs, strata=None, calibrator=None,
-                    portfolio_sizes=None, tie_break=None) -> dict:
+                    portfolio_sizes=None, tie_break=None, exposure=None) -> dict:
     """
     Single evaluation path shared by the baseline and the DeepSets+XGB model,
     so the two are compared under the SAME decision policy.
@@ -59,6 +124,10 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None,
                        effect of calibration from the cost rule).
     "cost_rule":       expected-cost decisions on calibrated+masked probs.
     "by_current_cat":  cost-rule metrics per current-category slice.
+    "ranking_by_exposure": the ranking block per REMAINING_AMNT decile (needs
+                       `exposure`). Flat lift@K across deciles means an
+                       amount-banded model would buy nothing; a dip says
+                       otherwise. See exposure_decile_ranking.
     "ranking_single_loan": the ranking block restricted to customers holding
                        exactly ONE loan (needs `portfolio_sizes`). For those
                        customers a loan-grain row and a portfolio-grain row
@@ -108,6 +177,9 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None,
                 y_true[one], sev[one], np.asarray(strata)[one],
                 tie_break=None if tie_break is None else np.asarray(tie_break)[one],
             )
+        if exposure is not None:
+            out["ranking_by_exposure"] = exposure_decile_ranking(
+                y_true, sev, strata, exposure, tie_break=tie_break)
     out["_cost_preds"] = cost_preds
     out["_probs_cal"] = probs_cal
     return out

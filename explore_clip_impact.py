@@ -21,7 +21,7 @@ Copy the old cache aside BEFORE rebuilding — the path is reused.
 
 Inputs (no DB): data/snapshots/train_<key>/  (per-snapshot NPZ cache)
 Usage:
-  python explore_clip_impact.py
+  python explore_clip_impact.py --ranked_only
   python explore_clip_impact.py --baseline data/cache_700m.npz
   python explore_clip_impact.py --only REMAINING_AMNT,UPCOMING_AMNT,PAYED_OVERDUE_AMNT
 """
@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 SEVERE_CLASS = config.NUM_CLASSES - 1
 
 
-def load_loan_rows(cache_dir=None):
+def load_loan_rows(cache_dir=None, ranked_only=False):
     """
     Returns (features_flat, severe_flag_per_row, feat_cols), mature rows only.
 
@@ -64,12 +64,20 @@ def load_loan_rows(cache_dir=None):
     offsets        = arrays["offsets"]
     labels         = arrays["labels"]
     snapshot_dates = arrays["snapshot_dates"]
+    current_cats   = arrays["current_cats"]
 
     sizes = np.diff(offsets)
     mature = set(filter_mature_snapshots(np.unique(snapshot_dates)))
     keep_inst = np.array([s in mature for s in snapshot_dates])
     if not keep_inst.all():
         log.warning(f"Dropping {(~keep_inst).sum():,} instance(s) from immature snapshots.")
+
+    if ranked_only:
+        carved = current_cats >= config.CARVE_CURRENT_CAT_GE
+        log.info(f"--ranked_only: dropping {int((carved & keep_inst).sum()):,} carved "
+                 f"(current_cat >= {config.CARVE_CURRENT_CAT_GE}) instance(s) — these are "
+                 "severe by the label identity and never enter the queue.")
+        keep_inst = keep_inst & ~carved
 
     keep_rows = np.repeat(keep_inst, sizes)
     severe = np.repeat((labels == SEVERE_CLASS), sizes)[keep_rows]
@@ -97,7 +105,8 @@ def clip_report(flat, severe, feat_cols, only=None) -> pd.DataFrame:
         else:
             p1, p99 = float(np.percentile(x, 1)), float(np.percentile(x, 99))
         above = flat[:, i] > p99
-        n_above = int(above.sum())
+        below = flat[:, i] < p1
+        n_above, n_below = int(above.sum()), int(below.sum())
         spread = p99 - p1
         rows.append({
             "feature":   col,
@@ -105,11 +114,17 @@ def clip_report(flat, severe, feat_cols, only=None) -> pd.DataFrame:
             "p99":       p99,
             "max":       float(x.max()),
             "pct_hi":    n_above / len(x),
-            "pct_lo":    float((flat[:, i] < p1).mean()),
+            "pct_lo":    n_below / len(x),
             "n_merged":  int(len(np.unique(x[x > p99]))),
             "tail_span": float((x.max() - p99) / spread) if spread > 0 else np.nan,
             "tail_lift": float(severe[above].mean() / base_rate)
                          if n_above and base_rate > 0 else np.nan,
+            # The p1 side. Symmetric question, opposite end: a head_lift well
+            # BELOW 1 is fine (the clean end really is clean), but one near or
+            # above 1 means the clip is folding risk-bearing rows into the
+            # bottom bin.
+            "head_lift": float(severe[below].mean() / base_rate)
+                         if n_below and base_rate > 0 else np.nan,
         })
     return pd.DataFrame(rows).sort_values("tail_lift", ascending=False)
 
@@ -121,17 +136,30 @@ def main():
     ap.add_argument("--baseline", default=None,
                     help="older cache to diff p99 against (population-shift check)")
     ap.add_argument("--only", default=None, help="comma-separated feature subset")
+    ap.add_argument("--ranked_only", action="store_true",
+                    help="restrict to current_cat < CARVE_CURRENT_CAT_GE — the population "
+                         "the queue actually ranks. Without it the DPD family pins at the "
+                         "arithmetic ceiling 1/base_rate and measures the label identity.")
     ap.add_argument("--output", default="explore_output/clip_impact.csv")
     ap.add_argument("--lift_threshold", type=float, default=1.5,
                     help="tail_lift above which a column is worth exempting")
     args = ap.parse_args()
 
     only = set(args.only.split(",")) if args.only else None
-    flat, severe, feat_cols = load_loan_rows(Path(args.cache) if args.cache else None)
+    flat, severe, feat_cols = load_loan_rows(
+        Path(args.cache) if args.cache else None, args.ranked_only)
     rep = clip_report(flat, severe, feat_cols, only)
 
+    if not args.ranked_only:
+        log.warning(
+            "Running over ALL mature rows. Rows with current_cat >= "
+            f"{config.CARVE_CURRENT_CAT_GE} are severe by the label identity and never "
+            "enter the queue, so tail_lift on any delinquency-ranking column is measuring "
+            "that identity, not signal. Re-run with --ranked_only to read it."
+        )
+
     if args.baseline:
-        b_flat, b_severe, b_cols = load_loan_rows(Path(args.baseline))
+        b_flat, b_severe, b_cols = load_loan_rows(Path(args.baseline), args.ranked_only)
         base = clip_report(b_flat, b_severe, b_cols, only)[["feature", "p99", "max"]]
         rep = rep.merge(base.rename(columns={"p99": "p99_before", "max": "max_before"}),
                         on="feature", how="left")
@@ -144,6 +172,24 @@ def main():
     with pd.option_context("display.width", 200, "display.max_columns", 30,
                            "display.float_format", lambda v: f"{v:,.4g}"):
         print(rep.to_string(index=False))
+
+    degenerate = rep[rep["p1"] >= rep["p99"]]
+    if len(degenerate):
+        log.error(
+            f"{len(degenerate)} feature(s) with p1 >= p99: "
+            f"{', '.join(degenerate['feature'])}\n"
+            "  Clipping to [p1, p99] makes these CONSTANT — the column carries no\n"
+            "  information into any arm. Set clip:false in contract/columns.json."
+        )
+
+    headed = rep[rep["head_lift"] > args.lift_threshold]
+    if len(headed):
+        log.warning(
+            f"{len(headed)} feature(s) with head_lift > {args.lift_threshold}: "
+            f"{', '.join(headed['feature'])}\n"
+            "  Severe events concentrate BELOW p1, so the low clip is folding\n"
+            "  risk-bearing rows into the bottom bin."
+        )
 
     flagged = rep[rep["tail_lift"] > args.lift_threshold]
     if len(flagged):

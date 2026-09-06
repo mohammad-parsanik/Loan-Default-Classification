@@ -191,7 +191,15 @@ def train_single_fold(
     if config.MAX_LOANS_PER_CUSTOMER is None:
         loan_counts = [i["n_loans"] for i in train_inst]
         max_loans   = int(np.percentile(loan_counts, 99))
-        logger.info(f"{fold_label} | MAX_LOANS (99th pct on train): {max_loans}")
+        # At loan grain every instance holds exactly one loan by construction,
+        # so this is the 99th percentile of a constant. Say that, rather than
+        # printing "1" as if it were a fact about how many loans customers hold
+        # (that is portfolio_n_loans, and it is not what gets truncated).
+        logger.info(
+            f"{fold_label} | MAX_LOANS (99th pct on train): {max_loans}"
+            + ("  [inert at loan grain — one loan per instance]"
+               if config.PREDICTION_GRAIN == "loan" else "")
+        )
     else:
         max_loans = config.MAX_LOANS_PER_CUSTOMER
         logger.info(f"{fold_label} | Using configured MAX_LOANS: {max_loans}")
@@ -225,6 +233,20 @@ def train_single_fold(
         if all(i.get("loan_id") is not None for i in test_inst)
         else range(len(test_inst))
     )
+    # Exposure per instance, for the ranking-by-amount-decile slice. Read from
+    # the RAW features — this runs before preprocessing, so the clip has not yet
+    # merged the top percentile. Summed over the instance's loans, which is the
+    # value at risk either way (one loan at loan grain, the portfolio at
+    # portfolio grain). Absent from the contract ⇒ the slice is skipped.
+    _exp_i = config.FEATURE_ORDER.index(config.EXPOSURE_FEATURE) \
+        if config.EXPOSURE_FEATURE in config.FEATURE_ORDER else None
+    if _exp_i is None:
+        logger.warning(f"EXPOSURE_FEATURE={config.EXPOSURE_FEATURE!r} is not in the "
+                       "contract — skipping the ranking-by-exposure slice.")
+        test_exposure = None
+    else:
+        test_exposure = np.array(
+            [float(np.asarray(i["features"])[:, _exp_i].sum()) for i in test_inst])
 
     # ── Stage: Preprocessing ──────────────────────────────────────────────────
     # Not checkpointed as a full round-trip — the transform itself (~3-4 min
@@ -326,7 +348,7 @@ def train_single_fold(
                         arm_metrics = full_evaluation(
                             y_test, test_probs,
                             strata=test_strata, calibrator=arm_cal,
-                            portfolio_sizes=test_sizes, tie_break=test_tie_break,
+                            portfolio_sizes=test_sizes, tie_break=test_tie_break, exposure=test_exposure,
                         )
                         sev = arm_metrics.pop("_probs_cal")[:, -1]
                         arm_metrics.pop("_cost_preds", None)
@@ -420,7 +442,7 @@ def train_single_fold(
                 probs_test = arm_test_probs[deploy_name]
                 fe = full_evaluation(
                     y_test, probs_test, strata=test_strata, calibrator=arm_cal,
-                    portfolio_sizes=test_sizes, tie_break=test_tie_break,
+                    portfolio_sizes=test_sizes, tie_break=test_tie_break, exposure=test_exposure,
                 )
                 y_pred     = fe.pop("_cost_preds")
                 y_prob_cal = fe.pop("_probs_cal")
@@ -902,6 +924,20 @@ def _log_arms_comparison(arms: dict, deploy_name: str):
         for slice_name, sub in m.get("ranking", {}).get("by_current_cat", {}).items():
             _log_ranking_line(f"  {tag} [{slice_name}]", sub)
     logger.info("  (* = deployed arm; queue sorting uses its calibrated+masked P3)")
+
+    by_exp = arms.get(deploy_name, {}).get("ranking_by_exposure") or {}
+    if by_exp:
+        logger.info(f"  ── Ranking by {config.EXPOSURE_FEATURE} decile "
+                    f"(deployed arm): does queue quality depend on loan size? ──")
+        for name, blk in by_exp.items():
+            _log_ranking_line(f"  {name}", blk)
+        aps = [b["pr_auc"] for b in by_exp.values() if "pr_auc" in b]
+        if len(aps) > 1:
+            logger.info(
+                f"    AP spread across deciles: {min(aps):.4f}–{max(aps):.4f}. "
+                "Flat ⇒ an amount-banded model buys nothing; a dip ⇒ a real "
+                "interaction to investigate (see §24)."
+            )
 
     logger.info("  ── Classification (full-distribution arms, cost-rule decisions) ──")
     for name, m in arms.items():

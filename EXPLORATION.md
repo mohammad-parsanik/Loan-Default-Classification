@@ -1,6 +1,6 @@
 # Data & Model Exploration Tools
 
-Four standalone scripts, kept permanently in the project root (not a
+Five standalone scripts, kept permanently in the project root (not a
 one-off exploration phase — re-run them each retraining cycle, especially
 after an ETL change or a new snapshot). They answer:
 
@@ -8,8 +8,9 @@ after an ETL change or a new snapshot). They answer:
 2. **Is there a separable manifold in the feature space?** → `explore_umap.py`
 3. **Is the deployed model relying on economically sensible features?** → `explore_shap.py`
 4. **Is preprocessing destroying signal before the model sees it?** → `explore_clip_impact.py`
+5. **Does a snapshot's content depend on how old it is?** → `explore_snapshot_drift.py`
 
-All four read from a local cache or a lightweight CSV — no live DB
+All five read from a local cache or a lightweight CSV — no live DB
 connection needed for any of them.
 
 ---
@@ -197,10 +198,21 @@ Reads the per-snapshot cache `data/snapshots/train_<key>/` (override with
 same table.
 
 ```bash
-python explore_clip_impact.py
+python explore_clip_impact.py --ranked_only
 python explore_clip_impact.py --only REMAINING_AMNT,UPCOMING_AMNT,PAYED_OVERDUE_AMNT
 python explore_clip_impact.py --baseline data/cache_700m.npz
 ```
+
+**Always pass `--ranked_only`.** Without it both lifts are computed over every
+mature row, including the `current_cat >= CARVE_CURRENT_CAT_GE` rows that are
+rule-flagged and never enter the queue. Those are severe *by definition*
+(`label >= current_cat`), so any delinquency-ranking column pins at the
+arithmetic ceiling `1 / base_rate` and looks like discovered signal — that is
+what made 22 features read above 5x lift in Run 7. `head_lift` is the same
+question at the p1 end, which `tail_lift` cannot see and which matters more:
+`PAYED_OVERDUE_INST_CNT` (`p1 = 3`) and `HIST_MAX_DPD_DAYS` (`p1 = 1`) push
+"never overdue" up into the delinquent bins, collapsing the clean end of the
+distribution that the `current_cat_0` task lives in.
 
 `--baseline` diffs `p99` and `max` against an older cache and adds a
 `p99_ratio` column — how far the bound moved when the population changed.
@@ -213,6 +225,8 @@ rebuild overwrites the only copy of the comparison.
 |---|---|---|
 | `tail_lift ≈ 1`, small `tail_span` | clip bound is benign | leave it alone |
 | `tail_lift > 1.5`, large `n_merged` | the clip is merging a risk-bearing tail into one value | candidate for `clip: false` in `contract/columns.json` — **then A/B it on validation lift@K**, don't ship on this number alone |
+| `p1 >= p99` | clipping makes the column a **constant** — it carries nothing into any arm | `clip: false`, no A/B needed; this is a defect, not a trade-off |
+| `head_lift > 1.5` | severe events concentrate *below* p1; the low clip folds them into the bottom bin | candidate for `clip: false` — and check whether p1 sits on a semantic boundary like "never delinquent" |
 | `tail_lift < 1` | large values are the *safe* end | leave it alone; this is the `DAYS_SINCE_LAST_*` shape, where high = healthy |
 | `p99_ratio` ≫ 1 under `--baseline` | the population change moved the bound | expected after a scope-filter change; read `tail_lift` on the new cache to decide whether it matters |
 
@@ -225,6 +239,50 @@ decides that.
 Changing a `clip` flag edits `contract/columns.json`, which bumps
 `contract_version` and invalidates the NPZ cache on its own — no
 `DATA_VERSION` bump needed for that particular change.
+
+## Script 5: `explore_snapshot_drift.py` — does a snapshot's content depend on how OLD it is?
+
+The upstream installment table is **hard-deleted** for loans the bank is
+done with (fully paid, or post-NPL), and every snapshot was rebuilt from a
+single as-of view during the ≤7B backfill. An old snapshot was therefore
+reconstructed after more of its loans had been deleted than a recent one —
+and the scope filter (`last installment >= T+6`) suppresses payoff-driven
+removal while leaving NPL-driven removal alone, so what goes missing is
+disproportionately the `WORST_FUTURE_CAT = 3` rows. Full argument and the
+measured numbers: `AGENT_HANDOFF.md` §24.
+
+Reports per snapshot: row count, customer count, severe rate, mean
+portfolio size, and the mean of 11 customer-history "canary" columns
+(`COUNT_ACTIVE_CONTRACTS`, `AVG_DPD_OTHER_LOANS`, `WORST_CLOSED_LOAN_DPD`,
+…) — the columns computed over the customer's *other* loans, which sibling
+deletion drags down. Then Spearman rho of each series against snapshot
+order.
+
+Reads the per-snapshot cache `data/snapshots/train_<key>/` (override with
+`--cache`). No DB, no model. Writes `explore_output/snapshot_drift.csv`.
+
+```bash
+python explore_snapshot_drift.py
+python explore_snapshot_drift.py --ranked_only        # match the queue population
+python explore_snapshot_drift.py --features COUNT_ACTIVE_CONTRACTS,AVG_DPD_OTHER_LOANS
+```
+
+### How to act on it
+
+| Observation | Meaning | Action |
+|---|---|---|
+| `severe_rate` rho ≈ 0 | no age dependence | nothing to correct; the drift hypothesis is dead |
+| `severe_rate` rho > 0.7, canary means follow | **deletion signature** — old snapshots depleted of class-3 rows | treat training labels as biased; confirm with a cohort-persistence count, then reweight or restrict snapshots (§24) |
+| `severe_rate` rho > 0.7, canary means flat | points to genuine portfolio deterioration | refit calibration on the newest mature snapshot; training labels are usable as-is |
+
+**This is strong evidence, not proof.** Portfolio growth lifts the canary
+means on its own — row volume is already up ~25% across the current
+snapshot range — so a positive rho on the features is consistent with both
+hypotheses. What discriminates is that growth does *not* preferentially
+delete class-3 rows, so it cannot explain a rising severe rate. The
+conclusive test is comparing one snapshot date across two cache vintages;
+**copy the cache aside before any rebuild**, since the path is reused and
+that comparison was already lost once.
 
 ## Recommended workflow (each retraining cycle)
 
@@ -244,6 +302,11 @@ Changing a `clip` flag edits `contract/columns.json`, which bumps
        risk-bearing tail. Run this BEFORE step 3 after any population
        or distribution change — no point explaining a model that was
        fitted on truncated inputs.
+
+5. python explore_snapshot_drift.py
+     → confirm the severe rate and the customer-history features aren't
+       trending with snapshot age. Run this after ANY upstream rebuild or
+       backfill — it is the only check that sees retroactive deletion.
 ```
 
 None of these scripts modify the pipeline or its artifacts — they're

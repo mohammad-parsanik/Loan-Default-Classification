@@ -121,6 +121,33 @@ def filter_mature_snapshots(raw_snaps, horizons: Optional[Dict] = None) -> list:
     return mature
 
 
+def _apply_train_window(train_snaps: Set, quiet: bool = False) -> Set:
+    """
+    Narrow an eligible training window to config.TRAIN_WINDOW_SNAPSHOTS.
+
+    None (default) keeps everything. Positive N keeps the NEWEST N snapshots,
+    negative N the OLDEST N — the two halves of the recency A/B in §24, which
+    asks whether retroactive deletion upstream costs ranking quality or only
+    calibration. Snapshot dates sort chronologically as ints, so ordering them
+    needs no date parsing.
+    """
+    n = getattr(config, "TRAIN_WINDOW_SNAPSHOTS", None)
+    if not n or not train_snaps:
+        return train_snaps
+
+    ordered = sorted(train_snaps)
+    kept = set(ordered[-n:] if n > 0 else ordered[:-n])
+    if quiet:
+        return kept
+    logger.warning(
+        f"TRAIN_WINDOW_SNAPSHOTS={n}: keeping the {len(kept)} "
+        f"{'newest' if n > 0 else 'oldest'} of {len(ordered)} eligible training "
+        f"snapshot(s) — {sorted(kept)}. This DISCARDS training data on purpose; "
+        "set it back to None for a production run."
+    )
+    return kept
+
+
 def _get_usable_snapshots(instances: List[Dict]) -> Tuple[list, list]:
     """
     From a list of instances, return (usable_raw, usable_dates) —
@@ -253,6 +280,8 @@ def split_by_time(instances: List[Dict]) -> tuple:
                     f"No snapshot is at least {horizon} months before test "
                     f"snapshot {test_raw}. Train set will be empty."
                 )
+
+    train_snaps = _apply_train_window(train_snaps)
 
     # ── 4. Build instance lists ───────────────────────────────────────────────
     train_inst = [i for i in instances if i["snapshot_date"] in train_snaps]
@@ -398,6 +427,13 @@ def generate_walk_forward_folds(
         )
         return []
 
+    if (window := getattr(config, "TRAIN_WINDOW_SNAPSHOTS", None)):
+        logger.warning(
+            f"TRAIN_WINDOW_SNAPSHOTS={window}: every fold below trains on the "
+            f"{'newest' if window > 0 else 'oldest'} {abs(window)} of its "
+            "eligible snapshots. Deliberate data reduction — see §24."
+        )
+
     folds: List[Fold] = []
     fold_id = 0
 
@@ -421,6 +457,10 @@ def generate_walk_forward_folds(
                 for i in range(val_idx)
                 if _months_apart(usable_dates[i], val_date) >= horizon
             ]
+            # Narrow BEFORE the min check, so the minimum applies to what the
+            # fold actually trains on rather than to what it was eligible for.
+            train_candidates = sorted(
+                _apply_train_window(set(train_candidates), quiet=True))
 
             if len(train_candidates) < min_train_snapshots:
                 continue  # not enough training data for this fold
