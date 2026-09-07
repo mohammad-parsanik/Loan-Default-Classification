@@ -1,6 +1,6 @@
 {
   "_comment": "Machine-readable column contract for the upstream feed. Code fields only: no column semantics (see etl_integration/, local-only, for those). Refresh by re-running the same projection over the vendored ETL copy; src/data/column_contract.py cross-checks the two when both are present.",
-  "contract_version": 2,
+  "contract_version": 3,
   "table": "D_ANALYTICS.EDP_LOAN_FEATURES",
   "etl_commit": "98a67ac",
   "columns": [
@@ -32,7 +32,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 5,
@@ -48,7 +49,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 7,
@@ -80,7 +82,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 11,
@@ -96,7 +99,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 13,
@@ -168,7 +172,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 22,
@@ -176,7 +181,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 23,
@@ -184,7 +190,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 24,
@@ -192,7 +199,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 25,
@@ -200,7 +208,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 26,
@@ -208,7 +217,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 27,
@@ -216,7 +226,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 28,
@@ -248,7 +259,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": false,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 32,
@@ -256,7 +268,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 33,
@@ -264,7 +277,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 34,
@@ -312,7 +326,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 40,
@@ -320,7 +335,8 @@
       "type": "INT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 41,
@@ -533,7 +549,8 @@
       "type": "FLOAT",
       "role": "feature",
       "nullable": true,
-      "binary": false
+      "binary": false,
+      "clip": false
     },
     {
       "ordinal": 65,

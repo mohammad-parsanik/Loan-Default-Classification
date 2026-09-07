@@ -39,21 +39,30 @@ _CODE_FIELDS = ("ordinal", "name", "type", "role", "nullable",
 # ETL copy, pending upstream adopting them. The vendored copy stays
 # authoritative for everything not listed here.
 #
-# These nine are bounded integer counts (observed max <= 14). Clipping exists
-# to bound unbounded tails; they have none, so [p1, p99] only merges legitimate
-# values. `COUNT_90PLUS_DPD_LAST_3M` is the proof: measured p1 == p99 == 0, so
-# the clip reduced it to a CONSTANT in every arm (AGENT_HANDOFF.md §23).
-# `clip` only — scaling is monotone and XGBoost splits on order, so there is no
-# reason to claim these must reach the model unscaled.
+# Contract v2 (9 features): bounded integer counts (observed max <= 14).
+# Contract v3 (17 features): 10 bounded no-ops, 4 trend features, and 3 critical
+# head/boundary features (HIST_MAX_DPD_DAYS to protect the 0-DPD pristine signal,
+# PAYED_OVERDUE_INST_CNT to protect cure-failure signal, and PCT_COMPLETED).
 #
 # Delete an entry once upstream ships it; _check_vendored_copy says when.
 _LOCAL_OVERRIDES: dict[str, dict] = {
     name: {"clip": False} for name in (
+        # Contract v2: 9 bounded integer counts
         "COUNT_90PLUS_DPD_LAST_3M", "COUNT_60PLUS_DPD_LAST_3M",
         "COUNT_30PLUS_DPD_LAST_3M", "PRE_UPTO30_DPD_LOANS",
         "PRE_UPTO60_DPD_LOANS", "PRE_UPTO120_DPD_LOANS",
         "PRE_UPTO150_DPD_LOANS", "COUNT_ACTIVE_CONTRACTS",
         "COUNT_DELINQUENT_CONTRACTS",
+        # Contract v3: 10 bounded no-ops
+        "LOAN_CATEGORY", "OVERDUE_RATIO", "ONTIME_RATIO",
+        "CATEGORY_T1", "CATEGORY_T2", "CATEGORY_T3",
+        "HIST_MAX_CATEGORY", "MONTHS_IN_CURRENT_CATEGORY",
+        "COUNT_DPD_EVENTS_LAST_3M", "COUNT_DPD_EVENTS_LAST_6M",
+        # Contract v3: 4 trend signals
+        "CATEGORY_TREND_1M", "CATEGORY_TREND_3M",
+        "DPD_TREND_1M", "DPD_TREND_3M",
+        # Contract v3: 3 critical head/boundary features
+        "HIST_MAX_DPD_DAYS", "PAYED_OVERDUE_INST_CNT", "PCT_COMPLETED",
     )
 }
 
