@@ -1653,6 +1653,46 @@ def test_stratum_lift_separates_signal_from_composition():
         "inside cat_2 the tail is an ordinary cat_2 row — it was composition"
 
 
+# ── an artifact says which contract it was fitted under ───────────────────────
+
+def test_artifacts_record_their_contract_and_warn_when_it_drifts(caplog):
+    """
+    A fitted OutlierClipper pickles its own `bounds_`, so a v2 artifact keeps
+    behaving as fitted even under v3 code. That is correct — and it was also
+    invisible, so a v2 bundle and a v3 bundle looked identical at load time.
+    """
+    import logging
+
+    from src.data.column_contract import CONTRACT_VERSION
+    from src.inference.model_loader import _warn_on_contract_drift, build_arm_bundle
+
+    bundle = build_arm_bundle(scaler=None, arm=None, calibrator=None,
+                              max_loans=1, features=["A"])
+    assert bundle["metadata"]["contract_version"] == CONTRACT_VERSION
+
+    with caplog.at_level(logging.WARNING):
+        _warn_on_contract_drift({"contract_version": CONTRACT_VERSION - 1}, "old.pkl")
+    assert "fitted under column contract" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _warn_on_contract_drift({}, "predates_the_field.pkl")
+        _warn_on_contract_drift({"contract_version": CONTRACT_VERSION}, "current.pkl")
+    assert caplog.text == "", "silent when it matches, or when it cannot be known"
+
+
+def test_effective_config_names_the_knobs_that_drifted():
+    """Run 8 ran DEPLOY_ARM='auto' with 5 Optuna trials while the repo said
+    'multiclass' and 0, and nothing in the artifacts recorded it."""
+    import run
+
+    cfg = run._effective_config()
+    assert {"deploy_arm", "arm_optuna_trials", "train_window_snapshots",
+            "prediction_grain", "contract_version"} <= set(cfg)
+    assert cfg["deploy_arm"] == config.DEPLOY_ARM
+    assert cfg["arm_optuna_trials"] == config.ARM_OPTUNA_TRIALS
+
+
 # ── the tuning objective scores the queue, not the label identity ─────────────
 
 def test_tuning_objective_ignores_rows_that_are_severe_by_definition():

@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 import project_config as config
+from src.data.column_contract import CONTRACT_VERSION
 from src.data.data_explorer import explore_data
 from src.data.data_loader import DataLoader
 from src.data.dataset import create_dataloaders
@@ -140,6 +141,28 @@ def timed(label: str, timing_log: dict):
     logger.info(f"✓  {label} completed in {elapsed:.1f}s")
 
 
+def _effective_config() -> dict:
+    """
+    The knobs that decide what a run IS, as this process actually sees them.
+
+    Recorded in metadata.json and echoed at startup because the tree and the
+    training server have drifted silently before: every Run 8 log says
+    `Deployed arm (auto, ...)` and tunes 5 Optuna trials, while the repo says
+    DEPLOY_ARM = "multiclass" and ARM_OPTUNA_TRIALS = 0. A shipped bundle has
+    to be reproducible from a config someone can read.
+    """
+    return {
+        "deploy_arm": config.DEPLOY_ARM,
+        "model_arms": list(config.MODEL_ARMS),
+        "arm_optuna_trials": config.ARM_OPTUNA_TRIALS,
+        "train_window_snapshots": config.TRAIN_WINDOW_SNAPSHOTS,
+        "prediction_grain": config.PREDICTION_GRAIN,
+        "walk_forward": config.WALK_FORWARD_ENABLED,
+        "data_version": config.DATA_VERSION,
+        "contract_version": CONTRACT_VERSION,
+    }
+
+
 def _now_str() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -212,6 +235,15 @@ def train_single_fold(
         # What a scored row IS — inference builds instances and features to
         # match this, not to whatever project_config says at predict time.
         "grain": config.PREDICTION_GRAIN,
+        # Which contract's clip/scale flags this artifact's preprocessing was
+        # fitted under. The transformers carry their own bounds, so an older
+        # artifact keeps working — this is here so that fact is visible.
+        "contract_version": CONTRACT_VERSION,
+        # The knobs that decide what a run IS. Recorded because the tree and
+        # the training server have drifted before: Run 8 ran DEPLOY_ARM="auto"
+        # with 5 Optuna trials while the repo said "multiclass" and 0, and
+        # nothing in the artifacts said so.
+        "config": _effective_config(),
     }))
 
     # Current-category strata for slice-level evaluation and stratified
@@ -714,6 +746,8 @@ def train_pipeline(resume_dir: Path = None, final_fit: bool = False):
     logger.info(
         f"Walk-forward mode: {'ENABLED' if config.WALK_FORWARD_ENABLED else 'DISABLED (single split)'}"
     )
+    logger.info("Effective config: "
+                + " | ".join(f"{k}={v}" for k, v in _effective_config().items()))
 
     # ── Run directory ─────────────────────────────────────────────────────────
     if resume_dir and resume_dir.exists():

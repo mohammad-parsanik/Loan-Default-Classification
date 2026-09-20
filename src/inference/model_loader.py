@@ -29,6 +29,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
 from src.baselines.aggregated_xgboost import build_features
+from src.data.column_contract import CONTRACT_VERSION
 from src.data.preprocessing import assert_pipeline_features
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,28 @@ def _require_features(features: list, source) -> list:
     return list(features)
 
 
+def _warn_on_contract_drift(meta: dict, where: str) -> None:
+    """
+    Say when an artifact was fitted under a different column contract.
+
+    Not an error: a fitted OutlierClipper pickles its own `bounds_`, so an
+    older artifact keeps behaving exactly as it was fitted — it does not pick
+    up the current NO_CLIP/CLIP_BOUNDS. That is correct, but it was also
+    invisible, so a v2 bundle scoring under v3 code looked identical to a v3
+    one. Silent when the key is absent, since artifacts predating this did not
+    record it — the same precedent as `feature_names_in_` in preprocessing.py.
+    """
+    fitted = meta.get("contract_version")
+    if fitted is not None and fitted != CONTRACT_VERSION:
+        logger.warning(
+            f"{where} was fitted under column contract v{fitted}; this code is "
+            f"at v{CONTRACT_VERSION}. Its preprocessing is pinned to the "
+            "contract it was fitted with (the transformers carry their own "
+            "bounds), so scoring is consistent — but no clip/scale change "
+            "made since then is in this artifact. Refit to pick one up."
+        )
+
+
 # ── Bundles ───────────────────────────────────────────────────────────────────
 
 def build_arm_bundle(scaler, arm, calibrator, max_loans, features) -> dict:
@@ -150,7 +173,8 @@ def build_arm_bundle(scaler, arm, calibrator, max_loans, features) -> dict:
         "calibrator": calibrator,
         "metadata": {"max_loans_per_customer_99th": max_loans,
                      "features": features, "num_classes": config.NUM_CLASSES,
-                     "grain": config.PREDICTION_GRAIN},
+                     "grain": config.PREDICTION_GRAIN,
+                     "contract_version": CONTRACT_VERSION},
     }
 
 
@@ -159,6 +183,7 @@ def load_bundle(bundle_path: Path, device: str):
     logger.info(f"Loading model bundle from {bundle_path}…")
     bundle = joblib.load(bundle_path)
     meta = bundle["metadata"]
+    _warn_on_contract_drift(meta, str(bundle_path))
     features = meta.get("features", [])
     max_loans = meta["max_loans_per_customer_99th"]
 
@@ -214,6 +239,7 @@ class ModelLoader:
 
         with open(self.artifact_dir / "metadata.json") as f:
             meta = json.load(f)
+        _warn_on_contract_drift(meta, str(self.artifact_dir))
         features = meta.get("features", [])
         max_loans = meta["max_loans_per_customer_99th"]
         scaler = joblib.load(self.artifact_dir / "scaler.pkl")
