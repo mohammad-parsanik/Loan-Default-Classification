@@ -1167,3 +1167,186 @@ population exactly and stay balanced; the degenerate slice scores against all
 - **Fix it upstream.** Not available now. Worth standing as a request: a
   soft-delete flag or a tombstone row would make the whole problem measurable and
   most of it correctable.
+
+---
+
+## 25. Run 8, Contract v3, and the `tail_lift` Artifact (September 20, 2026)
+
+Run 8 (`results_8/`, 2026-09-06) is the second end-to-end pass on the ≤7B loan-grain
+feed. Contract v3 (`8c0ebbe`, 2026-09-07) was committed *after* it, on the strength of
+`results_8/clip_impact_ranked.csv`. Reviewing the two together found that **the diagnostic
+those decisions rest on could not answer the question being asked of it**, in three
+separate ways. The corrections are in; the decisions they affect are deliberately left
+open pending a re-measurement.
+
+### Run 8 numbers
+
+Test `20260219`, 16 train snapshots (`20240419`…`20250722`), 16,872,770 train /
+4,204,534 val / 1,655,036 test. Severe base rate on the ranked population 0.0903.
+
+| Arm | pooled AP | `current_cat_0` AP | 1_day lift (cat_0) |
+|---|---|---|---|
+| multiclass | 0.6744 | 0.1837 | 21.2× |
+| binary | 0.6693 | 0.1544 | 13.7× |
+| ordinal | 0.6738 | **0.2208** | 28.9× |
+| per_cat (deployed) | **0.6821** | 0.2053 | 26.3× |
+
+**`DEPLOY_ARM` is now a three-way question, not the two-way one §23 framed.** `per_cat`
+wins pooled AP for the second run running (§23: 0.6721 vs 0.6555), but `ordinal` wins the
+`current_cat_0` slice — which is the slice CLAUDE.md says to judge on. Do not flip the
+lock on this; §18 item 2's walk-forward should run **three** arms.
+
+`ranking_by_exposure` came back flat (AP 0.6600–0.7025 across `REMAINING_AMNT` deciles),
+which is the §24 banding test answering *no*: an amount-banded model buys nothing.
+
+> **Run 8 did not run the config in the tree.** All three logs say
+> `Deployed arm (auto, best pooled ranking AP)` and tune 5 Optuna trials, while
+> `project_config` says `DEPLOY_ARM = "multiclass"` and `ARM_OPTUNA_TRIALS = 0`. Run 7 ran
+> the tree's value. That drift is now visible — `_effective_config()` is echoed at startup
+> and written into `metadata.json` — but which value is *correct* is left to the
+> walk-forward. **Run 8's tuned parameters should not be reused**: the objective that
+> produced them was wrong (below).
+
+### The recency A/B — the largest finding in Run 8, and it is not about clipping
+
+`TRAIN_WINDOW_SNAPSHOTS` (§24's knob) was exercised for the first time. Same test fold,
+same everything else:
+
+| Train window | pooled AP | **`current_cat_0` AP** |
+|---|---|---|
+| oldest 6 (`-6`) | 0.6621 | 0.1358 |
+| all 16 (`None`) | 0.6821 | 0.2053 |
+| newest 6 (`+6`) | 0.6795 | **0.2422** |
+
+Monotone in recency, and the same shape in `multiclass` (0.1150 / 0.1837 / 0.1895). **Six
+recent snapshots nearly match sixteen on pooled AP and beat them by 18% on the `cat_0`
+slice.** Pooled AP prefers all sixteen because it is dominated by cat_1/cat_2 rows where
+more data helps; the early-warning slice prefers recency. That is §24's retroactive
+deletion showing up as a measurable cost to the deliverable, and it is a larger lever than
+any clipping flag.
+
+One fold, no CI — a finding, not a settled result. It belongs in §18 above the clipping
+work.
+
+### What contract v3 got wrong
+
+**1. `PCT_COMPLETED` was exempted on a false premise.** `clipping_implementation_plan.md`
+calls it "naturally bounded between 0.0 and 1.0". `etl_integration/CONSUMER_CONTRACT.md`
+col 64 says the opposite: `INSTALLMENT_COUNT` disagrees with the fact table in both
+directions, the error is known and unquantified, and — under Group G — the column "can
+exceed 1.0. Do not assume it is bounded." Of the 17 exemptions it was the only one that
+genuinely un-bounded a column, and it was the column with a documented upstream defect.
+
+**2. The head-side numbers were measured before imputation; the pipeline clips after it.**
+`run.py:262` fits impute → clip → scale, but `clip_report` dropped NaN before
+`np.percentile`. For the 23 nullable clipped columns its `p1`/`p99` were therefore never
+the bounds `OutlierClipper` fits. `DomainAwareImputer` fills most columns with `0.0`, so
+**any column with a null rate above ~1% has a real `p1` of 0.0 and no head clip at all.**
+Both head-side headliners are nullable: `HIST_MAX_DPD_DAYS` (col 32) and `PCT_COMPLETED`
+(col 64). `PAYED_OVERDUE_INST_CNT` is `Null: N`, so its `head_lift = 16.26` stands.
+
+**3. `tail_lift` measures composition, and has produced a wrong answer twice.**
+
+This is the important one, and it generalises §23's blind spot rather than being a new
+instance of it.
+
+*First:* `tail_lift` measures the tail **as a block** — and clipping does not destroy a
+block. After `np.clip`, a split anywhere in `(p99−ε, p99]` still isolates the merged rows,
+so "this row was beyond the bound" survives. What dies is the **ordering inside** the
+region. A high `tail_lift` therefore *opens* the question and cannot close it.
+
+*Second:* `--ranked_only` removed cat_3 but not cat_2. A tail made entirely of cat_2 rows
+reports `cat2_rate / ranked_base_rate` with zero incremental signal. Solving backwards
+from `results_8/clip_impact_ranked.csv` at the observed cat_2 rate of 0.5939:
+
+| Feature | observed `tail_lift` | implied ranked base rate |
+|---|---|---|
+| `TOTAL_DPD_DAYS_LAST_6M` | 11.737 | 5.06% |
+| `MAX_DPD_LAST_3M` | 10.270 | 5.78% |
+| `TOTAL_DPD_DAYS_LAST_3M` | 10.173 | 5.84% |
+| `MAX_DPD_LAST_6M` | 7.951 | 7.47% |
+
+§24 puts the ranked base rate at **4.63%** on train; cache-wide, including the hotter gap
+and test windows, it lands in 5–6%. **These are ~exactly what pure composition produces.**
+
+The unranked ceiling confirms the mechanism exactly: in `results_8/clip_impact.csv`,
+`DPD_DAYS`, `UNPAYED_INST_CNT` and `CATEGORY_TREND_1M` all report
+`tail_lift = 11.012665403804089` to sixteen digits, and `1/11.0127 = 9.0805%` — the §24
+pooled severe base rate. Run 7's DPD numbers were the label identity; Run 8's ranked
+numbers are the cat_2 composition one level down.
+
+**Consequence: the standing position — leave the DPD family clipped — is the
+better-supported one.** The "clipping protects the scaling" instinct is half right and
+worth stating precisely: `RobustScaler` centers on the median and scales by the IQR, both
+interior statistics that the top 1% cannot move, so **un-clipping cannot change the fitted
+scaler at all** — only the scaled values of the tail rows, which XGBoost cannot see
+because it splits on order. The hazard is therefore **inert for the deployed model and
+live only if DeepSets is ever re-enabled**. That is a reason to record the coupling, not a
+reason to keep clipping.
+
+### What landed
+
+- **`clip_bounds` in the contract** (`contract/columns.json`, `CLIP_BOUNDS` in
+  `column_contract.py`): clip to a range the column's *definition* gives instead of one its
+  sample gives. `PCT_COMPLETED`, `OVERDUE_RATIO` and `ONTIME_RATIO` move to `[0, 1]` and
+  out of `NO_CLIP`. For `PCT_COMPLETED` this is strictly better than either prior state —
+  `hi = 1.0` clamps the upstream defect that `p99 = 0.850` was also clamping, while
+  `lo = 0.0` leaves a brand-new loan alone, which `p1 = 0.067` did not. It also retires
+  `OutlierClipper`'s `"RATIO" in col` test on the column NAME, which reached the two ratios
+  by luck and missed `PCT_COMPLETED` — a ratio in everything but its name. `_validate`
+  rejects a column claiming both `clip: false` and `clip_bounds`.
+- **`NO_CLIP` is now 27 columns over three populations**, not two: sentinel-bearing,
+  bounded counts, and the v3 signal-preservation exemptions.
+- **`explore_clip_impact.py` imputes before measuring**, fitting the real
+  `DomainAwareImputer` and applying its fill values in place (`transform()` would vstack a
+  second multi-GB copy). New columns: `pct_null`; `tail_gradient` / `head_gradient`
+  (P(severe | outer quartile of the region) / P(severe | inner quartile) — ~1 means the
+  region is internally flat and the clip costs nothing); `pct_tied_hi` / `pct_tied_lo`
+  (rows already sitting ON the bound, which the merged rows become indistinguishable from
+   — the case where the clip costs the split itself, not just the ordering). New
+  `--by_current_cat` reports the lift inside each queued stratum against that stratum's
+  own base rate; **read `tail_lift_cat0`**. It warns when run without it, and a column is
+  flagged as costly only when the tail is both risky *and* has a ramp inside it.
+- **`_cache_key` hashes contract CONTENT** (`CACHE_FINGERPRINT`: ordinal, name, type, role,
+  nullable, sentinel) rather than `contract_version`. The preprocessing flags are consumed
+  downstream of the NPZ, so a flag-only bump forced 2066s and ~12 GB of reload to produce
+  byte-identical files. `contract_version` is still written into every manifest.
+  `DATA_VERSION` remains the escape hatch for a meaning-change the contract cannot see.
+- **`load_cached_arrays` validates what it hands over.** It is the diagnostics' entry
+  point, takes an arbitrary directory, and previously assigned `feature_cols` *inside* the
+  loop — so it silently took the last snapshot's column list and never checked the
+  snapshots agreed. Different feature lists at the same width would concatenate
+  misaligned with no error. It now raises on disagreement and warns when the agreed list
+  differs from the current contract (which is what `--baseline` legitimately looks like).
+- **The Optuna objective is carved.** `tune_arm_params` scored average precision over the
+  *whole* validation set; `cat_val` was passed in and used for prediction but never used to
+  carve, so rows severe by the label identity were in the objective. That is the
+  aggregate-accuracy trap from `MODEL_EVALUATION.md` applied to tuning, and it is why
+  Run 8 logs `best val PR-AUC(severe) = 0.9036` against a test pooled AP of 0.6744. Now
+  `ranked_severe_ap`, matching `ranking.py:71` and `metrics.py:86`.
+- **Artifacts record their contract and config.** `metadata.json` and `build_arm_bundle`
+  carry `contract_version` and `_effective_config()`; `ModelLoader` warns on drift. A
+  fitted `OutlierClipper` pickles its own `bounds_`, so an older artifact keeps behaving as
+  fitted — correct, but it used to be invisible.
+
+Regression tests: cache key stable under flag flips and moving under renames; mismatched
+snapshots raise; `clip_bounds` beats percentiles and the name test is gone; a nullable
+column's `p1` collapses to 0.0 once its fill value is in the distribution; `tail_gradient`
+recovers a planted ramp and returns ~1 on a flat tail; a stratum lift of ~1 exposes a tail
+that was pure composition; the tuning objective scores only the ranked rows.
+
+### Open, in priority order
+
+1. **Re-run the diagnostic** — `explore_clip_impact.py --ranked_only --by_current_cat`.
+   The first invocation rebuilds the cache once (the key changed; v3 had already forced
+   this anyway). Read `tail_gradient`, `pct_tied_hi`, `pct_null` and `tail_lift_cat0`.
+   A flat gradient and a cat_0 lift near 1 closes the clipping question **in favour of the
+   status quo, with evidence** — which is the outcome the arithmetic above predicts.
+   `pct_null` also decides whether `HIST_MAX_DPD_DAYS`'s exemption ever had a head-side
+   rationale, and whether `PCT_COMPLETED`'s nulls (imputed to `0.0`, now landing exactly on
+   its declared lower bound) need a ticket of their own.
+2. **Three-arm walk-forward** for `DEPLOY_ARM`, at `ARM_OPTUNA_TRIALS = 0`. Independent of
+   clipping and already §18 item 2.
+3. **The clipping A/B** — only if step 1 shows a real ramp. If it does not, that *is* the
+   answer.
+4. **Recency**, per the A/B above. Probably worth more than 1–3 combined.

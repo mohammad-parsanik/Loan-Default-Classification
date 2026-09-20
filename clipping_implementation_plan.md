@@ -1,5 +1,24 @@
 # Clipping Analysis: Features That Shouldn't Be Clipped (Contract v2 → v3)
 
+> [!WARNING]
+> **Superseded in part — corrected 2026-09-20. See `AGENT_HANDOFF.md` §25.**
+> This document is kept because the reasoning is the useful part of the record,
+> including where it was wrong. Three corrections:
+>
+> 1. **`PCT_COMPLETED` is not bounded by the feed.** Category 3 item 3 below
+>    asserted it is. `etl_integration/CONSUMER_CONTRACT.md` col 64 says the
+>    opposite. Corrected in place below; the column now carries
+>    `clip_bounds: [0, 1]` instead of `clip: false`.
+> 2. **The `head_lift` figures were measured before imputation**, but the
+>    pipeline clips *after* it. For a nullable column the `p1` quoted here may
+>    never have been the clipper's `p1` — which affects `HIST_MAX_DPD_DAYS`
+>    and `PCT_COMPLETED`, both nullable. `PAYED_OVERDUE_INST_CNT` is not.
+> 3. **The `tail_lift` figures are composition, not signal.** `--ranked_only`
+>    removes cat_3 but not cat_2, and at the observed rates a tail made purely
+>    of cat_2 rows reports ~11.7 with zero incremental signal. The "Features
+>    Retained" section's reasoning stands on a different footing than it
+>    claims, and the DPD A/B it earmarks is now gated on a re-measurement.
+
 ## How Clipping Works in This Pipeline
 
 `OutlierClipper` clips non-binary, non-exempt features to `[p1, p99]` (fitted on train). XGBoost splits on order, so clipping is the **only** preprocessing step the model can feel — it merges all values outside the bounds into one number, permanently destroying the ordering in those regions.
@@ -78,10 +97,24 @@ Loans below p1 have `head_lift` of 5.22 and 7.47 (5–7× more likely to go seve
 * `OutlierClipper` pushes them **up to 3.0**, blending cure failures directly into the cured population.
 * **Action:** Set `clip: false`.
 
-### 3. `PCT_COMPLETED`: Bounded Percentage
-* `PCT_COMPLETED` is naturally bounded between $0.0$ and $1.0$.
+### 3. `PCT_COMPLETED`: Bounded by Definition, Not by the Feed — CORRECTED
+* ~~`PCT_COMPLETED` is naturally bounded between $0.0$ and $1.0$.~~ **Wrong.**
+  `etl_integration/CONSUMER_CONTRACT.md` col 64: it is `MATURED_INST_CNT / INSTALLMENT_COUNT`,
+  explicitly nullable, and carries "a known, unquantified error — the dimension's
+  `INSTALLMENT_COUNT` disagrees with the fact table in both directions". Group G states
+  plainly: **"`PCT_COMPLETED` can exceed 1.0. Do not assume it is bounded."** The
+  `max = 0.9958` in `clip_impact_ranked.csv` is one cache's observed max, not a bound.
 * Because its name doesn't contain `"RATIO"`, it was clipped to $[p_1, p_{99}] = [0.067, 0.850]$, capping loans that are 99% complete down to 85%, and new loans at 1% up to 6.7%.
-* **Action:** Set `clip: false`.
+* **Action (corrected):** `clip_bounds: [0.0, 1.0]`, **not** `clip: false`. Its range comes
+  from its *definition* even though the feed does not enforce it, so a declared bound is
+  right where both a percentile and an exemption are wrong: `hi = 1.0` clamps the upstream
+  defect that $p_{99} = 0.850$ was also clamping, while `lo = 0.0` leaves a brand-new loan
+  alone, which $p_1 = 0.067$ did not. Setting `clip: false` would have been the only one of
+  the 17 exemptions to genuinely un-bound a column — and on the column with a documented
+  data-quality defect.
+* Note its nulls impute to `0.0` and now land exactly on the new lower bound, conflating
+  "unknown completion" with "unstarted loan". Whether that matters depends on the null
+  rate, which `pct_null` now reports.
 
 ---
 
@@ -103,10 +136,11 @@ Loans below p1 have `head_lift` of 5.22 and 7.47 (5–7× more likely to go seve
 
 | Category | Count | Features |
 |---|---|---|
-| Bounded no-ops | 10 | `LOAN_CATEGORY`, `OVERDUE_RATIO`, `ONTIME_RATIO`, `CATEGORY_T1`, `CATEGORY_T2`, `CATEGORY_T3`, `HIST_MAX_CATEGORY`, `MONTHS_IN_CURRENT_CATEGORY`, `COUNT_DPD_EVENTS_LAST_3M`, `COUNT_DPD_EVENTS_LAST_6M` |
+| Bounded no-ops | 8 | `LOAN_CATEGORY`, `CATEGORY_T1`, `CATEGORY_T2`, `CATEGORY_T3`, `HIST_MAX_CATEGORY`, `MONTHS_IN_CURRENT_CATEGORY`, `COUNT_DPD_EVENTS_LAST_3M`, `COUNT_DPD_EVENTS_LAST_6M` (the two ratios moved to declared bounds) |
 | Trend signals | 4 | `CATEGORY_TREND_1M`, `CATEGORY_TREND_3M`, `DPD_TREND_1M`, `DPD_TREND_3M` |
-| Critical head & boundary fixes | 3 | `HIST_MAX_DPD_DAYS`, `PAYED_OVERDUE_INST_CNT`, `PCT_COMPLETED` |
-| **Total new exemptions** | **17** | |
+| Critical head & boundary fixes | 2 | `HIST_MAX_DPD_DAYS`, `PAYED_OVERDUE_INST_CNT` |
+| **Total new exemptions** | **14** | (was 17 as committed; `PCT_COMPLETED` corrected to `clip_bounds`) |
+| Declared bounds `[0, 1]` | 3 | `PCT_COMPLETED`, `OVERDUE_RATIO`, `ONTIME_RATIO` |
 
 ### Code Changes
 1. **`contract/columns.json`**: Add `"clip": false` to all 17 features; bump `contract_version` to 3.
