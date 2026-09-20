@@ -1653,6 +1653,47 @@ def test_stratum_lift_separates_signal_from_composition():
         "inside cat_2 the tail is an ordinary cat_2 row — it was composition"
 
 
+# ── the tuning objective scores the queue, not the label identity ─────────────
+
+def test_tuning_objective_ignores_rows_that_are_severe_by_definition():
+    """
+    Optuna maximised average precision over the WHOLE validation set, so rows
+    with current_cat >= CARVE_CURRENT_CAT_GE were in the objective — and those
+    are severe by the `label >= current_cat` identity and never enter the
+    queue. Tuning was partly rewarded for predicting a label definition, which
+    is why Run 8 logged a best val PR-AUC of 0.9036 against a test pooled AP of
+    0.6744.
+    """
+    from sklearn.metrics import average_precision_score
+
+    from src.baselines.aggregated_xgboost import ranked_severe_ap
+
+    severe = config.NUM_CLASSES - 1
+    rng = np.random.default_rng(0)
+    n = 1000
+
+    cat = np.zeros(n, dtype=int)
+    cat[800:] = severe                       # 20% carved out of the queue
+    y = np.zeros(n, dtype=int)
+    y[cat == severe] = severe                # severe by the identity
+    y[:40] = severe                          # the events the queue must find
+
+    # A ranker that is perfect on the carved rows and useless on the queued
+    # ones — the exact shape the uncarved objective used to reward.
+    p_sev = rng.random(n) * 0.5
+    p_sev[cat == severe] = 1.0
+
+    carved_out = ranked_severe_ap(y, p_sev, cat)
+    pooled = average_precision_score((y == severe).astype(int), p_sev)
+
+    assert pooled > 0.8, "pooled, the label identity alone looks like a model"
+    assert carved_out < 0.2, "on the queue, this ranker is worth nothing"
+    assert carved_out == pytest.approx(
+        average_precision_score((y == severe).astype(int)[cat < severe],
+                                p_sev[cat < severe])), \
+        "the objective must score exactly the ranked population"
+
+
 # ── clip_bounds: a range from the definition, not from the sample ─────────────
 
 def test_outlier_clipper_honours_declared_bounds():

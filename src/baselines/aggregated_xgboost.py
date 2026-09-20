@@ -358,6 +358,24 @@ ARM_BUILDERS = {
 }
 
 
+def ranked_severe_ap(y_true, p_sev, cat) -> float:
+    """
+    Average precision of P(severe) over the rows the queue actually RANKS —
+    `current_cat < CARVE_CURRENT_CAT_GE`, matching ranking.py:71 and
+    metrics.py:86.
+
+    Carved rows are severe by the `label >= current_cat` identity and never
+    enter the queue, so scoring them rewards predicting a label definition.
+    Lives here rather than inline in the Optuna objective so it can be tested
+    without optuna, which is a server-only dependency.
+    """
+    from sklearn.metrics import average_precision_score
+
+    queued = np.asarray(cat) < config.CARVE_CURRENT_CAT_GE
+    y_bin = (np.asarray(y_true) == config.NUM_CLASSES - 1).astype(np.int32)
+    return float(average_precision_score(y_bin[queued], np.asarray(p_sev)[queued]))
+
+
 def tune_arm_params(
     arm_name: str,
     X_train, y_train, cat_train,
@@ -367,20 +385,45 @@ def tune_arm_params(
 ) -> dict:
     """
     Optuna search over XGBoost hyperparameters for `arm_name`, maximising
-    PR-AUC of P(severe) on the validation set — the actual deliverable
-    objective (NOT macro F1; Run 5 tuned the wrong number and wasted 5.7h).
+    PR-AUC of P(severe) on the RANKED validation population — the actual
+    deliverable objective (NOT macro F1; Run 5 tuned the wrong number and
+    wasted 5.7h).
+
+    "Ranked" is the fix, not decoration. This scored the whole validation set,
+    so rows with current_cat >= CARVE_CURRENT_CAT_GE were in the objective —
+    and those are severe by the `label >= current_cat` identity and never enter
+    the queue. Tuning was therefore partly rewarded for predicting a label
+    definition. It is the aggregate-accuracy trap from MODEL_EVALUATION.md
+    applied to the tuning objective, and it is why Run 8 logged a best val
+    PR-AUC of 0.9036 against a test pooled AP of 0.6744. The carve matches
+    ranking.py:71 and metrics.py:86, so tuning and evaluation now agree on
+    which rows count.
 
     Returns the best-params dict to pass into the arm's constructor. Only
     meaningful for full-distribution arms; the binary arm is a diagnostic
     and is not tuned. optuna is imported lazily (server-only dependency).
     """
     import optuna
-    from sklearn.metrics import average_precision_score
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     builder = ARM_BUILDERS[arm_name]
     severe = config.NUM_CLASSES - 1
     y_val_bin = (y_val == severe).astype(np.int32)
+
+    queued = np.asarray(cat_val) < config.CARVE_CURRENT_CAT_GE
+    n_pos = int(y_val_bin[queued].sum())
+    if not queued.any() or n_pos == 0:
+        raise ValueError(
+            f"Cannot tune '{arm_name}': the ranked validation slice "
+            f"(current_cat < {config.CARVE_CURRENT_CAT_GE}) holds "
+            f"{int(queued.sum()):,} row(s) and {n_pos} severe event(s), so "
+            "average precision is undefined. Check the validation split."
+        )
+    logger.info(
+        f"Optuna[{arm_name}]: scoring on {int(queued.sum()):,} of "
+        f"{len(queued):,} val rows (current_cat < {config.CARVE_CURRENT_CAT_GE}); "
+        f"{n_pos:,} severe, base rate {y_val_bin[queued].mean():.4%}."
+    )
 
     def objective(trial):
         params = {
@@ -396,11 +439,12 @@ def tune_arm_params(
         arm = builder(random_state=random_state, params=params)
         arm.train(X_train, y_train, cat_train)
         p_sev = arm.predict_proba(X_val, cat_val)[:, -1]
-        return average_precision_score(y_val_bin, p_sev)
+        return ranked_severe_ap(y_val, p_sev, cat_val)
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    logger.info(f"Optuna[{arm_name}]: best val PR-AUC(severe) = {study.best_value:.4f}")
+    logger.info(f"Optuna[{arm_name}]: best ranked val PR-AUC(severe) = "
+                f"{study.best_value:.4f}")
     logger.info(f"Optuna[{arm_name}]: best params = {study.best_params}")
     return {**study.best_params, "n_jobs": -1}
 
