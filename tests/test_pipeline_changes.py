@@ -1563,6 +1563,96 @@ def test_clip_report_bounds_ignore_the_ranked_mask():
     assert np.isnan(ranked["tail_lift"])
 
 
+def test_clip_report_head_bound_moves_once_nulls_are_imputed():
+    """
+    The pipeline runs impute -> clip -> scale, so a nullable column's real p1
+    includes its fill value. Measuring with NaN dropped reported a p1 the
+    clipper never used: DomainAwareImputer fills most columns with 0.0, so a
+    null rate above ~1% puts p1 at 0.0 and there is no head clip at all. Two of
+    contract v3's three head-side arguments were built on the dropped-NaN
+    number.
+    """
+    from explore_clip_impact import clip_report
+    from src.data.preprocessing import DomainAwareImputer
+
+    n = 10_000
+    # Nullable, still clipped, and not DAYS_SINCE/AMNT/RATIO -- so it is filled
+    # with 0.0. HIST_MAX_DPD_DAYS is the column the v3 argument turned on, but
+    # v3 exempted it, and clip_report skips NO_CLIP.
+    cols = ["MAX_DPD_LAST_6M"]
+    flat = np.linspace(1.0, 100.0, n).reshape(-1, 1)
+    severe = np.zeros(n, dtype=bool)
+    severe[:100] = True
+
+    assert DomainAwareImputer(cols).fit([flat]).fill_values_[0] == 0.0, \
+        "the rule this test depends on: this column is filled with 0.0"
+
+    assert clip_report(flat, severe, cols).iloc[0]["p1"] > 0.0
+
+    imputed = flat.copy()
+    imputed[:200, 0] = 0.0                        # a 2% null rate, filled
+    assert clip_report(imputed, severe, cols).iloc[0]["p1"] == 0.0, \
+        "once the fill value is in the distribution the head clip vanishes"
+
+
+def test_tail_gradient_separates_a_ramp_from_a_flat_tail():
+    """
+    `tail_lift` says the tail is risky as a BLOCK — and clipping does not
+    destroy a block, because a split just inside the bound still isolates the
+    merged rows. `tail_gradient` is the number that says whether ORDERING
+    inside the tail carries risk, which is what the clip actually deletes.
+    """
+    from explore_clip_impact import _gradient
+
+    rng = np.random.default_rng(0)
+    n = 100_000
+    x = np.arange(n, dtype=np.float64)
+    tail = x > np.percentile(x, 99)
+    idx = np.flatnonzero(tail)
+
+    # Flat: the whole tail is equally risky. The clip costs nothing.
+    flat_sev = np.zeros(n, dtype=bool)
+    flat_sev[rng.choice(idx, size=len(idx) // 2, replace=False)] = True
+    assert _gradient(flat_sev, x, tail, True) == pytest.approx(1.0, abs=0.25)
+
+    # Ramp: 3x the severe rate in the outer quartile. The clip flattens it.
+    ramp_sev = np.zeros(n, dtype=bool)
+    q1, q3 = np.quantile(x[idx], [0.25, 0.75])
+    inner, outer = idx[x[idx] <= q1], idx[x[idx] >= q3]
+    ramp_sev[inner[:len(inner) // 5]] = True              # 20%
+    ramp_sev[outer[:len(outer) * 3 // 5]] = True          # 60%
+    assert _gradient(ramp_sev, x, tail, True) == pytest.approx(3.0, rel=0.1)
+
+    # One value beyond the bound: nothing out there to order, so nothing to lose.
+    const = np.where(tail, 999.0, 0.0)
+    assert np.isnan(_gradient(flat_sev, const, const > 998.0, True))
+
+
+def test_stratum_lift_separates_signal_from_composition():
+    """
+    --ranked_only removes cat_3 but not cat_2. A tail made entirely of cat_2
+    rows reports cat2_rate/base_rate pooled — a large number carrying zero
+    incremental signal — which is what Run 8's DPD family actually measured.
+    Inside the stratum it scores ~1 and says so.
+    """
+    from explore_clip_impact import clip_report
+
+    n = 10_000
+    x = np.arange(n, dtype=np.float64).reshape(-1, 1)
+    cats = np.where(x[:, 0] > np.percentile(x, 95), 2, 0)   # the tail IS cat_2
+    severe = np.zeros(n, dtype=bool)
+    rng = np.random.default_rng(0)
+    for k, rate in ((0, 0.02), (2, 0.60)):                  # risk is the CAT's
+        in_k = np.flatnonzero(cats == k)
+        severe[rng.choice(in_k, int(len(in_k) * rate), replace=False)] = True
+
+    row = clip_report(x, severe, ["MAX_DPD_LAST_6M"], strata=cats).iloc[0]
+
+    assert row["tail_lift"] > 5, "pooled, the tail looks hugely predictive"
+    assert row["tail_lift_cat2"] == pytest.approx(1.0, abs=0.2), \
+        "inside cat_2 the tail is an ordinary cat_2 row — it was composition"
+
+
 # ── clip_bounds: a range from the definition, not from the sample ─────────────
 
 def test_outlier_clipper_honours_declared_bounds():
