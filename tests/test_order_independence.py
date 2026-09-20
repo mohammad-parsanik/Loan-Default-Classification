@@ -303,6 +303,109 @@ def test_cache_key_changes_with_the_feature_list():
     assert _cache_key("x", "loan", list(FEATURE_ORDER) + ["NEW_72"]) != base  # addition
 
 
+def _fingerprint(rows):
+    """The projection CACHE_FINGERPRINT is built from, restated here so the test
+    fails if the field list silently gains a preprocessing flag."""
+    return [tuple(c.get(f) for f in
+                  ("ordinal", "name", "type", "role", "nullable", "sentinel"))
+            for c in rows]
+
+
+def test_cache_key_ignores_preprocessing_flags(monkeypatch):
+    """
+    `clip`, `scale`, `binary` and `clip_bounds` are consumed in preprocessing,
+    downstream of the NPZ, so flipping one cannot make a cached file wrong.
+    Keying the cache on `contract_version` meant a flag-only bump forced a full
+    reload to produce byte-identical files — ~34 min and ~12 GB, for nothing.
+    Column IDENTITY must still bust it.
+    """
+    import json
+    import src.data.data_loader as dl
+    from src.data.column_contract import CACHE_FINGERPRINT, CONTRACT_PATH
+
+    cols = json.loads(CONTRACT_PATH.read_text())["columns"]
+    assert _fingerprint(cols) == CACHE_FINGERPRINT
+
+    flipped = [{**c, "clip": not c.get("clip", True),
+                "scale": not c.get("scale", True),
+                "binary": not c.get("binary", False),
+                "clip_bounds": [0.0, 1.0]} for c in cols]
+    assert _fingerprint(flipped) == CACHE_FINGERPRINT      # flags are not in it
+
+    base = dl._cache_key("x", "loan", FEATURE_ORDER)
+    renamed = [dict(c) for c in cols]
+    renamed[0]["name"] = "SOMETHING_ELSE"
+    monkeypatch.setattr(dl, "CACHE_FINGERPRINT", _fingerprint(renamed))
+    assert dl._cache_key("x", "loan", FEATURE_ORDER) != base  # identity still does
+
+
+# ── the cache cannot hand the model a schema it never agreed to ───────────────
+
+def _fake_snapshot(cache_dir: Path, snap: int, feature_cols, n: int = 3) -> None:
+    """One cached snapshot: the arrays load_cached_arrays concatenates, plus the
+    manifest it reads the column list out of."""
+    import json
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        cache_dir / f"{snap}.npz",
+        features_flat=np.zeros((n, len(feature_cols)), dtype=np.float32),
+        offsets=np.arange(n + 1, dtype=np.int64),
+        labels=np.zeros(n, dtype=np.int64),
+        snapshot_dates=np.full(n, snap, dtype=np.int64),
+        current_cats=np.zeros(n, dtype=np.int64),
+    )
+    (cache_dir / f"{snap}.manifest.json").write_text(json.dumps(
+        {"cache_key": "k", "feature_cols": list(feature_cols), "label_horizons": {}}))
+
+
+def test_load_cached_arrays_rejects_snapshots_with_different_columns(tmp_path):
+    """
+    These arrays are concatenated into one matrix keyed by column POSITION, so
+    two snapshots built against different feature lists stack unrelated columns
+    on each other — same width, no error. That has to raise, not warn.
+    """
+    from src.data.data_loader import load_cached_arrays
+
+    _fake_snapshot(tmp_path, 20240419, FEATURE_ORDER)
+    _fake_snapshot(tmp_path, 20240520, list(FEATURE_ORDER)[::-1])
+    with pytest.raises(ValueError, match="different feature lists"):
+        load_cached_arrays(tmp_path)
+
+
+def test_load_cached_arrays_warns_when_cache_predates_the_contract(tmp_path, caplog):
+    """Consistent snapshots that simply disagree with the current contract are a
+    diagnostic reading an older cache on purpose (--baseline) — warn, don't raise."""
+    import logging
+
+    from src.data.data_loader import load_cached_arrays
+
+    older = list(FEATURE_ORDER)[:-1]
+    for snap in (20240419, 20240520):
+        _fake_snapshot(tmp_path, snap, older)
+
+    with caplog.at_level(logging.WARNING):
+        _, cols = load_cached_arrays(tmp_path)
+    assert cols == older
+    assert "different feature list" in caplog.text
+    assert FEATURE_ORDER[-1] in caplog.text          # names what is missing
+
+
+def test_load_cached_arrays_is_quiet_on_a_matching_cache(tmp_path, caplog):
+    import logging
+
+    from src.data.data_loader import load_cached_arrays
+
+    for snap in (20240419, 20240520):
+        _fake_snapshot(tmp_path, snap, FEATURE_ORDER)
+
+    with caplog.at_level(logging.WARNING):
+        arrays, cols = load_cached_arrays(tmp_path)
+    assert cols == list(FEATURE_ORDER)
+    assert "different feature list" not in caplog.text
+    assert arrays["features_flat"].shape == (6, len(FEATURE_ORDER))
+    assert arrays["offsets"].tolist() == [0, 1, 2, 3, 4, 5, 6]
+
+
 # ── the queue sort itself, fed out of order ───────────────────────────────────
 
 def test_queue_is_identical_when_instances_arrive_permuted(bundle_path):

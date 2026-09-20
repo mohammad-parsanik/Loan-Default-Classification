@@ -173,6 +173,20 @@ NO_SCALE: set[str] = {c["name"] for c in _cols if c.get("scale") is False}
 SENTINELS: dict[str, float] = {
     c["name"]: c["sentinel"] for c in _cols if "sentinel" in c
 }
+#: The fields that decide what a cached NPZ CONTAINS — which columns are read,
+#: under which names, in which order, and what counts as a feature. The
+#: preprocessing flags (`binary`, `clip`, `scale`, `clip_bounds`) are
+#: deliberately absent: they are consumed downstream of the cache, in
+#: `src/data/preprocessing.py`, so changing one cannot make a cached file wrong.
+#: `DataLoader._cache_key` hashes this instead of `contract_version`, so a
+#: clip-flag edit no longer costs a full reload of every snapshot. A change the
+#: contract cannot see at all (a column whose MEANING moved) is still handled the
+#: way it always was — by bumping `DATA_VERSION`. See contract/README.md.
+CACHE_FINGERPRINT: list[tuple] = [
+    tuple(c.get(f) for f in
+          ("ordinal", "name", "type", "role", "nullable", "sentinel"))
+    for c in _cols
+]
 
 _check_vendored_copy(_cols, CONTRACT_VERSION)
 

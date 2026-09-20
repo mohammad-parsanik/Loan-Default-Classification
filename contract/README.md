@@ -39,8 +39,20 @@ this repo is public and its working copy of that documentation
 - `DataLoader.project_features` projects every incoming frame to it **by
   name**: a missing feature raises and names itself; a column the model does
   not know is dropped with a warning.
-- `DataLoader._cache_key` hashes `contract_version` and the feature list *in
-  order*, so a contract change invalidates every NPZ cache.
+- `DataLoader._cache_key` hashes `CACHE_FINGERPRINT` — `ordinal`, `name`,
+  `type`, `role`, `nullable`, `sentinel` per column — and the feature list *in
+  order*, so a change to what the feed **contains** invalidates every NPZ cache.
+  The preprocessing flags (`binary`, `clip`, `scale`, `clip_bounds`) are
+  deliberately **not** in the key: they are consumed in
+  `src/data/preprocessing.py`, downstream of the cache, so flipping one cannot
+  make a cached file wrong and must not cost a ~34-minute, ~12 GB reload that
+  reproduces the same bytes. `contract_version` is written into every manifest
+  for the audit trail; it no longer keys anything.
+- `load_cached_arrays` **raises** if two snapshots in one directory were built
+  against different feature lists (they are concatenated into a matrix keyed by
+  column position, so that would stack unrelated columns at identical width) and
+  **warns** if the agreed list differs from the current `FEATURE_ORDER` — which
+  is what `explore_clip_impact.py --baseline` legitimately looks like.
 
 ## Why by name and not by position
 

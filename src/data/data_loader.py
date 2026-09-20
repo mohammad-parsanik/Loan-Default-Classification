@@ -21,7 +21,8 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
-from src.data.column_contract import CONTRACT_VERSION, FEATURE_ORDER, feature_ordinal
+from src.data.column_contract import (CACHE_FINGERPRINT, CONTRACT_VERSION,
+                                      FEATURE_ORDER, feature_ordinal)
 from src.data.feed_checks import assert_feed_invariants, label_horizons
 from src.data import temporal_split
 from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
@@ -41,13 +42,22 @@ def _cache_key(extra: str = "", grain: Optional[str] = None,
     """
     Returns a short hex string that uniquely identifies the data schema.
     Changing DATA_VERSION, the table, META_COLS, the DB name, the grain, OR
-    the column contract (its version, or the feature list IN ORDER) busts the
-    cache.
+    the column contract's CONTENT (CACHE_FINGERPRINT, or the feature list IN
+    ORDER) busts the cache.
 
     The feature list is hashed as an ordered list, not a set, on purpose: a
     cache built when features meant one set of positions must not be reused
     by a model fitted against another. That was the gap — the key described
     the schema's shape but not its column identity, so a reorder survived it.
+
+    It hashes CACHE_FINGERPRINT rather than `contract_version` because the
+    version moves for reasons the cached bytes cannot feel. A `clip` or
+    `scale` flag is consumed in preprocessing, downstream of the NPZ, so a
+    flag-only contract bump used to force ~34 minutes and ~12 GB of reload to
+    produce byte-identical files. `contract_version` is still written into
+    every manifest, so the audit trail survives; it just no longer keys the
+    cache. A meaning-change the contract cannot see is still a DATA_VERSION
+    bump, exactly as before (contract/README.md, "Refreshing" step 3).
     """
     payload = json.dumps(
         {
@@ -55,7 +65,7 @@ def _cache_key(extra: str = "", grain: Optional[str] = None,
             "train_table": config.TRAIN_TABLE,
             "meta_cols": sorted(config.META_COLS),
             "database": config.MSSQL_DATABASE,
-            "contract_version": CONTRACT_VERSION,
+            "contract_fingerprint": CACHE_FINGERPRINT,
             "feature_order": list(feature_order or FEATURE_ORDER),
             # An instance means something different per grain, so the two
             # must never share a cache file. Taken as an argument, not read
@@ -117,6 +127,16 @@ def _cached_snapshots(cache_dir: Path, key: str) -> list[int]:
         if npz.stem.isdigit() and _cache_is_valid(npz, key):
             found.append(int(npz.stem))
     return sorted(found)
+
+
+def _feature_diff(expected: list, got: list) -> str:
+    """Name the difference between two feature lists, in the same three-way
+    wording as `preprocessing.assert_pipeline_features` — because a pure
+    REORDER is the dangerous case and has to say so out loud."""
+    extra   = [c for c in got if c not in set(expected)]
+    missing = [c for c in expected if c not in set(got)]
+    return (f"missing={missing} extra={extra}" if (missing or extra)
+            else "same columns, DIFFERENT ORDER")
 
 
 def _write_manifest(cache_path: Path, key: str, meta: dict) -> None:
@@ -455,6 +475,9 @@ class DataLoader:
             key,
             {"feature_cols": feature_cols, "max_loans": max_loans,
              "n_instances": len(instances),
+             # Recorded, not keyed: _cache_key hashes CACHE_FINGERPRINT now, so
+             # this is here to say which contract built the file, nothing more.
+             "contract_version": CONTRACT_VERSION,
              # snapshot -> LABEL_HORIZON_DATE, so a cache-only run (no DB on
              # this machine) can still tell a matured snapshot from an
              # immature one without re-deriving it from the wall clock.
@@ -850,6 +873,14 @@ def load_cached_arrays(cache_dir: Optional[Path] = None) -> tuple[dict, list[str
     explore_clip_impact) want: the arrays, not tens of millions of instance
     dicts rebuilt from them. Label horizons are registered as a side effect,
     so filter_mature_snapshots works afterwards without a DB.
+
+    Takes an arbitrary directory, and deliberately does NOT check the cache key
+    — `--baseline` exists to read an older cache on purpose. So it checks the
+    thing that matters instead: every snapshot must agree on its feature
+    columns, because they are about to be concatenated into one matrix keyed by
+    column POSITION. Disagreement raises; a list that merely differs from the
+    current contract warns, since that is what reading an older cache looks
+    like.
     """
     cache_dir = cache_dir or train_cache_dir()
     parts = sorted(
@@ -875,8 +906,28 @@ def load_cached_arrays(cache_dir: Optional[Path] = None) -> tuple[dict, list[str
                 stacked.setdefault(name, []).append(arr)
         with open(_manifest_path(npz_path)) as f:
             manifest = json.load(f)
-        feature_cols = manifest["feature_cols"]
+        cols = manifest["feature_cols"]
+        if feature_cols and cols != feature_cols:
+            raise ValueError(
+                f"{cache_dir} mixes snapshots built against different feature "
+                f"lists: {parts[0].name} vs {npz_path.name} "
+                f"({_feature_diff(feature_cols, cols)}). These arrays are "
+                "concatenated into one matrix keyed by column POSITION, so "
+                "loading them together stacks unrelated columns on each other "
+                "at identical width and with no error. Delete the odd "
+                "snapshot(s) so they rebuild."
+            )
+        feature_cols = cols
         register_label_horizons(manifest.get("label_horizons", {}))
+
+    if feature_cols != list(FEATURE_ORDER):
+        logger.warning(
+            f"{cache_dir} was built against a different feature list than the "
+            f"contract declares ({_feature_diff(FEATURE_ORDER, feature_cols)}). "
+            "Expected when a diagnostic reads an older cache on purpose; not "
+            "something to feed a model fitted against the current contract, "
+            "whose transformers key every statistic by column position."
+        )
 
     arrays = {k: np.concatenate(v) for k, v in stacked.items()}
     arrays["offsets"] = np.concatenate([[0], arrays["offsets"]])
