@@ -572,7 +572,9 @@ class DataLoader:
         Cache is invalidated when:
           - DATA_VERSION changes in project_config.py
           - Table name, META_COLS, or DB name changes
-          - the column contract changes (version, or the feature list/order)
+          - the column contract's CONTENT changes (the feature list/order, or
+            any of CACHE_FINGERPRINT) -- NOT a clip/scale flag, and NOT the
+            contract version on its own
           - max_loans or the grain changes
         A snapshot that has since matured is simply a file that is not there.
         """
