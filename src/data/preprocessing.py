@@ -25,7 +25,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
-from src.data.column_contract import NO_CLIP, NO_SCALE
+from src.data.column_contract import CLIP_BOUNDS, NO_CLIP, NO_SCALE
 
 logger = logging.getLogger(__name__)
 
@@ -148,22 +148,30 @@ class DomainAwareImputer(BaseEstimator, TransformerMixin):
 class OutlierClipper(BaseEstimator, TransformerMixin):
     """
     Clips continuous features at [1st, 99th] percentile.
-    Ratios (*RATIO*) are clipped to [0, 1].
     Binary features are skipped.
 
-    So are the contract's `clip: false` columns (NO_CLIP). Those carry a
-    sentinel that is a CODE rather than a quantity — clipping it to p99 turns
-    one risk state into a different one. The damage is invisible in a column
-    where the sentinel is the majority value (p99 IS the sentinel, so the clip
-    is a no-op) and destructive in its sibling where it is a minority, so a
-    spot-check of one column tells you nothing about the other.
+    So are the contract's `clip: false` columns (NO_CLIP), for three different
+    reasons. Some carry a sentinel that is a CODE rather than a quantity —
+    clipping it to p99 turns one risk state into a different one. The damage is
+    invisible in a column where the sentinel is the majority value (p99 IS the
+    sentinel, so the clip is a no-op) and destructive in its sibling where it is
+    a minority, so a spot-check of one column tells you nothing about the other.
+    The rest are bounded counts with no tail to bound, and the v3 exemptions.
+
+    The contract's `clip_bounds` columns (CLIP_BOUNDS) are clipped to a range
+    their DEFINITION gives rather than one the sample gives. This replaces a
+    `"RATIO" in col` test on the column NAME, which reached the right columns by
+    luck and missed PCT_COMPLETED — a ratio in everything but its name, clipped
+    to [0.067, 0.850] as a result.
     """
 
     def __init__(self, feature_names: list[str], binary_features: list[str],
-                 no_clip: Optional[set] = None):
+                 no_clip: Optional[set] = None,
+                 clip_bounds: Optional[dict] = None):
         self.feature_names  = feature_names
         self.binary_features = set(binary_features)
         self.no_clip = set(NO_CLIP if no_clip is None else no_clip)
+        self.clip_bounds = dict(CLIP_BOUNDS if clip_bounds is None else clip_bounds)
 
     def fit(self, X: list[np.ndarray], y=None):
         flat, _ = _vstack_split(X)
@@ -175,8 +183,9 @@ class OutlierClipper(BaseEstimator, TransformerMixin):
             if col in self.binary_features or col in self.no_clip:
                 continue
             col_data = flat[:, i]
-            if "RATIO" in col:
-                self.bounds_[i] = (0.0, 1.0)
+            if col in self.clip_bounds:
+                lo, hi = self.clip_bounds[col]
+                self.bounds_[i] = (float(lo), float(hi))
             else:
                 p1  = float(np.percentile(col_data, 1))
                 p99 = float(np.percentile(col_data, 99))

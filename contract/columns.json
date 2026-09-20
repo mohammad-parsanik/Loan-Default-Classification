@@ -83,7 +83,10 @@
       "role": "feature",
       "nullable": false,
       "binary": false,
-      "clip": false
+      "clip_bounds": [
+        0.0,
+        1.0
+      ]
     },
     {
       "ordinal": 11,
@@ -100,7 +103,10 @@
       "role": "feature",
       "nullable": true,
       "binary": false,
-      "clip": false
+      "clip_bounds": [
+        0.0,
+        1.0
+      ]
     },
     {
       "ordinal": 13,
@@ -550,7 +556,10 @@
       "role": "feature",
       "nullable": true,
       "binary": false,
-      "clip": false
+      "clip_bounds": [
+        0.0,
+        1.0
+      ]
     },
     {
       "ordinal": 65,

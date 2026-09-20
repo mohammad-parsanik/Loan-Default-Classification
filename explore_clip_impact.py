@@ -45,7 +45,7 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent))
 import project_config as config
-from src.data.column_contract import NO_CLIP
+from src.data.column_contract import CLIP_BOUNDS, NO_CLIP
 from src.data.data_loader import load_cached_arrays
 from src.data.temporal_split import filter_mature_snapshots
 
@@ -122,9 +122,9 @@ def clip_report(flat, severe, feat_cols, only=None, lift_mask=None) -> pd.DataFr
         x = x[np.isfinite(x)]
         if len(x) == 0:
             continue
-        # mirror OutlierClipper.fit: ratios are clipped to [0, 1], not percentiles
-        if "RATIO" in col:
-            p1, p99 = 0.0, 1.0
+        # mirror OutlierClipper.fit: a declared range beats the sample
+        if col in CLIP_BOUNDS:
+            p1, p99 = CLIP_BOUNDS[col]
         else:
             p1, p99 = float(np.percentile(x, 1)), float(np.percentile(x, 99))
         above = flat[:, i] > p99

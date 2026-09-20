@@ -22,6 +22,7 @@ One entry per column, in the feed's own ordinal order:
 | `binary` | features | 0/1 flag — exempt from clipping and scaling. |
 | `sentinel` | some features | A value that is a *code*, not a quantity. |
 | `clip` / `scale` | some features | `false` exempts the column from `OutlierClipper` / `PortfolioRobustScaler`. |
+| `clip_bounds` | some features | `[lo, hi]` — clip to this declared range instead of `[p1, p99]`, for a column whose bounds come from its definition rather than its sample. Mutually exclusive with `clip: false`; the loader rejects a column claiming both. |
 
 It deliberately carries **no column semantics** — no prose describing what a
 column means or how the ETL derives it. That belongs to the upstream project;

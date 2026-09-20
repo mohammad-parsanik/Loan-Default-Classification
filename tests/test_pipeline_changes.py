@@ -1561,3 +1561,66 @@ def test_clip_report_bounds_ignore_the_ranked_mask():
     assert full["tail_lift"] == pytest.approx(1 / severe.mean())
     # Masked, no queued row reaches p99, so the clip cannot touch the ranking.
     assert np.isnan(ranked["tail_lift"])
+
+
+# ── clip_bounds: a range from the definition, not from the sample ─────────────
+
+def test_outlier_clipper_honours_declared_bounds():
+    """
+    `clip_bounds` clips to a range the column's DEFINITION gives. The sample
+    does not get a vote — which is the whole point for PCT_COMPLETED, whose
+    upper values are an upstream defect (CONSUMER_CONTRACT.md col 64) and whose
+    0.0 is a real value that a p1 of 0.067 was quietly erasing.
+    """
+    from src.data.preprocessing import OutlierClipper
+
+    n = 1000
+    declared = np.linspace(0.0, 2.0, n)      # a PCT_COMPLETED-shaped defect
+    exempt   = np.linspace(0.0, 9999.0, n)
+    plain    = np.linspace(0.0, 1000.0, n)
+    flat = np.column_stack([declared, exempt, plain]).astype(np.float64)
+    cols = ["DECLARED", "EXEMPT", "PLAIN"]
+
+    out = OutlierClipper(cols, binary_features=[], no_clip={"EXEMPT"},
+                         clip_bounds={"DECLARED": (0.0, 1.0)}
+                         ).fit([flat]).transform([flat])[0]
+
+    assert out[:, 0].max() == pytest.approx(1.0), "the defect is clamped"
+    assert out[:, 0].min() == pytest.approx(0.0), "0.0 is real, not an outlier"
+    assert np.array_equal(out[:, 1], exempt), "NO_CLIP stays untouched"
+    assert out[:, 2].max() == pytest.approx(np.percentile(plain, 99)), \
+        "a plain column still gets percentiles"
+
+
+def test_clip_bounds_come_from_the_contract_not_the_column_name():
+    """The `"RATIO" in col` name test is gone. It reached OVERDUE_RATIO and
+    ONTIME_RATIO by luck and missed PCT_COMPLETED — a ratio in everything but
+    its name — which is how that column ended up clipped to [0.067, 0.850]."""
+    from src.data.preprocessing import OutlierClipper
+
+    vals = np.linspace(0.0, 5.0, 1000).reshape(-1, 1)
+    out = OutlierClipper(["SOME_RATIO"], binary_features=[], no_clip=set(),
+                         clip_bounds={}).fit([vals]).transform([vals])[0]
+
+    assert out.max() == pytest.approx(np.percentile(vals, 99)), \
+        "a RATIO in the name must no longer imply [0, 1]"
+
+
+def test_contract_rejects_a_column_that_is_both_exempt_and_bounded():
+    from src.data.column_contract import _validate
+
+    doc = {"columns": [{"ordinal": 1, "name": "A", "role": "feature",
+                        "clip": False, "clip_bounds": [0.0, 1.0]}]}
+    with pytest.raises(ValueError, match="both clip: false and clip_bounds"):
+        _validate(doc, Path("synthetic"))
+
+
+@pytest.mark.parametrize("bad", [[0.0], [1.0, 0.0], [0.0, 0.0], "0,1",
+                                 [True, False], [0.0, None]])
+def test_contract_rejects_malformed_clip_bounds(bad):
+    from src.data.column_contract import _validate
+
+    doc = {"columns": [{"ordinal": 1, "name": "A", "role": "feature",
+                        "clip_bounds": bad}]}
+    with pytest.raises(ValueError, match=r"expected \[lo, hi\]"):
+        _validate(doc, Path("synthetic"))

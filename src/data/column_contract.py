@@ -33,7 +33,7 @@ _ROLES = {"key", "feature", "label", "meta"}
 # Fields the tracked contract keeps; also the fields compared against the
 # vendored copy. Anything outside this list is prose and stays out of git.
 _CODE_FIELDS = ("ordinal", "name", "type", "role", "nullable",
-                "binary", "sentinel", "clip", "scale")
+                "binary", "sentinel", "clip", "clip_bounds", "scale")
 
 # Fields where the tracked contract DELIBERATELY disagrees with the vendored
 # ETL copy, pending upstream adopting them. The vendored copy stays
@@ -46,24 +46,34 @@ _CODE_FIELDS = ("ordinal", "name", "type", "role", "nullable",
 #
 # Delete an entry once upstream ships it; _check_vendored_copy says when.
 _LOCAL_OVERRIDES: dict[str, dict] = {
-    name: {"clip": False} for name in (
+    **{name: {"clip": False} for name in (
         # Contract v2: 9 bounded integer counts
         "COUNT_90PLUS_DPD_LAST_3M", "COUNT_60PLUS_DPD_LAST_3M",
         "COUNT_30PLUS_DPD_LAST_3M", "PRE_UPTO30_DPD_LOANS",
         "PRE_UPTO60_DPD_LOANS", "PRE_UPTO120_DPD_LOANS",
         "PRE_UPTO150_DPD_LOANS", "COUNT_ACTIVE_CONTRACTS",
         "COUNT_DELINQUENT_CONTRACTS",
-        # Contract v3: 10 bounded no-ops
-        "LOAN_CATEGORY", "OVERDUE_RATIO", "ONTIME_RATIO",
-        "CATEGORY_T1", "CATEGORY_T2", "CATEGORY_T3",
+        # Contract v3: 8 bounded no-ops (measured: p1/p99 move nothing)
+        "LOAN_CATEGORY", "CATEGORY_T1", "CATEGORY_T2", "CATEGORY_T3",
         "HIST_MAX_CATEGORY", "MONTHS_IN_CURRENT_CATEGORY",
         "COUNT_DPD_EVENTS_LAST_3M", "COUNT_DPD_EVENTS_LAST_6M",
         # Contract v3: 4 trend signals
         "CATEGORY_TREND_1M", "CATEGORY_TREND_3M",
         "DPD_TREND_1M", "DPD_TREND_3M",
-        # Contract v3: 3 critical head/boundary features
-        "HIST_MAX_DPD_DAYS", "PAYED_OVERDUE_INST_CNT", "PCT_COMPLETED",
-    )
+        # Contract v3: 2 head-side features
+        "HIST_MAX_DPD_DAYS", "PAYED_OVERDUE_INST_CNT",
+    )},
+    # Contract v3: clipped to a range the column's DEFINITION gives, not one
+    # the sample gives. This replaces OutlierClipper's old `"RATIO" in col`
+    # name test. PCT_COMPLETED is the reason the field exists: it is NOT
+    # bounded by the feed — CONSUMER_CONTRACT.md col 64 says INSTALLMENT_COUNT
+    # disagrees with the fact table in both directions, so the column "can
+    # exceed 1.0" — but it IS bounded by its own definition, so a declared
+    # [0, 1] clamps the defect while leaving 0.0 (a brand-new loan, a real
+    # value) alone, which a p1 of 0.067 did not.
+    **{name: {"clip_bounds": [0.0, 1.0]} for name in (
+        "OVERDUE_RATIO", "ONTIME_RATIO", "PCT_COMPLETED",
+    )},
 }
 
 
@@ -96,6 +106,22 @@ def _validate(doc: dict, path: Path) -> list[dict]:
                 f"{path}: column {c.get('name')!r} has role {c.get('role')!r}, "
                 f"expected one of {sorted(_ROLES)}"
             )
+        if (bounds := c.get("clip_bounds")) is not None:
+            if c.get("clip") is False:
+                raise ValueError(
+                    f"{path}: column {c['name']!r} declares both clip: false "
+                    "and clip_bounds — exempt from clipping, and clipped to a "
+                    "declared range. Those cannot both be true; pick one."
+                )
+            ok = (isinstance(bounds, list) and len(bounds) == 2
+                  and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                          for v in bounds)
+                  and bounds[0] < bounds[1])
+            if not ok:
+                raise ValueError(
+                    f"{path}: column {c['name']!r} has clip_bounds "
+                    f"{bounds!r}; expected [lo, hi], two numbers, lo < hi."
+                )
     return cols
 
 
@@ -163,10 +189,20 @@ FEATURE_ORDER: list[str] = [c["name"] for c in _cols if c["role"] == "feature"]
 META_COLS: list[str] = [c["name"] for c in _cols if c["role"] != "feature"]
 #: 0/1 features — exempt from clipping and scaling.
 BINARY_FEATURES: list[str] = [c["name"] for c in _cols if c.get("binary")]
-#: Features `OutlierClipper` must leave alone. Two populations, both real:
-#: sentinel-bearing columns whose coded value clipping would destroy, and
-#: bounded integer counts with no tail to bound (see _LOCAL_OVERRIDES).
+#: Features `OutlierClipper` must leave alone. Three populations, all real:
+#: sentinel-bearing columns whose coded value clipping would destroy, bounded
+#: integer counts with no tail to bound, and the v3 signal-preservation
+#: exemptions (see _LOCAL_OVERRIDES). A column with a definitional range is NOT
+#: here — it declares `clip_bounds` and is still clipped, to those.
 NO_CLIP: set[str] = {c["name"] for c in _cols if c.get("clip") is False}
+#: Features clipped to a DECLARED range instead of [p1, p99]. A percentile
+#: bound describes the sample; these columns' bounds come from their definition,
+#: so the sample does not get a vote. Disjoint from NO_CLIP by construction
+#: (_validate rejects a column that claims both).
+CLIP_BOUNDS: dict[str, tuple[float, float]] = {
+    c["name"]: (float(c["clip_bounds"][0]), float(c["clip_bounds"][1]))
+    for c in _cols if c.get("clip_bounds") is not None
+}
 #: Features whose raw value must reach the model unscaled.
 NO_SCALE: set[str] = {c["name"] for c in _cols if c.get("scale") is False}
 #: name -> sentinel value, for the invariant checks and for documentation.
@@ -209,8 +245,12 @@ if __name__ == "__main__":
     assert NO_SCALE <= NO_CLIP, sorted(NO_SCALE - NO_CLIP)
     assert set(SENTINELS) == NO_SCALE, sorted(set(SENTINELS) ^ NO_SCALE)
     assert not (set(BINARY_FEATURES) & NO_CLIP)
+    # Exempt from clipping, or clipped to a declared range — never both.
+    assert set(CLIP_BOUNDS).isdisjoint(NO_CLIP), sorted(set(CLIP_BOUNDS) & NO_CLIP)
+    assert set(CLIP_BOUNDS).isdisjoint(BINARY_FEATURES)
     print(f"contract v{CONTRACT_VERSION} for {TABLE}: "
           f"{len(FEATURE_ORDER)} features, {len(META_COLS)} meta, "
           f"{len(BINARY_FEATURES)} binary, {len(NO_SCALE)} sentinel-bearing, "
           f"{len(NO_CLIP) - len(NO_SCALE)} bounded-count clip exemption(s), "
+          f"{len(CLIP_BOUNDS)} declared-bound column(s), "
           f"{len(_LOCAL_OVERRIDES)} local override(s) — OK")
