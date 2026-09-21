@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Superseded in part — corrected 2026-09-20. See `AGENT_HANDOFF.md` §25.**
 > This document is kept because the reasoning is the useful part of the record,
-> including where it was wrong. Three corrections:
+> including where it was wrong. Four corrections:
 >
 > 1. **`PCT_COMPLETED` is not bounded by the feed.** Category 3 item 3 below
 >    asserted it is. `etl_integration/CONSUMER_CONTRACT.md` col 64 says the
@@ -13,11 +13,19 @@
 >    pipeline clips *after* it. For a nullable column the `p1` quoted here may
 >    never have been the clipper's `p1` — which affects `HIST_MAX_DPD_DAYS`
 >    and `PCT_COMPLETED`, both nullable. `PAYED_OVERDUE_INST_CNT` is not.
-> 3. **The `tail_lift` figures are composition, not signal.** `--ranked_only`
->    removes cat_3 but not cat_2, and at the observed rates a tail made purely
->    of cat_2 rows reports ~11.7 with zero incremental signal. The "Features
->    Retained" section's reasoning stands on a different footing than it
->    claims, and the DPD A/B it earmarks is now gated on a re-measurement.
+> 3. **The `tail_lift` figures measure the tail as a block, which clipping does
+>    not destroy.** What the clip costs is the ordering *inside* the tail. The
+>    re-measurement (`results_9/clip_impact_2.csv`) found the DPD tails are real
+>    signal inside cat_0 (15–27×) but internally flat (`tail_gradient` ~1), so
+>    they stay clipped — and the DPD A/B earmarked under "Features Retained" is
+>    not warranted. (A first correction on 2026-09-20 called these figures
+>    cat_2 composition; `results_9` refuted that.) The columns where clipping
+>    does cost something are different ones: see `AGENT_HANDOFF.md` §25,
+>    "Stage 2 result".
+> 4. **`HIST_MAX_DPD_DAYS` and `PCT_COMPLETED` came out as argued.** Null rates
+>    are ≤ 0.012%, so point 2 changed nothing on this data: `PCT_COMPLETED`'s
+>    p1 of 0.067 was real, and `HIST_MAX_DPD_DAYS`'s p1 of 1 almost certainly
+>    was (inferred from its siblings; `--include_exempt` now measures it).
 
 ## How Clipping Works in This Pipeline
 

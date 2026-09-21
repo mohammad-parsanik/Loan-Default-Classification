@@ -1179,6 +1179,12 @@ those decisions rest on could not answer the question being asked of it**, in th
 separate ways. The corrections are in; the decisions they affect are deliberately left
 open pending a re-measurement.
 
+> **Corrected 2026-09-21 — read "Stage 2 result" below before anything else here.** The
+> re-measurement (`results_9/clip_impact_2.csv`) refuted this section's point 3 as first
+> written: Run 8's DPD `tail_lift` was **not** cat_2 composition. The conclusion it
+> supported (leave the DPD family clipped) survives, for a different reason. The
+> original reasoning is kept below, marked, because how it went wrong is the lesson.
+
 ### Run 8 numbers
 
 Test `20260219`, 16 train snapshots (`20240419`…`20250722`), 16,872,770 train /
@@ -1244,20 +1250,26 @@ the bounds `OutlierClipper` fits. `DomainAwareImputer` fills most columns with `
 **any column with a null rate above ~1% has a real `p1` of 0.0 and no head clip at all.**
 Both head-side headliners are nullable: `HIST_MAX_DPD_DAYS` (col 32) and `PCT_COMPLETED`
 (col 64). `PAYED_OVERDUE_INST_CNT` is `Null: N`, so its `head_lift = 16.26` stands.
+*Result:* right in principle, moot in practice — `pct_null` is ≤ 0.012% on every clipped
+column and p1/p99 came back identical to `results_8`. See "Stage 2 result".
 
-**3. `tail_lift` measures composition, and has produced a wrong answer twice.**
+**3. `tail_lift` measures the block, not what the clip costs — and pooled numbers mix
+strata.**
 
-This is the important one, and it generalises §23's blind spot rather than being a new
-instance of it.
+The first half held up; the second half was a wrong guess about *which way* the mix
+pushed.
 
 *First:* `tail_lift` measures the tail **as a block** — and clipping does not destroy a
 block. After `np.clip`, a split anywhere in `(p99−ε, p99]` still isolates the merged rows,
 so "this row was beyond the bound" survives. What dies is the **ordering inside** the
 region. A high `tail_lift` therefore *opens* the question and cannot close it.
 
-*Second:* `--ranked_only` removed cat_3 but not cat_2. A tail made entirely of cat_2 rows
-reports `cat2_rate / ranked_base_rate` with zero incremental signal. Solving backwards
-from `results_8/clip_impact_ranked.csv` at the observed cat_2 rate of 0.5939:
+*Second:* `--ranked_only` removed cat_3 but not cat_2, so a pooled number still mixes
+strata with very different base rates. That is true. **What follows was the wrong
+inference drawn from it** — kept because the coincidence that made it convincing is worth
+recognising next time. A tail made entirely of cat_2 rows would report
+`cat2_rate / ranked_base_rate` with zero incremental signal. Solving backwards from
+`results_8/clip_impact_ranked.csv` at the observed cat_2 rate of 0.5939:
 
 | Feature | observed `tail_lift` | implied ranked base rate |
 |---|---|---|
@@ -1267,16 +1279,20 @@ from `results_8/clip_impact_ranked.csv` at the observed cat_2 rate of 0.5939:
 | `MAX_DPD_LAST_6M` | 7.951 | 7.47% |
 
 §24 puts the ranked base rate at **4.63%** on train; cache-wide, including the hotter gap
-and test windows, it lands in 5–6%. **These are ~exactly what pure composition produces.**
+and test windows, it lands in 5–6%. These looked like exactly what pure composition
+produces. **They were a coincidence.** Measured inside cat_0, the same tails run 15–27×
+(below) — the opposite of composition. Back-solving a mechanism from a pooled number that
+two mechanisms can produce is not a test of either; the stratified measurement was, and
+it took minutes.
 
 The unranked ceiling confirms the mechanism exactly: in `results_8/clip_impact.csv`,
 `DPD_DAYS`, `UNPAYED_INST_CNT` and `CATEGORY_TREND_1M` all report
 `tail_lift = 11.012665403804089` to sixteen digits, and `1/11.0127 = 9.0805%` — the §24
-pooled severe base rate. Run 7's DPD numbers were the label identity; Run 8's ranked
-numbers are the cat_2 composition one level down.
+pooled severe base rate. Run 7's DPD numbers were the label identity — that part stands.
 
-**Consequence: the standing position — leave the DPD family clipped — is the
-better-supported one.** The "clipping protects the scaling" instinct is half right and
+**Consequence: leave the DPD family clipped** — but the reason is the flat interior
+measured below, not composition. The "clipping protects the scaling" instinct is half
+right and
 worth stating precisely: `RobustScaler` centers on the median and scales by the IQR, both
 interior statistics that the top 1% cannot move, so **un-clipping cannot change the fitted
 scaler at all** — only the scaled values of the tail rows, which XGBoost cannot see
@@ -1333,20 +1349,80 @@ Regression tests: cache key stable under flag flips and moving under renames; mi
 snapshots raise; `clip_bounds` beats percentiles and the name test is gone; a nullable
 column's `p1` collapses to 0.0 once its fill value is in the distribution; `tail_gradient`
 recovers a planted ramp and returns ~1 on a flat tail; a stratum lift of ~1 exposes a tail
-that was pure composition; the tuning objective scores only the ranked rows.
+that is pure composition, when one is; the tuning objective scores only the ranked rows.
+
+### Stage 2 result — `results_9/clip_impact_2.csv` (September 21, 2026)
+
+Run against the Run-8 cache (unchanged data) with
+`--ranked_only --by_current_cat`.
+
+**The DPD tail is real signal, not composition.**
+
+| Feature | pooled `tail_lift` | **cat0** | cat1 | cat2 | `tail_gradient` |
+|---|---|---|---|---|---|
+| `TOTAL_DPD_DAYS_LAST_6M` | 11.7 | **26.3** | 6.4 | 1.7 | 1.03 |
+| `MAX_DPD_LAST_6M` | 8.0 | **26.7** | 6.4 | 1.6 | 0.99 |
+| `TOTAL_DPD_DAYS_LAST_3M` | 10.2 | **15.9** | 2.6 | 1.2 | 1.12 |
+| `MAX_DPD_LAST_3M` | 10.3 | **15.5** | 2.5 | 1.2 | 1.08 |
+| `DPD_DAYS_T1` | 3.4 | **12.2** | 11.1 | 1.4 | 0.62 |
+
+A cat_0 loan with an extreme recent DPD history has just cured from heavy delinquency, and
+those relapse. The pooled figure mixes that with weak cat_2 composition (1.2–1.7).
+
+**But clipping them costs ~nothing, because the interior is flat.** Pooled
+`tail_gradient` is ~1 for the headline four and *falls* further out for `DPD_DAYS_T1..T5`
+(0.62–0.77); the block survives the clip. Ties at the bound are small — worst is
+`MAX_DPD_LAST_3M`, 0.29% already at p99 against 0.89% merged into it. **Caveat:** these
+gradients are pooled, and a pooled gradient bends with the stratum mix exactly as a pooled
+lift does. The per-stratum gradient did not exist yet; it does now.
+
+**The imputation concern was moot on this data.** `pct_null` ≤ 0.012% everywhere; bounds
+identical to `results_8`. `PCT_COMPLETED`: no nulls, no values at 0, nothing above 1.0 —
+`clip_bounds: [0, 1]` is currently a no-op, purely defensive, and no null-conflation
+ticket is needed. `HIST_MAX_DPD_DAYS` was not measured (exempt columns were never
+reported); its nullable Group D siblings show exactly 0 nulls, so its `p1 = 1` was almost
+certainly real and v3's head argument likely stands — inferred, not measured.
+
+**Where clipping does cost something** (verdicts as the fixed tool assigns them):
+
+| Feature | end | verdict | evidence |
+|---|---|---|---|
+| `WORST_CLOSED_LOAN_DPD` | tail | ramp | lift 1.43, gradient **5.55** |
+| `AVERAGE_CLOSE_LOAN_DPD` | tail | ramp | lift 1.39, gradient **5.17** |
+| `CONTRACT_AGE_MONTH` / `MATURED_INST_CNT` | tail | ramp | lift 1.65, gradient 1.88 |
+| `CNT_RECOVERED_BEFORE` | tail | ramp | lift 2.74, gradient 1.74 |
+| `COUNT_CATEGORY_CHANGES` | tail | ramp | lift 2.27, gradient 1.54 |
+| `PAYED_OVERDUE_AMNT` | head | ramp | lift 4.39 (cat0 1.87), gradient 2.73 |
+| `REMAINING_INST_CNT` | head | **swamped** | 0.74% of rows below p1 = 8 are ~15× *cleaner* than average (lift 0.069), and the clip merges them into the 1.0% already at 8 — a split can no longer find them |
+
+The old flag rule (lift > 1.5 **and** gradient > 1.5) caught only three of these and
+missed the two steepest. Expected gain from exempting them is modest: on
+`WORST_CLOSED_LOAN_DPD` the outer quartile of the tail is only ~2–3× base, while the top of
+the queue runs at 10–30×.
+
+**Data anomaly, upstream:** `TOTAL_DPD_DAYS_LAST_6M` has 39 rows and `_3M` 27 rows of
+*negative* DPD (below p1 = 0), against the feed contract's `≥ 0`. `feed_checks.py` has no
+non-negativity invariant, so nothing caught it.
+
+**Amounts:** tail lift inside cat_0 is 0.40–0.41, so the Run-7 closure holds within the
+early-warning slice too.
+
+**Tool fixes that followed** (`explore_clip_impact.py`): per-stratum gradients with the row
+counts they rest on; `tail_verdict`/`head_verdict` from a pure `side_verdict()` (none,
+tiny, inert, block, ramp, swamped) in which a ramp no longer needs an informative block
+and a clean block counts as informative; a 100-event floor under every gradient (a
+pure-noise smoke test flagged two "ramps" at ~1.6 before it); `--include_exempt` to audit
+the `clip: false` columns with the same measurements.
 
 ### Open, in priority order
 
-1. **Re-run the diagnostic** — `explore_clip_impact.py --ranked_only --by_current_cat`.
-   The first invocation rebuilds the cache once (the key changed; v3 had already forced
-   this anyway). Read `tail_gradient`, `pct_tied_hi`, `pct_null` and `tail_lift_cat0`.
-   A flat gradient and a cat_0 lift near 1 closes the clipping question **in favour of the
-   status quo, with evidence** — which is the outcome the arithmetic above predicts.
-   `pct_null` also decides whether `HIST_MAX_DPD_DAYS`'s exemption ever had a head-side
-   rationale, and whether `PCT_COMPLETED`'s nulls (imputed to `0.0`, now landing exactly on
-   its declared lower bound) need a ticket of their own.
+1. **One more cheap diagnostic run:**
+   `explore_clip_impact.py --ranked_only --by_current_cat --include_exempt`. It settles the
+   per-stratum gradients for the DPD family (the one remaining question there), measures
+   `HIST_MAX_DPD_DAYS` directly, and audits every v3 exemption.
 2. **Three-arm walk-forward** for `DEPLOY_ARM`, at `ARM_OPTUNA_TRIALS = 0`. Independent of
    clipping and already §18 item 2.
-3. **The clipping A/B** — only if step 1 shows a real ramp. If it does not, that *is* the
-   answer.
-4. **Recency**, per the A/B above. Probably worth more than 1–3 combined.
+3. **Recency**, per the A/B above. Probably worth more than any clipping change.
+4. **The clipping A/B, low priority** — not for the DPD family (flat interior). If run at
+   all, one exemption run covering the ramp columns and `REMAINING_INST_CNT`'s head. Now
+   free to try: a flag change no longer rebuilds the cache.
