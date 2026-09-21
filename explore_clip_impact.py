@@ -8,9 +8,9 @@ log transforms are monotone, and trees split on order — but clipping merges
 every value above p99 into a single number, so any ordering up there is gone.
 That is fine when the tail is noise and harmful when the tail is the risk.
 
-Reports, per clipped feature:
+Reports, per clipped feature (and per exempt one, with --include_exempt):
   pct_null      share of rows NaN before imputation — see "Imputation" below
-  pct_hi        share of loan-rows pinned to p99 (~1% by construction)
+  n_hi / pct_hi rows pinned to p99 (~1% by construction)
   pct_tied_hi   share sitting EXACTLY on p99 already
   n_merged      distinct values above p99 collapsed into one
   tail_span     (max - p99) / (p99 - p1) — how much range is discarded
@@ -19,9 +19,12 @@ Reports, per clipped feature:
                 quartile). THIS is the number that says whether the clip
                 costs anything. See "What clipping actually destroys".
   head_lift / head_gradient / pct_tied_lo   the same, for the p1 side.
+  tail_verdict / head_verdict   what the clip costs at each end — none, tiny,
+                inert, block, ramp, swamped. See side_verdict().
 
-With --by_current_cat, also tail_lift_cat{k} / head_lift_cat{k}: the same lift
-computed INSIDE each current_cat stratum, against that stratum's own base rate.
+With --by_current_cat, also n_*_cat{k}, *_lift_cat{k} and *_gradient_cat{k}:
+the same measurements INSIDE each queued current_cat stratum, against that
+stratum's own base rate, with the row counts they rest on.
 
 What clipping actually destroys
 -------------------------------
@@ -31,13 +34,18 @@ is the ORDERING inside that region. So a high `tail_lift` OPENS the question and
 `tail_gradient` answers it: ~1 means the region is internally flat, the clip
 merges rows the model had no reason to separate, and it costs nothing.
 
-`tail_lift` is also composition-prone, and has produced a wrong answer twice.
-Over all mature rows the DPD family pins at the arithmetic ceiling 1/base_rate,
-measuring the `label >= current_cat` identity — that is what --ranked_only is
-for. But --ranked_only only removes cat_3: a tail made entirely of cat_2 rows
-still reports cat2_rate/base_rate with zero incremental signal, which is
-~11.7 at the observed rates and is exactly what Run 8 reported. Read
-tail_lift_cat0 (--by_current_cat), not the pooled number.
+Pooled numbers are composition-prone — lift AND gradient. Over all mature rows
+the DPD family pins at the arithmetic ceiling 1/base_rate, measuring the
+`label >= current_cat` identity; that is what --ranked_only is for. But
+--ranked_only only removes cat_3, so a pooled number still mixes cat_0, cat_1
+and cat_2 rows with very different base rates. Which way the mix pushes is an
+empirical question, and it has been guessed wrong: §25 first read Run 8's
+pooled DPD tail_lift of ~11.7 as pure cat_2 composition, and results_9 showed
+the opposite — inside cat_0 the same tails run 15-27x, i.e. recently cured
+heavy delinquents, a real signal. The same mix can bend a pooled gradient
+(an outer quartile that is more cat_0 than the inner one reads as a decline
+even when risk rises inside every stratum). So read the per-stratum columns,
+and the n_*_cat counts under them, before any pooled number.
 
 Imputation
 ----------
@@ -160,6 +168,13 @@ def _lift(severe, mask, base_rate):
 
 #: Below this many rows beyond a bound, a quartile split is noise, not a shape.
 _MIN_TAIL_ROWS = 200
+#: ...and below this many severe events across the two compared quartiles. The
+#: noise in a ratio of two rates is set by the event counts, not the rows: at
+#: 100 events the log-ratio's standard error is ~0.2, so a gradient of 1.5
+#: sits ~2 SE from flat. With ~20 events, pure noise crosses 1.5 routinely —
+#: a synthetic smoke test with no signal at all flagged two "ramps" before
+#: this floor existed.
+_MIN_EVENTS = 100
 
 
 def _gradient(severe, x, mask, outer_is_high: bool) -> float:
@@ -175,8 +190,9 @@ def _gradient(severe, x, mask, outer_is_high: bool) -> float:
     Returns P(severe | outer quartile of the region) / P(severe | inner
     quartile). ~1 means internally flat -- the clip merges rows the model had no
     reason to separate, and costs nothing. Well above 1 means it is flattening a
-    real ramp. NaN when the region is too small to split, or is a single value
-    (an integer column with one value out there has no ordering to lose).
+    real ramp. NaN when the region is too small to split, holds too few severe
+    events to estimate a shape (_MIN_EVENTS), or is a single value (an integer
+    column with one value out there has no ordering to lose).
     """
     idx = np.flatnonzero(mask)
     if len(idx) < _MIN_TAIL_ROWS:
@@ -187,6 +203,8 @@ def _gradient(severe, x, mask, outer_is_high: bool) -> float:
         return np.nan
     far, near = ((v >= hi_cut), (v <= lo_cut)) if outer_is_high else \
                 ((v <= lo_cut), (v >= hi_cut))
+    if int(severe[idx[far]].sum() + severe[idx[near]].sum()) < _MIN_EVENTS:
+        return np.nan
     rate_near = float(severe[idx[near]].mean())
     if rate_near <= 0:
         return np.nan
@@ -194,20 +212,27 @@ def _gradient(severe, x, mask, outer_is_high: bool) -> float:
 
 
 def clip_report(flat, severe, feat_cols, only=None, lift_mask=None,
-                strata=None, null_frac=None) -> pd.DataFrame:
+                strata=None, null_frac=None, include_exempt=False) -> pd.DataFrame:
     """Bounds and merge counts describe the FULL population the clipper fits on;
     `lift_mask` (--ranked_only) narrows only the rows the severe rate is
-    conditioned on. `strata` (--by_current_cat) adds the same lifts computed
-    inside each queued stratum against that stratum's own base rate, which is
-    what separates signal from composition."""
+    conditioned on. `strata` (--by_current_cat) adds the same lifts AND
+    gradients computed inside each queued stratum against that stratum's own
+    base rate, plus the row counts they rest on — pooled numbers mix the
+    strata, and both the lift and the gradient can be moved by that mix.
+
+    `include_exempt` also reports the NO_CLIP columns, with the bounds the
+    clipper WOULD fit, flagged `exempt=True` — the way to audit an exemption
+    with the same measurements that would have justified it."""
     if lift_mask is None:
         lift_mask = np.ones(len(flat), dtype=bool)
     base_rate = float(severe[lift_mask].mean()) if lift_mask.any() else 0.0
     binary = set(config.BINARY_FEATURES)
     rows = []
     for i, col in enumerate(feat_cols):
-        if col in binary or col in NO_CLIP:
+        if col in binary:
             continue                       # clipper skips these; so do we
+        if col in NO_CLIP and not include_exempt:
+            continue
         if only and col not in only:
             continue
         # Imputed upstream, so this only drops +/-inf. len(x) == len(flat) in
@@ -229,10 +254,13 @@ def clip_report(flat, severe, feat_cols, only=None, lift_mask=None,
         spread = p99 - p1
         row = {
             "feature":   col,
+            "exempt":    col in NO_CLIP,
             "p1":        p1,
             "p99":       p99,
             "max":       float(x.max()),
             "pct_null":  float(null_frac[i]) if null_frac is not None else np.nan,
+            "n_hi":      n_above,
+            "n_lo":      n_below,
             "pct_hi":    n_above / len(x),
             "pct_lo":    n_below / len(x),
             # Rows already sitting ON the bound. The merged rows become
@@ -258,16 +286,102 @@ def clip_report(flat, severe, feat_cols, only=None, lift_mask=None,
         }
         if strata is not None:
             # Within one current_cat, against that cat's own base rate. A tail
-            # that is risky only because it is full of cat_2 rows scores ~1
-            # here and is telling you about current_cat, which the model
-            # already has as a feature.
+            # that is risky only because it is full of high-cat rows scores ~1
+            # here. The gradient gets the same treatment, because a pooled
+            # gradient is just as exposed to the mix: if the outer quartile of
+            # a tail is more cat_0 than its inner quartile, the pooled ratio
+            # falls even when risk rises inside every stratum.
             for k in np.unique(strata[strata < config.CARVE_CURRENT_CAT_GE]):
                 in_cat = strata == k
                 cat_base = float(severe[in_cat].mean()) if in_cat.any() else 0.0
-                row[f"tail_lift_cat{k}"] = _lift(severe, above & in_cat, cat_base)
-                row[f"head_lift_cat{k}"] = _lift(severe, below & in_cat, cat_base)
+                hi_k, lo_k = above & in_cat, below & in_cat
+                row[f"n_hi_cat{k}"] = int(hi_k.sum())
+                row[f"tail_lift_cat{k}"] = _lift(severe, hi_k, cat_base)
+                row[f"tail_gradient_cat{k}"] = _gradient(severe, col_x, hi_k, True)
+                row[f"n_lo_cat{k}"] = int(lo_k.sum())
+                row[f"head_lift_cat{k}"] = _lift(severe, lo_k, cat_base)
+                row[f"head_gradient_cat{k}"] = _gradient(severe, col_x, lo_k, False)
         rows.append(row)
+    if not rows:                           # e.g. --only naming exempt columns
+        return pd.DataFrame(columns=["feature", "exempt"])
     return pd.DataFrame(rows).sort_values("tail_lift", ascending=False)
+
+
+#: The clip "swamps" a block when the rows already sitting on the bound are at
+#: least this large a share relative to the rows it merges into them: the
+#: merged rows are then at most 2/3 of the post-clip bin, and a split can no
+#: longer isolate them. HIST_MAX_DPD_DAYS's 0 -> 1 is the case this names.
+SWAMP_RATIO = 0.5
+
+
+def side_verdict(row, side: str, lift_thr: float, grad_thr: float) -> str:
+    """
+    What clipping one end of one column costs, from a clip_report row.
+
+      none     nothing lies beyond this bound; the clip is a no-op here
+      tiny     fewer than _MIN_TAIL_ROWS rows beyond it — too few to judge,
+               and too few for the clip to matter to a queue whose 1-day
+               budget is thousands of rows. (TOTAL_DPD_DAYS_LAST_6M has ~40
+               rows of NEGATIVE DPD below p1 = 0: a data anomaly, not a head.)
+      ramp     risk varies ACROSS the region (pooled or inside some stratum):
+               the clip flattens an ordering the model could have used
+      swamped  the region is informative as a block, but the rows already on
+               the bound outnumber enough of it that the merged block can no
+               longer be split off: the clip costs the split itself
+      block    informative as a block, flat inside, not swamped: the block
+               survives the clip, which costs nothing. Leave it clipped.
+      inert    uninformative block, flat inside
+
+    Stratum lifts and gradients only count when their own region holds at
+    least _MIN_TAIL_ROWS rows (n_hi_cat{k} / n_lo_cat{k}); a lift of 20 on a
+    dozen rows is noise.
+
+    `ramp` does not require an informative block. The old rule demanded
+    tail_lift > threshold AND gradient > threshold and so missed the two
+    steepest ramps in results_9 (WORST_CLOSED_LOAN_DPD 5.55,
+    AVERAGE_CLOSE_LOAN_DPD 5.17), whose blocks average out near 1.4. A block
+    lift is informative in either direction — a head that is unusually CLEAN
+    is as much signal as one that is unusually risky.
+    """
+    end = "hi" if side == "tail" else "lo"
+    merged = row.get(f"pct_{end}", 0.0) or 0.0
+    if merged <= 0:
+        return "none"
+    n = row.get(f"n_{end}")
+    if n is not None and np.isfinite(n) and n < _MIN_TAIL_ROWS:
+        return "tiny"
+
+    def big_enough(key):
+        # "tail_lift_cat0" -> "n_hi_cat0"; pooled keys have no stratum count.
+        if "_cat" not in key:
+            return True
+        k_n = row.get(f"n_{end}_cat" + key.rsplit("_cat", 1)[1])
+        return k_n is None or not np.isfinite(k_n) or k_n >= _MIN_TAIL_ROWS
+
+    def present(prefix):
+        return [v for k, v in row.items()
+                if (k == prefix or k.startswith(prefix + "_cat"))
+                and isinstance(v, (int, float)) and np.isfinite(v)
+                and big_enough(k)]
+
+    grads = present(f"{side}_gradient")
+    lifts = present(f"{side}_lift")
+    ramp = any(g > grad_thr for g in grads)
+    informative = any(v > lift_thr or v < 1 / lift_thr for v in lifts)
+    swamped = informative and row.get(f"pct_tied_{end}", 0.0) >= SWAMP_RATIO * merged
+
+    parts = [p for p, on in (("ramp", ramp), ("swamped", swamped)) if on]
+    if parts:
+        return "+".join(parts)
+    return "block" if informative else "inert"
+
+
+def add_verdicts(rep: pd.DataFrame, lift_thr: float, grad_thr: float) -> pd.DataFrame:
+    rep = rep.copy()
+    for side in ("tail", "head"):
+        rep[f"{side}_verdict"] = [side_verdict(r, side, lift_thr, grad_thr)
+                                  for r in rep.to_dict("records")]
+    return rep
 
 
 def main():
@@ -284,14 +398,19 @@ def main():
                          "identity. Bounds and merge counts stay on the full population either "
                          "way, because that is what OutlierClipper fits on.")
     ap.add_argument("--by_current_cat", action="store_true",
-                    help="also report tail_lift/head_lift INSIDE each queued "
-                         "current_cat stratum, against that stratum's own base "
-                         "rate. --ranked_only removes cat_3 but not cat_2, so a "
-                         "tail made of cat_2 rows still reports a large pooled "
-                         "lift with zero incremental signal. Read cat0.")
+                    help="also report lift, gradient and row counts INSIDE each "
+                         "queued current_cat stratum, against that stratum's own "
+                         "base rate. Pooled numbers mix the strata: a tail full "
+                         "of cat_2 rows reports a large lift with no incremental "
+                         "signal, and a pooled gradient moves with the mix too.")
+    ap.add_argument("--include_exempt", action="store_true",
+                    help="also report the clip:false columns, with the bounds the "
+                         "clipper WOULD fit — to audit an exemption with the same "
+                         "measurements that would have justified it")
     ap.add_argument("--output", default="explore_output/clip_impact.csv")
     ap.add_argument("--lift_threshold", type=float, default=1.5,
-                    help="tail_lift above which a column is worth a second look")
+                    help="block lift above this (or below its inverse) counts as "
+                         "informative")
     ap.add_argument("--gradient_threshold", type=float, default=1.5,
                     help="tail_gradient above which the clip is flattening a "
                          "real ramp rather than merging equivalent rows")
@@ -309,7 +428,12 @@ def main():
                  f"{severe[rankable].mean():.4%}. Bounds still from all rows.")
     rep = clip_report(flat, severe, feat_cols, only, lift_mask,
                       strata=cats if args.by_current_cat else None,
-                      null_frac=null_frac)
+                      null_frac=null_frac, include_exempt=args.include_exempt)
+    if rep.empty:
+        log.error("Nothing to report — every requested column is binary or "
+                  "clip:false. Pass --include_exempt to audit exempt columns.")
+        return
+    rep = add_verdicts(rep, args.lift_threshold, args.gradient_threshold)
 
     if not args.ranked_only:
         log.warning(
@@ -346,15 +470,6 @@ def main():
             "  information into any arm. Set clip:false in contract/columns.json."
         )
 
-    headed = rep[rep["head_lift"] > args.lift_threshold]
-    if len(headed):
-        log.warning(
-            f"{len(headed)} feature(s) with head_lift > {args.lift_threshold}: "
-            f"{', '.join(headed['feature'])}\n"
-            "  Severe events concentrate BELOW p1, so the low clip is folding\n"
-            "  risk-bearing rows into the bottom bin."
-        )
-
     nulled = rep[rep["pct_null"] > 0.002]
     if len(nulled):
         log.info(
@@ -365,40 +480,59 @@ def main():
             "  percentiles stated a p1 these columns never had."
         )
 
-    # The block is risky AND has a shape inside it -- the only combination in
-    # which clipping actually costs the model something.
-    costly = rep[(rep["tail_lift"] > args.lift_threshold)
-                 & (rep["tail_gradient"] > args.gradient_threshold)]
-    flat_tail = rep[(rep["tail_lift"] > args.lift_threshold)
-                    & (rep["tail_gradient"] <= args.gradient_threshold)]
+    def costs(r):
+        return [s for s in ("tail", "head")
+                if r[f"{s}_verdict"].startswith(("ramp", "swamped"))]
+
+    def named(frame):
+        out = []
+        for r in frame.to_dict("records"):
+            where = "/".join(f"{s}:{r[s + '_verdict']}" for s in costs(r))
+            out.append(f"{r['feature']} ({where})" if where else r["feature"])
+        return ", ".join(out)
+
+    clipped, exempt = rep[~rep["exempt"]], rep[rep["exempt"]]
+    costly = clipped[[bool(costs(r)) for r in clipped.to_dict("records")]]
+    block = clipped[[not costs(r) and "block" in (r["tail_verdict"], r["head_verdict"])
+                     for r in clipped.to_dict("records")]]
 
     if len(costly):
         log.warning(
-            f"{len(costly)} feature(s) with tail_lift > {args.lift_threshold} AND "
-            f"tail_gradient > {args.gradient_threshold}: "
-            f"{', '.join(costly['feature'])}\n"
-            "  Risk RISES across the tail, so the clip is flattening a real ramp\n"
-            "  rather than merging equivalent rows. These are the candidates for\n"
-            "  clip:false — A/B on validation lift@K before committing."
+            f"{len(costly)} clipped feature(s) where the clip costs something: "
+            f"{named(costly)}\n"
+            "  ramp    = risk varies across the clipped region, and the clip\n"
+            "            flattens that ordering.\n"
+            "  swamped = the region is informative but the merged rows can no\n"
+            "            longer be split off from those already on the bound.\n"
+            "  Candidates for clip:false. Read the per-stratum columns and the\n"
+            "  n_*_cat counts first, then A/B on validation lift@K."
         )
-    if len(flat_tail):
+    else:
+        log.info("No clipped feature shows a ramp or a swamped bound — the clip "
+                 "merges rows the model had no reason to separate.")
+    if len(block):
         log.info(
-            f"{len(flat_tail)} feature(s) with a high tail_lift but a FLAT "
-            f"tail_gradient: {', '.join(flat_tail['feature'])}\n"
-            "  The tail is risky as a block, but risk does not vary across it —\n"
-            "  and the block survives clipping, because a split just inside the\n"
-            "  bound still isolates it. Leave these clipped."
+            f"{len(block)} clipped feature(s) informative as a BLOCK but flat "
+            f"inside and not swamped: {', '.join(block['feature'])}\n"
+            "  A split just inside the bound still isolates the block, so the\n"
+            "  clip costs nothing here. Leave these clipped."
         )
-    if not len(costly):
-        log.info("No feature shows a risk ramp inside its tail — the clip merges "
-                 "rows the model had no reason to separate.")
+    if len(exempt):
+        justified = exempt[[bool(costs(r)) for r in exempt.to_dict("records")]]
+        idle = exempt[[not costs(r) for r in exempt.to_dict("records")]]
+        log.info(
+            f"--include_exempt: {len(exempt)} clip:false column(s) audited.\n"
+            f"  Clipping WOULD cost something (exemption justified): "
+            f"{named(justified) or 'none'}\n"
+            f"  Clipping would cost nothing measurable (exemption harmless, not "
+            f"needed): {', '.join(idle['feature']) or 'none'}"
+        )
 
     if not args.by_current_cat:
         log.warning(
-            "No --by_current_cat. --ranked_only removes cat_3 but not cat_2, so "
-            "a tail made of cat_2 rows reports cat2_rate/base_rate with zero "
-            "incremental signal. Re-run with --by_current_cat and read "
-            "tail_lift_cat0 before acting on any pooled number above."
+            "No --by_current_cat. Pooled lifts AND pooled gradients both move "
+            "with the current_cat mix of the region they measure. Re-run with "
+            "--by_current_cat before acting on any verdict above."
         )
     log.info(f"Wrote {out}")
 

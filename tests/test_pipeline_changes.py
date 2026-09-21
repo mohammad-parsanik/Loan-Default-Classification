@@ -1623,6 +1623,11 @@ def test_tail_gradient_separates_a_ramp_from_a_flat_tail():
     ramp_sev[outer[:len(outer) * 3 // 5]] = True          # 60%
     assert _gradient(ramp_sev, x, tail, True) == pytest.approx(3.0, rel=0.1)
 
+    # Too few events to estimate a shape: NaN, not a noisy ratio.
+    sparse = np.zeros(n, dtype=bool)
+    sparse[rng.choice(idx, size=20, replace=False)] = True
+    assert np.isnan(_gradient(sparse, x, tail, True))
+
     # One value beyond the bound: nothing out there to order, so nothing to lose.
     const = np.where(tail, 999.0, 0.0)
     assert np.isnan(_gradient(flat_sev, const, const > 998.0, True))
@@ -1651,6 +1656,109 @@ def test_stratum_lift_separates_signal_from_composition():
     assert row["tail_lift"] > 5, "pooled, the tail looks hugely predictive"
     assert row["tail_lift_cat2"] == pytest.approx(1.0, abs=0.2), \
         "inside cat_2 the tail is an ordinary cat_2 row — it was composition"
+
+
+def test_stratum_gradient_sees_a_ramp_the_pooled_gradient_hides():
+    """
+    A pooled gradient moves with the current_cat mix across the region, exactly
+    as a pooled lift does. Here risk DOUBLES across the tail inside every
+    stratum, but the tail's inner half is cat_2 and its outer half cat_0 — so
+    the pooled ratio compares cat_2 rows to cat_0 rows and reads as a steep
+    DECLINE. Only the per-stratum gradient tells the truth.
+    """
+    from explore_clip_impact import add_verdicts, clip_report
+
+    rng = np.random.default_rng(0)
+    n = 1_000_000                            # enough cat_0 events to estimate
+    x = np.arange(n, dtype=np.float64).reshape(-1, 1)
+    tail = np.flatnonzero(x[:, 0] > np.percentile(x, 99))
+    inner, outer = tail[: len(tail) // 2], tail[len(tail) // 2:]
+    cats = np.zeros(n, dtype=int)
+    cats[inner] = 2
+
+    severe = rng.random(n) < 0.01
+    for block, lo_rate in ((inner, 0.30), (outer, 0.05)):    # cat_2, then cat_0
+        q = len(block) // 4
+        severe[block] = False
+        severe[block[:q]] = rng.random(q) < lo_rate           # inner quartile
+        severe[block[-q:]] = rng.random(q) < 2 * lo_rate      # outer: doubled
+
+    row = clip_report(x, severe, ["MAX_DPD_LAST_6M"], strata=cats).iloc[0]
+
+    assert row["tail_gradient"] < 0.5, "pooled, the mix reads as a decline"
+    assert row["tail_gradient_cat0"] == pytest.approx(2.0, rel=0.35)
+    assert row["tail_gradient_cat2"] == pytest.approx(2.0, rel=0.35)
+    assert row["n_hi_cat0"] == len(outer) and row["n_hi_cat2"] == len(inner)
+
+    rep = add_verdicts(clip_report(x, severe, ["MAX_DPD_LAST_6M"], strata=cats)
+                       .assign(exempt=False), 1.5, 1.5)
+    assert rep.iloc[0]["tail_verdict"].startswith("ramp")
+
+
+def _verdict_row(**kw):
+    base = {"pct_hi": 0.01, "n_hi": 300_000, "pct_tied_hi": 0.0,
+            "tail_lift": 1.0, "tail_gradient": 1.0}
+    return {**base, **kw}
+
+
+def test_verdict_flags_a_ramp_even_when_the_block_looks_ordinary():
+    """The old rule required tail_lift > 1.5 AND gradient > 1.5, which missed
+    the two steepest ramps in results_9 (WORST_CLOSED_LOAN_DPD: lift 1.43,
+    gradient 5.55). A ramp costs ordering whatever the block averages to."""
+    from explore_clip_impact import side_verdict
+
+    assert side_verdict(_verdict_row(tail_lift=1.43, tail_gradient=5.55),
+                        "tail", 1.5, 1.5) == "ramp"
+    assert side_verdict(_verdict_row(tail_lift=11.7, tail_gradient=1.03),
+                        "tail", 1.5, 1.5) == "block", \
+        "risky but flat: the block survives the clip — leave it clipped"
+    assert side_verdict(_verdict_row(), "tail", 1.5, 1.5) == "inert"
+    assert side_verdict(_verdict_row(pct_hi=0.0), "tail", 1.5, 1.5) == "none"
+
+
+def test_verdict_flags_a_block_swamped_by_rows_already_on_the_bound():
+    """REMAINING_INST_CNT in results_9: 0.74% of rows below p1 = 8 are ~15x
+    CLEANER than average, and the clip merges them into the 1.0% of rows
+    already sitting at 8 — a split can no longer find them. A clean block is
+    as informative as a risky one."""
+    from explore_clip_impact import side_verdict
+
+    row = {"pct_lo": 0.0074, "n_lo": 242_354, "pct_tied_lo": 0.0104,
+           "head_lift": 0.0685, "head_gradient": np.nan}
+    assert side_verdict(row, "head", 1.5, 1.5) == "swamped"
+
+    row["pct_tied_lo"] = 0.001                   # few rows on the bound
+    assert side_verdict(row, "head", 1.5, 1.5) == "block"
+
+
+def test_verdict_ignores_regions_too_small_to_judge():
+    """TOTAL_DPD_DAYS_LAST_6M has 39 rows of NEGATIVE DPD below p1 = 0 — a
+    data anomaly. Stratum lifts on a dozen rows are noise too."""
+    from explore_clip_impact import side_verdict
+
+    anomaly = {"pct_lo": 1.2e-6, "n_lo": 39, "pct_tied_lo": 0.14,
+               "head_lift": 0.999, "head_lift_cat1": 20.4, "n_lo_cat1": 12}
+    assert side_verdict(anomaly, "head", 1.5, 1.5) == "tiny"
+
+    noisy = _verdict_row(tail_lift_cat0=40.0, n_hi_cat0=15)
+    assert side_verdict(noisy, "tail", 1.5, 1.5) == "inert", \
+        "a lift on 15 rows must not make the block informative"
+
+
+def test_include_exempt_audits_clip_false_columns():
+    from explore_clip_impact import clip_report
+    from src.data.column_contract import NO_CLIP
+
+    exempt_col = "HIST_MAX_DPD_DAYS"
+    assert exempt_col in NO_CLIP
+    x = np.linspace(0.0, 100.0, 5000).reshape(-1, 1)
+    severe = np.zeros(5000, dtype=bool)
+
+    assert clip_report(x, severe, [exempt_col]).empty, "skipped by default"
+    audited = clip_report(x, severe, [exempt_col], include_exempt=True).iloc[0]
+    assert bool(audited["exempt"])
+    assert audited["p99"] == pytest.approx(np.percentile(x, 99)), \
+        "reports the bound the clipper WOULD fit"
 
 
 # ── an artifact says which contract it was fitted under ───────────────────────
