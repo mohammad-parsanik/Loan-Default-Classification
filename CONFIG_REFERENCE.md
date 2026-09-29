@@ -79,6 +79,14 @@ subset you should double-check before a production `--final` run.
 | `API_CALL_LOG` | `None` | Default path to the call ledger CSV (`NATIONAL_CODE, CALLED_AT`), used if `--called_log`/`called_log_path` isn't passed explicitly. |
 | `CERTAINTY_ACT_THRESHOLD` | `None` | When set (e.g. `0.9`), queue rows with `RISK_SCORE` at or above this are flagged `PREDICTED_SEVERE` — treated as certain enough to act on directly without spending an API call. **Pending business sign-off** — leave `None` until confirmed. |
 
+## Monitoring
+
+| Setting | Default | Notes |
+|---|---|---|
+| `PRED_ARCHIVE_TABLE` | `None` | The table the inference engine writes scored output to. `run.py monitor` reads it (`SELECT *`) and needs `SNAPSHOT_DATE, LOAN_ID, NATIONAL_CODE, CURRENT_CAT, RISK_SCORE`. If a `SCORED_AT` column exists, it breaks ties when a snapshot was scored twice (newest wins); otherwise the higher score is kept. **Must be set on the server.** |
+| `MONITOR_HEADLINE_WINDOWS` | `("1_day", "1_week")` | Which `RANKING_REF_WINDOWS` appear as headline tiles and early-warning bars. |
+| `MONITOR_OUTPUT_DIR` | `"monitoring"` | Root for `<asof>/metrics.json`, `<asof>/report_<asof>.html`, `<asof>/charts/*.png` and `history.csv`. Gitignored. |
+
 ## Cache
 
 | Setting | Default | Notes |

@@ -259,6 +259,14 @@ API_CALL_LOG      = None   # optional default path to the ledger CSV
 # None = disabled.
 CERTAINTY_ACT_THRESHOLD = None
 
+# ── Monitoring (python run.py monitor) ───────────────────
+# Table the inference engine writes its scored output to (score_instances
+# columns: SNAPSHOT_DATE, LOAN_ID, NATIONAL_CODE, CURRENT_CAT, RISK_SCORE, ...).
+# The monthly report joins it to TRAIN_TABLE's outcomes. Set on the server.
+PRED_ARCHIVE_TABLE       = None
+MONITOR_HEADLINE_WINDOWS = ("1_day", "1_week")   # keys of RANKING_REF_WINDOWS
+MONITOR_OUTPUT_DIR       = "monitoring"
+
 
 # ── Cache ────────────────────────────────────────────────
 # Bump this string when raw data changes (re-ETL, schema updates, etc.)

@@ -1017,7 +1017,7 @@ def predict_pipeline(artifact_dir: str, snapshot_date=None, output_path: str = N
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Loan Default Classification Pipeline")
     parser.add_argument(
-        "action", choices=["explore", "train", "predict"],
+        "action", choices=["explore", "train", "predict", "monitor"],
         help="Pipeline action to run.",
     )
     parser.add_argument(
@@ -1049,6 +1049,17 @@ if __name__ == "__main__":
              "project_config.API_CALL_LOG.",
     )
 
+    parser.add_argument(
+        "--asof", type=int, default=None,
+        help="monitor: date (YYYYMMDD) deciding which cohorts count as matured. "
+             "Defaults to today.",
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default=None,
+        help="monitor: where metrics.json, history.csv and the HTML report go. "
+             "Defaults to project_config.MONITOR_OUTPUT_DIR.",
+    )
+
     args = parser.parse_args()
 
     if args.action == "explore":
@@ -1062,3 +1073,6 @@ if __name__ == "__main__":
             sys.exit(1)
         predict_pipeline(args.artifact_dir, args.snapshot_date, args.output,
                          called_log=args.called_log)
+    elif args.action == "monitor":
+        from src.monitoring.monitor import run_monitor
+        run_monitor(asof=args.asof, output_dir=args.output_dir)

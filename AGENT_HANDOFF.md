@@ -1426,3 +1426,37 @@ the `clip: false` columns with the same measurements.
 4. **The clipping A/B, low priority** — not for the DPD family (flat interior). If run at
    all, one exemption run covering the ramp columns and `REMAINING_INST_CNT`'s head. Now
    free to try: a flag change no longer rebuilds the cache.
+
+---
+
+## 26. Monthly Monitoring Report (September 28, 2026)
+
+`python run.py monitor` (`src/monitoring/`) grades the predictions the inference
+engine actually made. It reads `PRED_ARCHIVE_TABLE`, joins it to `TRAIN_TABLE` on
+(`SNAPSHOT_DATE`, `LOAN_ID`), and writes one self-contained HTML report per run.
+The training server is offline, so charts are embedded PNGs, also saved individually
+for slides.
+
+- **Every cohort is recomputed from the DB on each run.** A rewritten snapshot carries
+  the more complete label, so there is no frozen per-cohort state.
+- **Matured cohort** (`LABEL_HORIZON_DATE <= asof`): the queue's recall, precision and
+  lift at 1 day and 1 week, with Wilson 95% intervals; PR-AUC; the share of severe
+  exposure (`REMAINING_AMNT`) caught; predicted vs actual severe counts; calibration by
+  queue decile; a migration matrix (top 1 week vs rest); and a per-`current_cat`
+  breakdown **inside the pooled queue**. `ranking_metrics`' own `by_current_cat` block
+  re-ranks each stratum alone with the full K, so it reads 100% recall for any stratum
+  smaller than K. Do not put it in front of anyone.
+- **Interim cohort:** `WORST_FUTURE_CAT` on an immature row is the worst category
+  reached so far (contract §2). It is reported only as "flagged loans worsened at N×
+  the rate of the rest" and never mixed into matured metrics. It rests on the ETL
+  refreshing that partial label in its monthly recompute of the newest 7 snapshots,
+  which has not been confirmed with the ETL owner.
+- **Drift:** population size, `current_cat` mix, score quantiles, and score PSI against
+  the previous 6 snapshots, all computed from the prediction table alone. Feature-level
+  PSI is not built.
+- **The queue is not acted on yet.** Once it is, a loan that was called and then did not
+  go severe will count against the model. The report then needs the call log to split
+  called from not called.
+- **Predicted severe counts will sit below actual** (§24). The report says so next to the
+  chart.
+

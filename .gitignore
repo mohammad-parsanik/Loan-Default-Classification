@@ -63,3 +63,6 @@ logs/
 # Generated handoff artifacts
 /placeholder/
 /scoring_package*/
+
+# Monthly monitoring output (python run.py monitor)
+/monitoring/
