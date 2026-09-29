@@ -40,7 +40,7 @@ python run.py predict --artifact_dir <dir> [--snapshot_date <YYYYMMDD> ...] [--o
 # snapshot_date defaults to PRED_SNAPSHOT_DATES, else every currently-immature snapshot
 # output defaults to <artifact_dir>/predictions/predictions_<tag>.csv
 python run.py explore                        # one-shot data profiling
-python run.py monitor [--asof <YYYYMMDD>]    # monthly report: past predictions vs outcomes (reads PRED_ARCHIVE_TABLE)
+python run.py monitor [--asof <YYYYMMDD>]    # monthly report: inference-engine predictions vs outcomes (AGENT_HANDOFF §26)
 
 # Standalone diagnostics (read NPZ cache, no DB needed):
 python explore_iv_woe.py [--n_bins 15 --top_n 30]

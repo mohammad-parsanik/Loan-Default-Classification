@@ -260,11 +260,18 @@ API_CALL_LOG      = None   # optional default path to the ledger CSV
 CERTAINTY_ACT_THRESHOLD = None
 
 # ── Monitoring (python run.py monitor) ───────────────────
-# Table the inference engine writes its scored output to (score_instances
-# columns: SNAPSHOT_DATE, LOAN_ID, NATIONAL_CODE, CURRENT_CAT, RISK_SCORE, ...).
-# The monthly report joins it to TRAIN_TABLE's outcomes. Set on the server.
-PRED_ARCHIVE_TABLE       = None
-MONITOR_HEADLINE_WINDOWS = ("1_day", "1_week")   # keys of RANKING_REF_WINDOWS
+# The inference engine's tables (EDP-inference-engine repo, db/schema.sql).
+# OperationLog maps each run to its snapshot; InferenceOutput holds p0..p3 per
+# loan; ContractTracking says which loans its exception rule sent to
+# enrichment. The report joins them to TRAIN_TABLE's outcomes.
+INFERENCE_OPLOG_TABLE    = "D_ANALYTICS.OperationLog"
+INFERENCE_OUTPUT_TABLE   = "D_ANALYTICS.InferenceOutput"
+INFERENCE_TRACKING_TABLE = "D_ANALYTICS.ContractTracking"
+# Where the report cuts the p3-ordered list: a float is a share of the list,
+# an int a fixed number of loans. MONITOR_MAIN_CUTOFF is the one the lead
+# sentence, migration matrix and "rest of the list" comparisons use.
+MONITOR_CUTOFFS          = {"top_1pct": 0.01, "top_5pct": 0.05, "top_1000": 1000}
+MONITOR_MAIN_CUTOFF      = "top_5pct"
 MONITOR_OUTPUT_DIR       = "monitoring"
 
 

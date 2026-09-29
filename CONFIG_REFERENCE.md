@@ -83,9 +83,12 @@ subset you should double-check before a production `--final` run.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `PRED_ARCHIVE_TABLE` | `None` | The table the inference engine writes scored output to. `run.py monitor` reads it (`SELECT *`) and needs `SNAPSHOT_DATE, LOAN_ID, NATIONAL_CODE, CURRENT_CAT, RISK_SCORE`. If a `SCORED_AT` column exists, it breaks ties when a snapshot was scored twice (newest wins); otherwise the higher score is kept. **Must be set on the server.** |
-| `MONITOR_HEADLINE_WINDOWS` | `("1_day", "1_week")` | Which `RANKING_REF_WINDOWS` appear as headline tiles and early-warning bars. |
-| `MONITOR_OUTPUT_DIR` | `"monitoring"` | Root for `<asof>/metrics.json`, `<asof>/report_<asof>.html`, `<asof>/charts/*.png` and `history.csv`. Gitignored. |
+| `INFERENCE_OPLOG_TABLE` | `"D_ANALYTICS.OperationLog"` | The inference engine's run log. `run.py monitor` uses the newest `SUCCESS`/`PARTIAL_SUCCESS` run per `snapshot_date`, which is the same rule as the engine's `db/analysis/01_backtest_base.sql`. |
+| `INFERENCE_OUTPUT_TABLE` | `"D_ANALYTICS.InferenceOutput"` | One row per scored loan per run. The monitor reads `loan_id, national_code, p3, dpd_cat, remain_of_account`. `p3` is the ranking score, and `dpd_cat` (raw 0–4) is capped to 3 as the current category. |
+| `INFERENCE_TRACKING_TABLE` | `"D_ANALYTICS.ContractTracking"` | `operation_status_enrichment` other than `NOT_APPLICABLE` marks a loan the engine's exception rule sent to enrichment. |
+| `MONITOR_CUTOFFS` | `{"top_1pct": 0.01, "top_5pct": 0.05, "top_1000": 1000}` | Where the report cuts the list ordered by `p3`: a float is a share of the list (rounded up), an int a fixed number of loans (capped at the list size). Each cutoff gets recall with a 95% interval, hit rate, lift and exposure caught. These replace the API-budget windows (`RANKING_REF_WINDOWS`), which the monitor no longer uses. |
+| `MONITOR_MAIN_CUTOFF` | `"top_5pct"` | The cutoff behind the lead sentence, the migration matrix and every "rest of the list" comparison. Must be a key of `MONITOR_CUTOFFS`. |
+| `MONITOR_OUTPUT_DIR` | `"monitoring"` | Root for `<asof>/metrics.json`, `<asof>/report_<asof>.html`, `<asof>/charts/*.png`, `history.csv` and **`labels/`**. `labels/` is the label archive (one `.npz` per snapshot, holding the highest `WORST_FUTURE_CAT` ever read per loan). It is state, not output: it is what protects the outcomes against upstream deletion, so keep it on the server across runs. Gitignored. |
 
 ## Cache
 

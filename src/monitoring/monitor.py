@@ -1,24 +1,36 @@
 """
 Monthly monitoring: how did the predictions we actually made turn out?
 
-Joins the inference engine's prediction table (PRED_ARCHIVE_TABLE — one row
-per scored loan x snapshot, `score_instances` columns) to the feed's outcomes
-and recomputes every cohort from the DB on each run:
+The inference engine (EDP-inference-engine repo) records each monthly run in
+OperationLog (one operation_id per run, keyed to a snapshot_date) and writes
+one InferenceOutput row per scored loan (p0..p3, dpd_cat, dpd,
+remain_of_account), plus a ContractTracking row saying whether its exception
+rule sent the loan to enrichment. It scores LOAN_CATEGORY 0-2 only — exactly
+the ranked population. A snapshot can hold several runs (--force); the newest
+SUCCESS/PARTIAL_SUCCESS one counts, the same rule as the engine's
+db/analysis/01_backtest_base.sql.
 
-  - matured cohort  (LABEL_HORIZON_DATE <= asof): the label is final — ranking
-    quality at the API budget, exposure caught, calibration, migration.
-  - interim cohort  (horizon not reached): WORST_FUTURE_CAT holds the worst
-    category reached SO FAR (contract §2), a lower bound on the final label.
-    Reported only as "flagged loans deteriorated at N x the rate of the rest",
-    never mixed into matured metrics.
+Outcomes come from the feed's WORST_FUTURE_CAT on the scored snapshot's own
+row, and every cohort is recomputed from the DB on each run:
 
-Evaluation is per snapshot, on the ranked population (current_cat <
-CARVE_CURRENT_CAT_GE), ordered by RISK_SCORE with LOAN_ID as tie-break —
-the same order the production queue uses.
+  - matured cohort  (LABEL_HORIZON_DATE <= asof): the label is final — how
+    many severe loans the top of the list caught (MONITOR_CUTOFFS: a share of
+    the list or a fixed count), exposure caught, calibration, migration, and
+    how the engine's enrichment rule did.
+  - interim cohort  (horizon not reached): the ETL refreshes WORST_FUTURE_CAT
+    on the newest 7 snapshots every load, so it holds the worst category
+    reached SO FAR — a lower bound on the final label. Reported only as
+    "flagged loans deteriorated at N x the rate of the rest", never mixed
+    into matured metrics.
+
+Evaluation is per snapshot, ordered by p3 with LOAN_ID as tie-break. The
+engine does not rank (its queue columns are deliberately not persisted), so
+"the list" here is that ordering, cut at MONITOR_CUTOFFS.
 """
 
 import json
 import logging
+import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -27,76 +39,142 @@ import numpy as np
 import pandas as pd
 
 import project_config as config
-from src.evaluation.ranking import SEVERE_CLASS, _order, capture_curve, ranking_metrics
+from src.evaluation.ranking import SEVERE_CLASS, _average_precision, _order, capture_curve
 
 logger = logging.getLogger(__name__)
 
-PRED_COLS = ["SNAPSHOT_DATE", "LOAN_ID", "NATIONAL_CODE", "CURRENT_CAT", "RISK_SCORE"]
-OUTCOME_COLS = ["SNAPSHOT_DATE", "LOAN_ID", "WORST_FUTURE_CAT", "LABEL_HORIZON_DATE",
-                "REMAINING_AMNT"]
+# Internal names, shared with the evaluation code; engine columns are mapped onto them.
+PRED_COLS = ["SNAPSHOT_DATE", "LOAN_ID", "NATIONAL_CODE", "CURRENT_CAT", "RISK_SCORE",
+             "REMAINING_AMNT", "FLAGGED"]
+OUTCOME_COLS = ["SNAPSHOT_DATE", "LOAN_ID", "WORST_FUTURE_CAT", "LABEL_HORIZON_DATE"]
+USABLE_RUN_STATUSES = ("SUCCESS", "PARTIAL_SUCCESS")
 PSI_REF_SNAPSHOTS = 6
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────
 
-def load_frames(conn) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Predictions from PRED_ARCHIVE_TABLE, outcomes for the same snapshots from TRAIN_TABLE."""
-    table = config.PRED_ARCHIVE_TABLE
-    if not table:
-        raise ValueError("project_config.PRED_ARCHIVE_TABLE is not set.")
-    preds = conn.read_sql(f"SELECT * FROM {table}")
-    snaps = sorted(int(s) for s in preds["SNAPSHOT_DATE"].unique())
-    outcomes = pd.concat(
-        [conn.read_sql(
+def pick_runs(runs: pd.DataFrame) -> pd.DataFrame:
+    """Newest usable run per snapshot, with how many usable runs the snapshot had."""
+    r = runs[runs["operation_status"].isin(USABLE_RUN_STATUSES)
+             & runs["snapshot_date"].notna()].copy()
+    r["snapshot_date"] = r["snapshot_date"].astype(int)
+    r["n_usable_runs"] = r.groupby("snapshot_date")["operation_id"].transform("size")
+    return (r.sort_values(["snapshot_date", "operation_date"], ascending=[True, False])
+             .drop_duplicates("snapshot_date").reset_index(drop=True))
+
+
+def engine_to_preds(output: pd.DataFrame, snapshot: int) -> pd.DataFrame:
+    """One run's InferenceOutput (+ ContractTracking status) -> internal prediction frame."""
+    status = output["operation_status_enrichment"]
+    return pd.DataFrame({
+        "SNAPSHOT_DATE": int(snapshot),
+        "LOAN_ID": output["loan_id"].astype("int64"),
+        "NATIONAL_CODE": output["national_code"],
+        # dpd_cat is the raw 0-4 feed band; the model's classes are 0-3
+        "CURRENT_CAT": np.minimum(output["dpd_cat"].astype(int), config.NUM_CLASSES - 1),
+        "RISK_SCORE": output["p3"].astype(float),
+        "REMAINING_AMNT": output["remain_of_account"].astype(float),
+        # PENDING_ENRICHMENT when written; later enrichment statuses overwrite it
+        "FLAGGED": status.notna() & (status != "NOT_APPLICABLE"),
+    })
+
+
+def load_frames(conn) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """(predictions, outcomes, chosen runs) for every snapshot the engine has scored."""
+    statuses = ", ".join(f"'{s}'" for s in USABLE_RUN_STATUSES)
+    runs = pick_runs(conn.read_sql(
+        "SELECT operation_id, snapshot_date, operation_status, operation_date, "
+        f"inference_failures FROM {config.INFERENCE_OPLOG_TABLE} "
+        f"WHERE operation_status IN ({statuses}) AND snapshot_date IS NOT NULL"))
+    if runs.empty:
+        raise ValueError(f"No {'/'.join(USABLE_RUN_STATUSES)} run in {config.INFERENCE_OPLOG_TABLE}.")
+
+    preds, outcomes = [], []
+    for run in runs.itertuples():
+        out = conn.read_sql(
+            "SELECT o.loan_id, o.national_code, o.p3, o.dpd_cat, o.remain_of_account, "
+            "t.operation_status_enrichment "
+            f"FROM {config.INFERENCE_OUTPUT_TABLE} o "
+            f"LEFT JOIN {config.INFERENCE_TRACKING_TABLE} t "
+            "ON t.operation_id = o.operation_id AND t.loan_id = o.loan_id "
+            "WHERE o.operation_id = ?", (run.operation_id,))
+        preds.append(engine_to_preds(out, run.snapshot_date))
+        outcomes.append(conn.read_sql(
             f"SELECT {', '.join(OUTCOME_COLS)} FROM {config.TRAIN_TABLE} WHERE SNAPSHOT_DATE = ?",
-            (s,),
-        ) for s in snaps],
-        ignore_index=True,
-    ) if snaps else pd.DataFrame(columns=OUTCOME_COLS)
-    return preds, outcomes
+            (int(run.snapshot_date),)))
+    return pd.concat(preds, ignore_index=True), pd.concat(outcomes, ignore_index=True), runs
 
 
 def prepare(preds: pd.DataFrame, outcomes: pd.DataFrame, asof: int) -> tuple[pd.DataFrame, dict]:
-    """Validate, dedupe and join. Returns (frame, data-quality dict)."""
-    missing = set(PRED_COLS) - set(preds.columns)
-    if missing:
-        raise ValueError(f"{config.PRED_ARCHIVE_TABLE} lacks required columns {sorted(missing)}")
-
-    p = preds.copy()
-    p["SNAPSHOT_DATE"] = p["SNAPSHOT_DATE"].astype(float).astype(int)
-    # A snapshot scored twice leaves two rows per loan. Prefer the newest run
-    # when the table says which that is, else the higher score — either way a
-    # stated, deterministic choice.
-    order_col = "SCORED_AT" if "SCORED_AT" in p.columns else "RISK_SCORE"
+    """Join predictions to outcomes. Returns (frame, data-quality dict)."""
     key = ["SNAPSHOT_DATE", "LOAN_ID"]
-    dup = p.duplicated(key, keep=False)
-    n_dup_conflict = int(
-        (p[dup].groupby(key)["RISK_SCORE"].nunique() > 1).sum()) if dup.any() else 0
-    p = (p.sort_values(key + [order_col], ascending=[True, True, False])
-          .drop_duplicates(key, keep="first"))
-
     o = outcomes.copy()
     o["SNAPSHOT_DATE"] = o["SNAPSHOT_DATE"].astype(float).astype(int)
-    df = p[PRED_COLS].merge(o, on=key, how="left", validate="one_to_one")
+    o["LOAN_ID"] = o["LOAN_ID"].astype("int64")
+    df = preds[PRED_COLS].merge(o, on=key, how="left", validate="one_to_one")
 
     unmatched = df["WORST_FUTURE_CAT"].isna()
     quality = {
         "n_prediction_rows": int(len(preds)),
-        "n_duplicates_dropped": int(len(preds) - len(p)),
-        "n_duplicate_keys_with_different_scores": n_dup_conflict,
-        "dedup_rule": f"keep highest {order_col}",
         "unmatched_by_snapshot": {
             int(s): int(n) for s, n in df[unmatched].groupby("SNAPSHOT_DATE").size().items()
         },
     }
     if unmatched.any():
-        logger.warning(f"{int(unmatched.sum()):,} predicted loans have no row in "
+        logger.warning(f"{int(unmatched.sum()):,} scored loans have no row in "
                        f"{config.TRAIN_TABLE} — excluded from outcome metrics.")
     df = df[~unmatched].copy()
     df["OUTCOME"] = np.minimum(df["WORST_FUTURE_CAT"].astype(int), config.NUM_CLASSES - 1)
     df["CURRENT_CAT"] = df["CURRENT_CAT"].astype(int)
     df["MATURED"] = df["LABEL_HORIZON_DATE"].astype(float).astype(int) <= asof
     return df, quality
+
+
+# ── Label archive ─────────────────────────────────────────────────────────────
+
+def reconcile_labels(outcomes: pd.DataFrame, archive_dir: Path) -> tuple[pd.DataFrame, dict]:
+    """
+    Guard the outcome against upstream deletion.
+
+    Every month the ETL rebuilds the newest snapshots, and a rebuilt label can
+    only have seen MORE installments than the last one, so within a snapshot a
+    loan's WORST_FUTURE_CAT never legitimately goes down. It goes down, or the
+    loan vanishes, when its installments were deleted between builds (§24) —
+    and that happens to exactly the loans that went NPL. So keep, per snapshot,
+    the highest label ever read for each loan, use that, and count every
+    lowered label and vanished loan so the report shows whether it happened.
+    """
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    frames, stats = [], {}
+    for snap, cur in outcomes.groupby("SNAPSHOT_DATE"):
+        snap = int(snap)
+        cur = cur.assign(LOAN_ID=cur["LOAN_ID"].astype("int64"),
+                         WORST_FUTURE_CAT=cur["WORST_FUTURE_CAT"].astype(int),
+                         LABEL_HORIZON_DATE=cur["LABEL_HORIZON_DATE"].astype(float).astype(int))
+        path = archive_dir / f"{snap}.npz"
+        st = {"n_label_lowered": 0, "n_vanished": 0, "first_read": not path.exists()}
+        if path.exists():
+            with np.load(path) as z:
+                prev = pd.DataFrame({"LOAN_ID": z["loan_id"], "PREV": z["label"],
+                                     "PREV_HORIZON": z["horizon"]})
+            m = cur.merge(prev, on="LOAN_ID", how="outer", indicator=True)
+            both = m["_merge"] == "both"
+            gone = m["_merge"] == "right_only"
+            st["n_label_lowered"] = int((both & (m["WORST_FUTURE_CAT"] < m["PREV"])).sum())
+            st["n_vanished"] = int(gone.sum())
+            m["WORST_FUTURE_CAT"] = np.fmax(m["WORST_FUTURE_CAT"], m["PREV"]).astype(int)
+            m.loc[gone, "LABEL_HORIZON_DATE"] = m.loc[gone, "PREV_HORIZON"]
+            m["SNAPSHOT_DATE"] = snap
+            cur = m[OUTCOME_COLS].astype({"LABEL_HORIZON_DATE": int})
+        np.savez(path, loan_id=cur["LOAN_ID"].to_numpy("int64"),
+                 label=cur["WORST_FUTURE_CAT"].to_numpy("int8"),
+                 horizon=cur["LABEL_HORIZON_DATE"].to_numpy("int64"))
+        if st["n_label_lowered"] or st["n_vanished"]:
+            logger.warning(f"Snapshot {snap}: {st['n_label_lowered']:,} labels lower than last read, "
+                           f"{st['n_vanished']:,} loans gone from the feed — kept the archived values.")
+        stats[snap] = st
+        frames.append(cur)
+    return pd.concat(frames, ignore_index=True), stats
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -112,47 +190,61 @@ def wilson(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 def _ranked(cohort: pd.DataFrame) -> pd.DataFrame:
-    """Ranked population in queue order, with a 1-based QUEUE_POS."""
+    """Ranked population in list order, with a 1-based QUEUE_POS."""
     r = cohort[cohort["CURRENT_CAT"] < config.CARVE_CURRENT_CAT_GE]
     r = r.iloc[_order(r["RISK_SCORE"].to_numpy(), r["LOAN_ID"].to_numpy())].copy()
     r["QUEUE_POS"] = np.arange(1, len(r) + 1)
     return r
 
 
-def _k(window: str) -> int:
-    return int(config.API_RATE_PER_HOUR * config.RANKING_REF_WINDOWS[window])
+def cutoffs(n: int) -> dict[str, int]:
+    """MONITOR_CUTOFFS resolved to row counts for a list of n loans (float = share, int = count)."""
+    return {name: min(n, math.ceil(v * n) if isinstance(v, float) else int(v))
+            for name, v in config.MONITOR_CUTOFFS.items()}
+
+
+def cutoff_label(name: str) -> str:
+    v = config.MONITOR_CUTOFFS[name]
+    return f"top {100 * v:g}%" if isinstance(v, float) else f"top {v:,}"
+
+
+def _ap(severe: pd.Series, scores: pd.Series) -> float:
+    return _average_precision(severe.to_numpy(np.int32), scores.to_numpy()) if severe.any() else float("nan")
 
 
 def matured_metrics(cohort: pd.DataFrame) -> dict:
-    y, cc = cohort["OUTCOME"].to_numpy(), cohort["CURRENT_CAT"].to_numpy()
-    out = ranking_metrics(y, cohort["RISK_SCORE"].to_numpy(), strata=cc,
-                          tie_break=cohort["LOAN_ID"].to_numpy())
     r = _ranked(cohort)
     severe = r["OUTCOME"] == SEVERE_CLASS
-    if not severe.any():
+    n_sev = int(severe.sum())
+    out = {"n_ranked": int(len(r)), "n_severe": n_sev,
+           "base_rate": float(n_sev / len(r)) if len(r) else float("nan")}
+    if not n_sev:
         return out
+    out["pr_auc"] = _ap(severe, r["RISK_SCORE"])
 
-    for w in config.RANKING_REF_WINDOWS:
-        block = out[f"at_{w}"]
-        top = r["QUEUE_POS"] <= block["k"]
-        block["recall_ci"] = wilson(int((top & severe).sum()), int(severe.sum()))
-        sev_amt = r.loc[severe, "REMAINING_AMNT"].sum()
-        block["exposure_caught"] = (float(r.loc[top & severe, "REMAINING_AMNT"].sum() / sev_amt)
-                                    if sev_amt > 0 else float("nan"))
+    sev_amt = r.loc[severe, "REMAINING_AMNT"].sum()
+    ks = cutoffs(len(r))
+    out["cutoffs"] = {}
+    for name, k in ks.items():
+        top = r["QUEUE_POS"] <= k
+        hits = int((top & severe).sum())
+        out["cutoffs"][name] = {
+            "k": k, "recall": hits / n_sev, "recall_ci": wilson(hits, n_sev),
+            "precision": hits / k, "lift": hits / k / out["base_rate"],
+            "exposure_caught": (float(r.loc[top & severe, "REMAINING_AMNT"].sum() / sev_amt)
+                                if sev_amt > 0 else float("nan")),
+        }
 
-    # Per current_cat, inside the ONE pooled queue. ranking_metrics'
-    # by_current_cat re-ranks each stratum alone with the full K, which reads
-    # 100% recall for any stratum smaller than K — not what the queue does.
-    by_cat = out.get("by_current_cat", {})
+    # Per current_cat, inside the ONE pooled list — not re-ranked per stratum.
     out["queue_by_cat"] = {}
     for cat, sub in r.groupby("CURRENT_CAT"):
         sev = sub["OUTCOME"] == SEVERE_CLASS
         row = {"n": int(len(sub)), "n_severe": int(sev.sum()), "base_rate": float(sev.mean()),
-               "pr_auc": by_cat.get(f"current_cat_{cat}", {}).get("pr_auc", float("nan"))}
-        for w in config.RANKING_REF_WINDOWS:
-            top = sub["QUEUE_POS"] <= _k(w)
-            row[f"share_of_top_{w}"] = float(top.sum() / min(_k(w), len(r)))
-            row[f"recall_{w}"] = float((top & sev).sum() / sev.sum()) if sev.any() else float("nan")
+               "pr_auc": _ap(sev, sub["RISK_SCORE"])}
+        for name, k in ks.items():
+            top = sub["QUEUE_POS"] <= k
+            row[f"share_of_{name}"] = float(top.sum() / k)
+            row[f"recall_{name}"] = float((top & sev).sum() / sev.sum()) if sev.any() else float("nan")
         out["queue_by_cat"][int(cat)] = row
 
     out["predicted_severe"] = float(r["RISK_SCORE"].sum())
@@ -164,7 +256,7 @@ def matured_metrics(cohort: pd.DataFrame) -> dict:
                              n=("OUTCOME", "size"))
     out["calibration_deciles"] = cal.reset_index(drop=True).to_dict("list")
 
-    r["GROUP"] = np.where(r["QUEUE_POS"] <= _k("1_week"), "top_1_week", "rest")
+    r["GROUP"] = np.where(r["QUEUE_POS"] <= ks[config.MONITOR_MAIN_CUTOFF], "top", "rest")
     out["migration"] = {
         g: pd.crosstab(sub["CURRENT_CAT"], sub["OUTCOME"])
              .reindex(columns=range(config.NUM_CLASSES), fill_value=0)
@@ -173,6 +265,20 @@ def matured_metrics(cohort: pd.DataFrame) -> dict:
     }
     out["capture_curve"] = capture_curve(r["OUTCOME"].to_numpy(), r["RISK_SCORE"].to_numpy(),
                                          tie_break=r["LOAN_ID"].to_numpy())
+
+    # The engine's exception rule (remain > 50M, p3 > 0.5, dpd > 120) is what
+    # actually goes to enrichment. It can only reach cat-2 loans at DPD 121-155,
+    # so its hit rate is largely mechanical accrual; the same-size column says
+    # what taking that many loans from the top of the list would have caught.
+    fl = r["FLAGGED"].to_numpy(bool)
+    n_fl = int(fl.sum())
+    out["enrichment_rule"] = {
+        "n_flagged": n_fl,
+        "n_severe_flagged": int((fl & severe).sum()),
+        "precision": float(severe[fl].mean()) if n_fl else float("nan"),
+        "recall": float((fl & severe).sum() / n_sev),
+        "recall_top_same_size": float(((r["QUEUE_POS"] <= n_fl) & severe).sum() / n_sev),
+    }
     return out
 
 
@@ -184,19 +290,21 @@ def interim_metrics(cohort: pd.DataFrame, snapshot: int, asof: int) -> dict:
     out = {"months_elapsed": round(months, 1), "n_ranked": int(len(r)),
            "deteriorated_rate": float(worse.mean()) if len(r) else float("nan"),
            "severe_so_far_rate": float(severe.mean()) if len(r) else float("nan")}
-    rest = r["QUEUE_POS"] > _k("1_week")
-    for w in config.MONITOR_HEADLINE_WINDOWS:
-        top = r["QUEUE_POS"] <= _k(w)
-        out[f"top_{w}"] = {"n": int(top.sum()),
-                           "deteriorated_rate": float(worse[top].mean()),
-                           "severe_so_far_rate": float(severe[top].mean())}
-    out["rest"] = {"n": int(rest.sum()),
-                   "deteriorated_rate": float(worse[rest].mean()) if rest.any() else float("nan"),
-                   "severe_so_far_rate": float(severe[rest].mean()) if rest.any() else float("nan")}
+
+    def rates(mask):
+        return {"n": int(mask.sum()),
+                "deteriorated_rate": float(worse[mask].mean()) if mask.any() else float("nan"),
+                "severe_so_far_rate": float(severe[mask].mean()) if mask.any() else float("nan")}
+
+    ks = cutoffs(len(r))
+    out["rest"] = rates(r["QUEUE_POS"] > ks[config.MONITOR_MAIN_CUTOFF])
     rest_rate = out["rest"]["deteriorated_rate"]
-    for w in config.MONITOR_HEADLINE_WINDOWS:
-        out[f"top_{w}"]["lift_vs_rest"] = (out[f"top_{w}"]["deteriorated_rate"] / rest_rate
-                                           if rest_rate else float("nan"))
+    out["cutoffs"] = {}
+    for name, k in ks.items():
+        g = rates(r["QUEUE_POS"] <= k)
+        g["lift_vs_rest"] = g["deteriorated_rate"] / rest_rate if rest_rate else float("nan")
+        out["cutoffs"][name] = g
+    out["enrichment_rule"] = rates(r["FLAGGED"].to_numpy(bool))
     return out
 
 
@@ -215,7 +323,6 @@ def drift(preds: pd.DataFrame) -> list[dict]:
     """Per-snapshot population and score-distribution stats, straight from the prediction table."""
     p = preds.copy()
     p["SNAPSHOT_DATE"] = p["SNAPSHOT_DATE"].astype(float).astype(int)
-    p = p.drop_duplicates(["SNAPSHOT_DATE", "LOAN_ID"])
     snaps = sorted(p["SNAPSHOT_DATE"].unique())
     ranked = p[p["CURRENT_CAT"] < config.CARVE_CURRENT_CAT_GE]
     rows = []
@@ -239,8 +346,17 @@ def drift(preds: pd.DataFrame) -> list[dict]:
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
-def compute(preds: pd.DataFrame, outcomes: pd.DataFrame, asof: int) -> dict:
+def compute(preds: pd.DataFrame, outcomes: pd.DataFrame, asof: int,
+            runs: Optional[pd.DataFrame] = None, label_stats: Optional[dict] = None) -> dict:
     df, quality = prepare(preds, outcomes, asof)
+    if label_stats is not None:
+        quality["labels"] = label_stats
+    if runs is not None:
+        quality["runs"] = [
+            {"snapshot": int(r.snapshot_date), "operation_id": str(r.operation_id),
+             "status": r.operation_status, "operation_date": str(r.operation_date),
+             "inference_failures": int(r.inference_failures), "n_usable_runs": int(r.n_usable_runs)}
+            for r in runs.itertuples()]
     matured, interim = {}, {}
     for s, cohort in df.groupby("SNAPSHOT_DATE"):
         s = int(s)
@@ -260,16 +376,18 @@ def history_frame(metrics: dict) -> pd.DataFrame:
     for s, m in sorted(metrics["matured"].items()):
         row = {"snapshot": s, "n_ranked": m["n_ranked"], "n_severe": m["n_severe"],
                "base_rate": m["base_rate"], "pr_auc": m.get("pr_auc"),
+               "cat0_pr_auc": m.get("queue_by_cat", {}).get(0, {}).get("pr_auc"),
                "predicted_severe": m.get("predicted_severe")}
-        cat0 = m.get("by_current_cat", {}).get("current_cat_0", {})
-        row["cat0_pr_auc"], row["cat0_base_rate"] = cat0.get("pr_auc"), cat0.get("base_rate")
-        for w in config.MONITOR_HEADLINE_WINDOWS:
-            b = m.get(f"at_{w}", {})
-            lo, hi = b.get("recall_ci", (None, None))
-            row.update({f"recall_{w}": b.get("recall"), f"recall_{w}_lo": lo,
-                        f"recall_{w}_hi": hi, f"precision_{w}": b.get("precision"),
-                        f"lift_{w}": b.get("lift"),
-                        f"exposure_caught_{w}": b.get("exposure_caught")})
+        for name, b in m.get("cutoffs", {}).items():
+            lo, hi = b["recall_ci"]
+            row.update({f"{name}_k": b["k"], f"{name}_recall": b["recall"],
+                        f"{name}_recall_lo": lo, f"{name}_recall_hi": hi,
+                        f"{name}_precision": b["precision"], f"{name}_lift": b["lift"],
+                        f"{name}_exposure_caught": b["exposure_caught"]})
+        rule = m.get("enrichment_rule", {})
+        row.update({"rule_n_flagged": rule.get("n_flagged"), "rule_precision": rule.get("precision"),
+                    "rule_recall": rule.get("recall"),
+                    "rule_recall_top_same_size": rule.get("recall_top_same_size")})
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -293,10 +411,11 @@ def run_monitor(asof: Optional[int] = None, output_dir: Optional[str] = None,
     if conn is None:
         from src.db.mssql_connection import MSSQLConnector
         conn = MSSQLConnector()
-    preds, outcomes = load_frames(conn)
-    metrics = compute(preds, outcomes, asof)
-
     out = Path(output_dir or config.MONITOR_OUTPUT_DIR)
+    preds, outcomes, runs = load_frames(conn)
+    outcomes, label_stats = reconcile_labels(outcomes, out / "labels")
+    metrics = compute(preds, outcomes, asof, runs, label_stats)
+
     run_dir = out / str(asof)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "metrics.json").write_text(json.dumps(metrics, default=_json_default, indent=1))

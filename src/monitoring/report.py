@@ -20,11 +20,12 @@ import numpy as np  # noqa: E402
 from matplotlib.ticker import PercentFormatter, StrMethodFormatter  # noqa: E402
 
 import project_config as config  # noqa: E402
-from src.monitoring.monitor import PSI_REF_SNAPSHOTS  # noqa: E402
+from src.monitoring.monitor import PSI_REF_SNAPSHOTS, cutoff_label  # noqa: E402
 
-BLUE, ORANGE, GRAY, INK, MUTED = "#2a78d6", "#eb6834", "#a3a29c", "#0b0b0b", "#52514e"
+BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"   # categorical slots 1-3, fixed order
+SERIES = [BLUE, ORANGE, AQUA]
+GRAY, INK, MUTED = "#a3a29c", "#0b0b0b", "#52514e"
 CAT_NAMES = ["No delay", "1–60 DPD", "61–155 DPD", "Severe 156+"]
-WINDOW_LABEL = {"1_day": "1 day", "1_week": "1 week", "1_month": "1 month"}
 
 plt.rcParams.update({
     "font.size": 10, "axes.edgecolor": GRAY, "axes.labelcolor": MUTED,
@@ -54,8 +55,13 @@ def _num(x) -> str:
     return "–" if x is None or x != x else f"{x:,.0f}"
 
 
-def _k(w) -> int:
-    return int(config.API_RATE_PER_HOUR * config.RANKING_REF_WINDOWS[w])
+def _main() -> str:
+    return config.MONITOR_MAIN_CUTOFF
+
+
+def _cap(name: str) -> str:
+    label = cutoff_label(name)
+    return label[0].upper() + label[1:]
 
 
 class _Charts:
@@ -78,7 +84,7 @@ class _Charts:
 def _trend(ch, snaps, series, title, name, ci=None):
     fig, ax = plt.subplots(figsize=(6.2, 3.0))
     x = [_d(s) for s in snaps]
-    for (label, ys), color in zip(series.items(), [BLUE, ORANGE]):
+    for (label, ys), color in zip(series.items(), SERIES):
         ax.plot(x, ys, color=color, lw=2, marker="o", ms=5, label=label)
         if ci and label in ci:
             lo, hi = ci[label]
@@ -96,14 +102,14 @@ def _trend(ch, snaps, series, title, name, ci=None):
 
 def _early_warning(ch, interim):
     snaps = sorted(interim)
-    groups = [(f"top_{w}", f"Top {WINDOW_LABEL[w]} of queue", c)
-              for w, c in zip(config.MONITOR_HEADLINE_WINDOWS, [BLUE, ORANGE])]
-    groups.append(("rest", "Rest of queue", GRAY))
+    groups = [(name, _cap(name), c) for name, c in zip(config.MONITOR_CUTOFFS, SERIES)]
+    groups.append(("rest", f"Beyond {cutoff_label(_main())}", GRAY))
     fig, ax = plt.subplots(figsize=(6.2, 3.0))
     x = np.arange(len(snaps))
     width = 0.8 / len(groups)
     for i, (key, label, color) in enumerate(groups):
-        ys = [interim[s][key]["deteriorated_rate"] for s in snaps]
+        ys = [(interim[s]["rest"] if key == "rest" else interim[s]["cutoffs"][key])
+              ["deteriorated_rate"] for s in snaps]
         ax.bar(x + (i - (len(groups) - 1) / 2) * width, ys, width * 0.92, color=color, label=label)
     ax.set_xticks(x, [f"{_d(s)}\n{interim[s]['months_elapsed']:.0f} mo" for s in snaps])
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
@@ -113,8 +119,7 @@ def _early_warning(ch, interim):
 
 
 def _migration(ch, mig):
-    groups = [("top_1_week", f"Top 1 week of queue ({_k('1_week'):,} loans)"),
-              ("rest", "Rest of queue")]
+    groups = [("top", f"{_cap(_main())} of the list"), ("rest", "Rest of the list")]
     groups = [(g, t) for g, t in groups if g in mig]
     fig, axes = plt.subplots(1, len(groups), figsize=(6.2, 2.7), squeeze=False)
     n_rank = config.CARVE_CURRENT_CAT_GE
@@ -134,7 +139,7 @@ def _migration(ch, mig):
         ax.set_title(title, loc="left", color=INK, fontsize=9)
         ax.set_xlabel("Worst reached in 6 months", fontsize=8)
     axes[0][0].set_ylabel("When scored", fontsize=8)
-    return ch.emit(fig, "migration", "Migration, top of queue vs rest")
+    return ch.emit(fig, "migration", "Migration, top of list vs rest")
 
 
 def _calibration(ch, cal):
@@ -143,9 +148,9 @@ def _calibration(ch, cal):
     ax.bar(x - 0.2, cal["mean_score"], 0.38, color=BLUE, label="Predicted P(severe)")
     ax.bar(x + 0.2, cal["severe_rate"], 0.38, color=ORANGE, label="Actual severe rate")
     ax.set_xticks(x, [f"D{i}" for i in x])
-    ax.set_xlabel("Queue decile (D1 = riskiest)")
+    ax.set_xlabel("List decile (D1 = riskiest)")
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    ax.set_title("Predicted vs actual, by queue decile", loc="left", color=INK, fontsize=11)
+    ax.set_title("Predicted vs actual, by list decile", loc="left", color=INK, fontsize=11)
     _legend_top(ax, 2)
     return ch.emit(fig, "calibration", "Calibration by decile")
 
@@ -155,7 +160,7 @@ def _pred_vs_actual(ch, matured):
     fig, ax = plt.subplots(figsize=(6.2, 2.8))
     x = np.arange(len(snaps))
     ax.bar(x - 0.2, [matured[s].get("predicted_severe", np.nan) for s in snaps], 0.38,
-           color=BLUE, label="Predicted (Σ RISK_SCORE)")
+           color=BLUE, label="Predicted (Σ p3)")
     ax.bar(x + 0.2, [matured[s]["n_severe"] for s in snaps], 0.38, color=ORANGE, label="Actual")
     ax.set_xticks(x, [_d(s) for s in snaps], rotation=30, ha="right")
     ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
@@ -164,18 +169,22 @@ def _pred_vs_actual(ch, matured):
     return ch.emit(fig, "predicted_vs_actual", "Predicted vs actual severe counts")
 
 
-def _capture(ch, cc):
+def _capture(ch, cc, cuts, n_ranked):
     fig, ax = plt.subplots(figsize=(6.2, 2.8))
-    ax.plot(cc["hours"], cc["recall"], color=BLUE, lw=2)
-    ax.set_xscale("log")
-    ax.set_xlim(left=1)
-    for w in config.MONITOR_HEADLINE_WINDOWS:
-        h = config.RANKING_REF_WINDOWS[w]
-        ax.axvline(h, color=GRAY, lw=1, ls="--")
-        ax.text(h, 0.02, f" {WINDOW_LABEL[w]}", color=MUTED, fontsize=8)
+    ax.plot(cc["frac_called"], cc["recall"], color=BLUE, lw=2)
+    ax.plot([0, 1], [0, 1], color=GRAY, lw=1, ls=":")
+    ax.text(0.55, 0.49, "random order", color=MUTED, fontsize=8, rotation=16)
+    lines = []
+    for name, b in sorted(cuts.items(), key=lambda kv: kv[1]["k"]):
+        ax.plot(b["k"] / n_ranked, b["recall"], "o", ms=7, color=BLUE, mec="white", mew=2)
+        lines.append(f"{_cap(name)} ({_pct(b['k'] / n_ranked, 1)} of list): {_pct(b['recall'])} caught")
+    ax.text(0.98, 0.06, "\n".join(lines), transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=8, color=INK, linespacing=1.6)
+    ax.xaxis.set_major_formatter(PercentFormatter(1.0))
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    ax.set_xlabel(f"Hours of calling at {config.API_RATE_PER_HOUR}/h")
-    ax.set_title("Share of severe loans caught vs calling time", loc="left", color=INK, fontsize=11)
+    ax.set_xlabel("Share of the list, riskiest first")
+    ax.set_title("Share of severe loans caught vs how far down the list", loc="left", color=INK,
+                 fontsize=11)
     return ch.emit(fig, "capture_curve", "Capture curve")
 
 
@@ -207,56 +216,57 @@ def _table(headers, rows) -> str:
 def _management(ch, m) -> str:
     matured, interim = m["matured"], m["interim"]
     parts = []
-    scored = {s: v for s, v in matured.items() if "at_1_week" in v}
+    scored = {s: v for s, v in matured.items() if "cutoffs" in v}
+    main = _main()
     if scored:
         s = max(scored)
         c = scored[s]
         tiles = []
-        for w in config.MONITOR_HEADLINE_WINDOWS:
-            b = c[f"at_{w}"]
+        for name, b in c["cutoffs"].items():
             lo, hi = b["recall_ci"]
-            tiles.append(_tile(_pct(b["recall"]), f"of severe loans in the first {WINDOW_LABEL[w]}",
-                               f"{b['k']:,} calls · 95% CI {_pct(lo)}–{_pct(hi)}"))
-        wk = c["at_1_week"]
-        tiles.append(_tile(f"{wk['lift']:.1f}×", "better than random (1 week)",
-                           f"hit rate {_pct(wk['precision'])} vs {_pct(c['base_rate'], 1)}"))
-        tiles.append(_tile(_pct(wk.get("exposure_caught")), "of severe exposure caught (1 week)",
-                           "by remaining amount"))
+            tiles.append(_tile(_pct(b["recall"]), f"of severe loans were in the {cutoff_label(name)}",
+                               f"{b['k']:,} loans · hit rate {_pct(b['precision'])} · "
+                               f"95% CI {_pct(lo, 1)}–{_pct(hi, 1)}"))
+        mb = c["cutoffs"][main]
+        tiles.append(_tile(f"{mb['lift']:.1f}×", f"better than random ({cutoff_label(main)})",
+                           f"hit rate {_pct(mb['precision'])} vs {_pct(c['base_rate'], 1)}"))
+        tiles.append(_tile(_pct(mb["exposure_caught"]),
+                           f"of severe exposure in the {cutoff_label(main)}", "by remaining amount"))
         tiles.append(_tile(_pct(c["base_rate"], 1), "went severe overall",
                            f"{c['n_severe']:,} of {c['n_ranked']:,} loans"))
         parts.append(
             f"<h2>How the {_d(s)} predictions turned out</h2>"
             f'<p class="lead">Of the <b>{c["n_severe"]:,}</b> loans that went severe within six '
-            f"months, <b>{_pct(wk['recall'])}</b> were in the first week of the queue — "
-            f"<b>{wk['lift']:.1f}×</b> better than calling at random.</p>"
+            f"months, <b>{_pct(mb['recall'])}</b> were in the {cutoff_label(main)} of the list "
+            f"({mb['k']:,} loans) — <b>{mb['lift']:.1f}×</b> the hit rate of a random pick.</p>"
             f'<div class="tiles">{"".join(tiles)}</div>')
         snaps = sorted(scored)
         if len(snaps) > 1:
-            series = {f"First {WINDOW_LABEL[w]}": [scored[x][f"at_{w}"]["recall"] for x in snaps]
-                      for w in config.MONITOR_HEADLINE_WINDOWS}
-            ci = {f"First {WINDOW_LABEL[w]}": ([scored[x][f"at_{w}"]["recall_ci"][0] for x in snaps],
-                                                [scored[x][f"at_{w}"]["recall_ci"][1] for x in snaps])
-                  for w in config.MONITOR_HEADLINE_WINDOWS}
+            series = {_cap(n): [scored[x]["cutoffs"][n]["recall"] for x in snaps]
+                      for n in config.MONITOR_CUTOFFS}
+            ci = {_cap(n): ([scored[x]["cutoffs"][n]["recall_ci"][0] for x in snaps],
+                            [scored[x]["cutoffs"][n]["recall_ci"][1] for x in snaps])
+                  for n in config.MONITOR_CUTOFFS}
             parts.append('<div class="row">'
-                         + _trend(ch, snaps, series, "Severe loans caught, by snapshot", "trend_recall", ci)
+                         + _trend(ch, snaps, series, "Share of severe loans caught, by snapshot",
+                                  "trend_recall", ci)
                          + _trend(ch, snaps, {"Severe rate": [scored[x]["base_rate"] for x in snaps]},
                                   "Share of loans that went severe", "trend_base_rate")
                          + "</div>"
                          '<p class="note">Shaded band: 95% interval. Movement inside it is noise. '
-                         "Read recall next to the severe rate — a month with more severe loans is "
-                         "harder to cover with the same number of calls.</p>")
+                         "Read the fixed-count line next to the severe rate: when more loans go "
+                         "severe, the same number of loans can hold a smaller share of them.</p>")
     else:
         parts.append('<div class="empty">No snapshot with predictions has reached its 6-month '
                      "outcome date yet.</div>")
 
     if interim:
         latest = interim[max(interim)]
-        w0 = config.MONITOR_HEADLINE_WINDOWS[-1]
-        lift = latest[f"top_{w0}"]["lift_vs_rest"]
+        lift = latest["cutoffs"][main]["lift_vs_rest"]
         parts.append(
             "<h2>Early warning — recent predictions, outcome still open</h2>"
-            f'<p class="lead">Loans in the first {WINDOW_LABEL[w0]} of the {_d(max(interim))} queue '
-            f"have already worsened at <b>{lift:.1f}×</b> the rate of the rest of the queue.</p>"
+            f'<p class="lead">Loans in the {cutoff_label(main)} of the {_d(max(interim))} list '
+            f"have already worsened at <b>{lift:.1f}×</b> the rate of the rest of the list.</p>"
             + _early_warning(ch, interim)
             + '<p class="note">"Worse" = a higher delinquency category than when scored. Partial '
             "window: these rates only rise until the 6 months are up.</p>")
@@ -266,11 +276,24 @@ def _management(ch, m) -> str:
         parts.append(f"<h2>Where loans went — {_d(s)}</h2>" + _migration(ch, scored[s]["migration"])
                      + '<p class="note">Each row: loans in that category when scored; cells: '
                      "the worst category they reached within 6 months.</p>")
+        rule = scored[s].get("enrichment_rule", {})
+        if rule.get("n_flagged"):
+            parts.append(
+                f"<h2>The enrichment rule — {_d(s)}</h2>"
+                f'<p class="lead">The engine sent <b>{rule["n_flagged"]:,}</b> loans to enrichment; '
+                f"<b>{_pct(rule['precision'])}</b> of them went severe, covering "
+                f"<b>{_pct(rule['recall'], 1)}</b> of all severe loans. Taking the same number of "
+                f"loans from the top of the list would have covered "
+                f"<b>{_pct(rule['recall_top_same_size'], 1)}</b>.</p>"
+                '<p class="note">The rule (remaining &gt; 50M, p3 &gt; 0.5, DPD &gt; 120) can only '
+                "reach loans already 121–155 days past due, so its hit rate is mostly loans "
+                "crossing into the severe band on schedule — high precision, little early warning."
+                "</p>")
     return "".join(parts)
 
 
 def _analyst(ch, m) -> str:
-    matured = {s: v for s, v in m["matured"].items() if "at_1_week" in v}
+    matured = {s: v for s, v in m["matured"].items() if "cutoffs" in v}
     parts = []
     if matured:
         snaps = sorted(matured)
@@ -280,28 +303,28 @@ def _analyst(ch, m) -> str:
             parts.append(_trend(ch, snaps, {
                 "All ranked": [matured[x].get("pr_auc") for x in snaps],
                 "No delay when scored (cat 0)": [
-                    matured[x].get("by_current_cat", {}).get("current_cat_0", {}).get("pr_auc", np.nan)
+                    matured[x]["queue_by_cat"].get(0, {}).get("pr_auc", np.nan)
                     for x in snaps]}, "PR-AUC by snapshot", "trend_pr_auc"))
         rows = []
         for cat, sub in sorted(c.get("queue_by_cat", {}).items()):
             cells = [CAT_NAMES[cat], _num(sub["n"]), _num(sub["n_severe"]),
                      _pct(sub["base_rate"], 1), f"{sub['pr_auc']:.3f}"]
-            for w in config.MONITOR_HEADLINE_WINDOWS:
-                cells += [_pct(sub[f"share_of_top_{w}"]), _pct(sub[f"recall_{w}"])]
+            for name in config.MONITOR_CUTOFFS:
+                cells += [_pct(sub[f"share_of_{name}"]), _pct(sub[f"recall_{name}"])]
             rows.append(cells)
         heads = ["When scored", "Loans", "Severe", "Severe rate", "PR-AUC within"]
-        for w in config.MONITOR_HEADLINE_WINDOWS:
-            heads += [f"Share of {WINDOW_LABEL[w]} calls", f"Severe caught, {WINDOW_LABEL[w]}"]
+        for name in config.MONITOR_CUTOFFS:
+            heads += [f"Share of {cutoff_label(name)}", f"Severe caught, {cutoff_label(name)}"]
         parts.append(f"<h3>By current category — {_d(s)}</h3>" + _table(heads, rows)
                      + '<p class="note">Judge the model on cat 0: for already-delinquent loans the '
                      "outcome is largely mechanical DPD accrual. Share/caught columns are within the "
-                     "one pooled queue.</p>")
+                     "one pooled list, not re-ranked per category.</p>")
         parts.append('<div class="row">' + _calibration(ch, c["calibration_deciles"])
                      + _pred_vs_actual(ch, matured) + "</div>"
                      + '<p class="note">Predicted counts run below actual: training snapshots are '
                      "depleted of severe loans by upstream deletion (AGENT_HANDOFF §24). The ranking "
                      "survives it; the probability level does not.</p>")
-        parts.append(_capture(ch, c["capture_curve"]))
+        parts.append(_capture(ch, c["capture_curve"], c["cutoffs"], c["n_ranked"]))
 
     drift = m["drift"]
     if drift:
@@ -316,14 +339,45 @@ def _analyst(ch, m) -> str:
             ["Snapshot", "Rows", "Ranked", *[f"cat {k}" for k in range(config.NUM_CLASSES)],
              "Mean score", "p99 score", "PSI"], rows))
 
+    rule_rows = [[_d(x), _num(v["enrichment_rule"]["n_flagged"]),
+                  _pct(v["enrichment_rule"]["precision"]), _pct(v["enrichment_rule"]["recall"], 1),
+                  _pct(v["enrichment_rule"]["recall_top_same_size"], 1)]
+                 for x, v in sorted(matured.items()) if "enrichment_rule" in v]
+    rule_rows += [[f"{_d(x)} ({v['months_elapsed']:.0f} mo, open)", _num(v["enrichment_rule"]["n"]),
+                   _pct(v["enrichment_rule"]["severe_so_far_rate"]), "–", "–"]
+                  for x, v in sorted(m["interim"].items()) if "enrichment_rule" in v]
+    if rule_rows:
+        parts.append("<h3>Enrichment rule by snapshot</h3>" + _table(
+            ["Snapshot", "Sent to enrichment", "Went severe", "Share of severe covered",
+             "Top of list, same size"], rule_rows))
+
     q = m["quality"]
     unmatched = ", ".join(f"{_d(s)}: {n:,}" for s, n in q["unmatched_by_snapshot"].items()) or "none"
     parts.append("<h3>Data quality</h3><ul>"
-                 f"<li>{q['n_prediction_rows']:,} prediction rows read; "
-                 f"{q['n_duplicates_dropped']:,} duplicates dropped ({q['dedup_rule']}); "
-                 f"{q['n_duplicate_keys_with_different_scores']:,} with conflicting scores.</li>"
-                 f"<li>Predicted loans missing from {html.escape(config.TRAIN_TABLE)}: {unmatched}.</li>"
+                 f"<li>{q['n_prediction_rows']:,} scored rows read.</li>"
+                 f"<li>Scored loans missing from {html.escape(config.TRAIN_TABLE)}: {unmatched}.</li>"
                  "</ul>")
+    labels = q.get("labels", {})
+    hit = {s: v for s, v in labels.items() if v["n_label_lowered"] or v["n_vanished"]}
+    if hit:
+        parts.append("<h3>Outcome labels changed upstream</h3>" + _table(
+            ["Snapshot", "Labels lower than last read", "Loans gone from the feed"],
+            [[_d(s), _num(v["n_label_lowered"]), _num(v["n_vanished"])]
+             for s, v in sorted(hit.items())])
+            + '<p class="note">A rebuilt snapshot has seen more installments, so a label can only '
+            "rise. A drop or a vanished loan means installment records were deleted upstream; "
+            "the report keeps the highest label it has read for each loan.</p>")
+    elif labels:
+        parts.append('<p class="note">No outcome label went down and no scored loan left the feed '
+                     "since the last run.</p>")
+    if q.get("runs"):
+        parts.append(_table(
+            ["Snapshot", "Engine run used", "Status", "Run date", "Failed loans", "Usable runs"],
+            [[_d(r["snapshot"]), html.escape(r["operation_id"][:8]), r["status"],
+              html.escape(r["operation_date"][:16]), _num(r["inference_failures"]),
+              r["n_usable_runs"]] for r in q["runs"]])
+            + '<p class="note">The newest SUCCESS/PARTIAL_SUCCESS run per snapshot is used. '
+            "A PARTIAL_SUCCESS run is missing the loans in its failed chunks.</p>")
     return "".join(parts)
 
 
@@ -357,8 +411,8 @@ def build_report(metrics: dict, run_dir: Path) -> Path:
     body = (
         f'<section class="page"><header><h1>Loan early-warning — monthly monitor</h1>'
         f'<div class="meta">As of {asof} · {len(metrics["matured"])} snapshots with final '
-        f'outcomes · {len(metrics["interim"])} still open · API budget '
-        f"{config.API_RATE_PER_HOUR}/hour</div></header>{_management(ch, metrics)}</section>"
+        f'outcomes · {len(metrics["interim"])} still open · list ordered by p3, riskiest first'
+        f"</div></header>{_management(ch, metrics)}</section>"
         f'<section><h2>Model detail</h2>{_analyst(ch, metrics)}'
         f'<p class="meta">Generated {metrics["generated_at"]}.</p></section>'
     )

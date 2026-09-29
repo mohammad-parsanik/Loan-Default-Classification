@@ -1429,34 +1429,78 @@ the `clip: false` columns with the same measurements.
 
 ---
 
-## 26. Monthly Monitoring Report (September 28, 2026)
+## 26. Monthly Monitoring Report (September 28–29, 2026)
 
-`python run.py monitor` (`src/monitoring/`) grades the predictions the inference
-engine actually made. It reads `PRED_ARCHIVE_TABLE`, joins it to `TRAIN_TABLE` on
-(`SNAPSHOT_DATE`, `LOAN_ID`), and writes one self-contained HTML report per run.
-The training server is offline, so charts are embedded PNGs, also saved individually
-for slides.
+`python run.py monitor` (`src/monitoring/`) grades the predictions the **inference
+engine** (`EDP-inference-engine` repo) actually made. It writes one self-contained HTML
+report per run. The training server is offline, so charts are embedded PNGs, and each
+chart is also saved individually for slides.
 
-- **Every cohort is recomputed from the DB on each run.** A rewritten snapshot carries
-  the more complete label, so there is no frozen per-cohort state.
-- **Matured cohort** (`LABEL_HORIZON_DATE <= asof`): the queue's recall, precision and
-  lift at 1 day and 1 week, with Wilson 95% intervals; PR-AUC; the share of severe
-  exposure (`REMAINING_AMNT`) caught; predicted vs actual severe counts; calibration by
-  queue decile; a migration matrix (top 1 week vs rest); and a per-`current_cat`
-  breakdown **inside the pooled queue**. `ranking_metrics`' own `by_current_cat` block
-  re-ranks each stratum alone with the full K, so it reads 100% recall for any stratum
-  smaller than K. Do not put it in front of anyone.
-- **Interim cohort:** `WORST_FUTURE_CAT` on an immature row is the worst category
-  reached so far (contract §2). It is reported only as "flagged loans worsened at N×
-  the rate of the rest" and never mixed into matured metrics. It rests on the ETL
-  refreshing that partial label in its monthly recompute of the newest 7 snapshots,
-  which has not been confirmed with the ETL owner.
-- **Drift:** population size, `current_cat` mix, score quantiles, and score PSI against
-  the previous 6 snapshots, all computed from the prediction table alone. Feature-level
-  PSI is not built.
+**Where the predictions come from** (engine `db/schema.sql`):
+- `OperationLog` maps each run's `operation_id` to its `snapshot_date`. A snapshot can hold
+  several runs (`--force`), so the newest `SUCCESS`/`PARTIAL_SUCCESS` run counts. This is the
+  same rule as the engine's `db/analysis/01_backtest_base.sql`. A `PARTIAL_SUCCESS` run is
+  missing the loans in its failed chunks, and the report's run table shows that.
+- `InferenceOutput` holds `p0..p3`, `dpd_cat` (raw 0–4), `dpd` and `remain_of_account` per
+  loan. The engine scores `LOAN_CATEGORY` 0–2 only, which is exactly the ranked population.
+  It does **not** rank: the package's queue columns are deliberately not persisted. So
+  "the list" in the report is the scored loans ordered by `p3`, with `LOAN_ID` as the
+  tie-break.
+- `ContractTracking.operation_status_enrichment` other than `NOT_APPLICABLE` marks the
+  loans the engine's exception rule (remaining > 50M, p3 > 0.5, DPD > 120) sent to
+  enrichment. That rule is what actually reaches the enrichment API today. The report
+  grades it next to the same number of loans taken from the top of the list. The rule can only reach cat-2
+  loans at DPD 121–155, so expect high precision and very low coverage of severe loans.
+
+**Where the outcomes come from:** `WORST_FUTURE_CAT` on the scored snapshot's own feed
+row, joined on (`SNAPSHOT_DATE`, `LOAN_ID`). The ETL rebuilds the newest 7 snapshots on
+every monthly load. Each rebuild of a snapshot replaces the previous one under the same
+date, and its label has seen one more month of installments, so on an immature row it is
+the worst category reached so far. The user confirmed this on 2026-09-29. The engine's
+`db/analysis/README.md` §2 says the opposite ("frozen with a forward window of zero") and
+is stale on this point. Features are not an issue: the engine's `InferenceOutput` stores
+the as-of-scoring state (`dpd_cat`, `remain_of_account`), so a rebuild can only move the
+label.
+
+**The label archive (`monitoring/labels/`)** guards against the one way a rebuild makes
+the label *worse*: installment records deleted between builds. That is §24's mechanism,
+and it hits exactly the loans that went NPL. Within one snapshot the label can only rise,
+because each rebuild sees more installments. So a label that drops, or a scored loan that
+disappears from the feed, is a deletion (or an upstream correction). `reconcile_labels`
+keeps the highest label ever read per (snapshot, loan), uses that value, and reports every
+drop and every disappearance. Three consequences:
+- **The monitor has to run every month.** It can only protect a label it has read, so a
+  skipped month is a rebuild it never saw.
+- **It protects matured snapshots too.** Those are no longer rebuilt monthly, but a full
+  backfill like the ≤7B one (§21) rebuilds them from a depleted source. That was the
+  §24 damage.
+- **The cost:** a label legitimately corrected downward upstream stays at its old value.
+  The report counts every drop, so this stays visible.
+
+**No API budget in the monitor.** The list is cut at `MONITOR_CUTOFFS`: shares of the list
+(top 1%, top 5%) and fixed counts (top 1,000). `MONITOR_MAIN_CUTOFF` (top 5%) drives the lead
+sentence, the migration matrix and the "rest of the list" comparisons.
+`RANKING_REF_WINDOWS` / `API_RATE_PER_HOUR` still drive the training-side `ranking` block
+in `metrics.json`. The monitor no longer reads them.
+
+- **Matured cohort** (`LABEL_HORIZON_DATE <= asof`):
+  - recall (with Wilson 95% intervals), hit rate and lift at each cutoff;
+  - PR-AUC;
+  - the share of severe exposure caught at each cutoff;
+  - predicted (Σ p3) vs actual severe counts;
+  - calibration by queue decile;
+  - a migration matrix (main cutoff vs rest);
+  - the enrichment rule's results;
+  - a per-`current_cat` breakdown **inside the pooled list**. Do not re-rank each stratum
+    alone: `ranking_metrics`' own `by_current_cat` does that, and it reads 100% recall for
+    any stratum smaller than K.
+- **Interim cohort:** reported only as "flagged loans worsened at N× the rate of the
+  rest", and never mixed into matured metrics.
+- **Drift:** population size, category mix, and p3 quantiles and PSI against the
+  previous 6 snapshots, all computed from the engine's output alone. Feature-level PSI is
+  not built.
 - **The queue is not acted on yet.** Once it is, a loan that was called and then did not
-  go severe will count against the model. The report then needs the call log to split
-  called from not called.
+  go severe counts against the model. The report then needs the call log to split called
+  from not called.
 - **Predicted severe counts will sit below actual** (§24). The report says so next to the
   chart.
-
