@@ -25,7 +25,9 @@ from src.data.column_contract import (CACHE_FINGERPRINT, CONTRACT_VERSION,
                                       FEATURE_ORDER, feature_ordinal)
 from src.data.feed_checks import assert_feed_invariants, label_horizons
 from src.data import temporal_split
-from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
+from src.data.temporal_split import (
+    filter_mature_snapshots, register_label_horizons, register_label_ledger,
+)
 
 try:
     from src.db.mssql_connection import MSSQLConnector
@@ -102,14 +104,12 @@ def _cache_dir(stage: str, key: str) -> Path:
     Directory holding one NPZ per snapshot for a given (stage, schema key).
 
     Snapshots are cached individually because that is how the upstream ETL
-    treats them. Each monthly load recomputes the last 7 snapshots: the newest
-    (T) is fresh, the oldest of the seven (T-7) has just matured, and the ones
-    between are rewritten without changing anything the ML side reads. A
-    matured snapshot is never touched again, so its NPZ is permanent; an
-    immature one is provisional and gets rewritten until it matures. One
-    monolithic cache file cannot express either half — a single new snapshot
-    forced a full rebuild of all ~40M rows, and a rewritten immature snapshot
-    was invisible.
+    treats them: each is built once, and its label is written once, when the
+    ETL finalises it in EDP_LABEL_FINALIZATION. A train NPZ is only ever
+    written for a finalised snapshot, so it is permanent; a pred NPZ holds
+    features only, and is reused while the snapshot's own ETL run is
+    unchanged. One monolithic cache file forced a full rebuild of all ~40M rows
+    for a single new snapshot.
     """
     return config.DATA_DIR / "snapshots" / f"{stage}_{key}"
 
@@ -280,6 +280,22 @@ class DataLoader:
 
         feature_cols = self.project_features(df, feature_order)
 
+        # A finalised snapshot can still hold NULL labels: loans with no
+        # installment rows in any of their seven state months (hard-deleted
+        # upstream; the ledger's LOANS_UNLABELLED). Drop, never impute — and
+        # before the int() casts below, which a NaN would crash.
+        if config.TARGET_COL in df.columns:
+            unlabelled = df[config.TARGET_COL].isna()
+            if unlabelled.any():
+                logger.info(
+                    f"Dropping {int(unlabelled.sum()):,} row(s) with a NULL "
+                    f"{config.TARGET_COL} (loans the ETL could not label)."
+                )
+                df = df.loc[~unlabelled].reset_index(drop=True)
+            if df.empty:
+                logger.warning(f"Every row had a NULL {config.TARGET_COL} — no instances.")
+                return [], feature_cols
+
         # Canonical row order, established once and inherited by everything
         # downstream. Primary by group keys, then *current* DPD descending so
         # truncation keeps the currently-worst loans. Must NOT use a label
@@ -427,6 +443,15 @@ class DataLoader:
           feature_cols  : serialised as JSON in separate manifest
         """
         logger.info(f"Saving portfolio cache to {cache_path}…")
+        meta = meta or {}
+        snap = meta.get("snapshot")
+        if meta.get("mature"):
+            # A mature NPZ is permanent, so an unlabelled one would be served
+            # forever. Raise, not assert: this must survive `python -O`.
+            if snap not in temporal_split.LABEL_LEDGER:
+                raise RuntimeError(f"Refusing to cache {snap} as mature: not in the label ledger.")
+            if any(inst["label"] < 0 for inst in instances):
+                raise RuntimeError(f"Refusing to cache {snap} as mature: it holds unlabelled rows.")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Fill a preallocated block rather than np.vstack-ing the per-instance
@@ -478,12 +503,17 @@ class DataLoader:
              # Recorded, not keyed: _cache_key hashes CACHE_FINGERPRINT now, so
              # this is here to say which contract built the file, nothing more.
              "contract_version": CONTRACT_VERSION,
-             # snapshot -> LABEL_HORIZON_DATE, so a cache-only run (no DB on
-             # this machine) can still tell a matured snapshot from an
-             # immature one without re-deriving it from the wall clock.
+             # snapshot -> LABEL_HORIZON_DATE, for display; maturity is the
+             # ledger row below.
              "label_horizons": {str(k): int(v)
                                 for k, v in temporal_split.LABEL_HORIZONS.items()},
-             **(meta or {})},
+             # This snapshot's EDP_LABEL_FINALIZATION row — its label VINTAGE
+             # ('FINAL' or 'LEGACY', which mean different things for the
+             # current_cat_0 slice) — and what makes it mature in a cache-only
+             # run. Empty for an open (pred) snapshot.
+             "label_ledger": ({str(snap): temporal_split.LABEL_LEDGER[snap]}
+                              if snap in temporal_split.LABEL_LEDGER else {}),
+             **meta},
         )
         logger.info(f"Cache saved ({cache_path.stat().st_size / 1e6:.1f} MB).")
 
@@ -514,6 +544,7 @@ class DataLoader:
             manifest = json.load(f)
         feature_cols = manifest["feature_cols"]
         register_label_horizons(manifest.get("label_horizons", {}))
+        register_label_ledger(manifest.get("label_ledger", {}))
 
         instances = [
             {
@@ -622,15 +653,15 @@ class DataLoader:
     def _training_snapshots(self, conn, cache_dir: Path, key: str,
                             requested: Optional[list] = None) -> list:
         """
-        The snapshots to train on, ascending: `requested` if the caller named
-        them, else every mature snapshot in the table. With no DB reachable
-        (a dev machine with a copied cache directory) it is whatever the cache
-        holds.
+        The snapshots to train on, ascending: every finalised snapshot in the
+        table, narrowed to `requested` if the caller named some. With no DB
+        reachable (a dev machine with a copied cache directory) it is whatever
+        the cache holds — a train NPZ is only ever written for a finalised
+        snapshot.
         """
-        if requested:
-            return sorted(int(s) for s in requested)
-
         if conn is None:
+            if requested:
+                return sorted(int(s) for s in requested)
             snaps = _cached_snapshots(cache_dir, key)
             if not snaps:
                 raise RuntimeError(
@@ -640,13 +671,16 @@ class DataLoader:
             return snaps
 
         self._warn_on_failed_etl_runs(conn)
-        # Before anything else, so LABEL_HORIZONS knows about every snapshot in
-        # the table — including the immature ones we are about to skip.
+        # Before anything else: maturity IS ledger membership.
         self._register_horizons_from_db(conn)
-        snaps = filter_mature_snapshots(conn.get_available_snapshots())
+        self._register_ledger_from_db(conn)
+        snaps = filter_mature_snapshots(
+            [int(s) for s in requested] if requested else conn.get_available_snapshots()
+        )
         if not snaps:
             raise RuntimeError(
-                f"No mature snapshots in {config.TRAIN_TABLE} — nothing to train on."
+                f"No finalised snapshots in {config.TRAIN_TABLE} (label ledger "
+                f"{config.LABEL_LEDGER_TABLE}) — nothing to train on."
             )
         logger.info(f"{len(snaps)} mature snapshot(s): {snaps[0]} … {snaps[-1]}")
         return snaps
@@ -666,13 +700,13 @@ class DataLoader:
         model older than the current contract keeps being fed exactly the
         columns it was fitted on. Defaults to the contract's order.
 
-        Scoring targets immature snapshots, and the ETL rewrites the newest 7
-        of those on every monthly load — so unlike a mature snapshot's cache,
-        this one is PROVISIONAL. It is reused only while the ETL run that
-        produced it is still the newest successful one; after the next load it
-        is rewritten. If the job ledger cannot be read the run tag is unknown,
-        and an immature snapshot is then re-read from the DB every time rather
-        than risk serving last month's rows.
+        A published snapshot's features never change — the ETL builds each
+        snapshot once — and its labels change only at finalisation, which this
+        path drops anyway. The cache is therefore reused while the snapshot's
+        OWN etl_job_control row is unchanged (its end_time): the only thing
+        that can alter a published snapshot is a deliberate rebuild, which
+        writes a new row. If that row cannot be read the snapshot is re-read
+        from the DB rather than trusted.
         """
         extra = f"pred_{max_loans or 'auto'}"
         key   = _cache_key(extra, grain, feature_order)
@@ -681,28 +715,26 @@ class DataLoader:
 
         conn, close_conn = self._get_conn()
         try:
-            if use_cache and _cache_is_valid(npz, key) and self._pred_cache_is_fresh(npz, conn):
+            # The feed check needs every snapshot's ledger row to tell an
+            # open snapshot (all labels NULL) from a finalised one.
+            self._register_ledger_from_db(conn)
+            built = self._build_time(conn, snapshot_date)
+            if use_cache and _cache_is_valid(npz, key) and self._pred_cache_is_fresh(npz, built):
                 return self._load_cache(npz)
 
             df = conn.load_prediction_data(snapshot_date=snapshot_date)
-            # TRAIN_TABLE carries WORST_FUTURE_CAT/DPD for every row, but on
-            # an immature snapshot those values are degenerate ("worst
-            # category observed so far", not the true future outcome) —
-            # never real labels. Drop them so process_raw_data's normal
-            # "column absent -> label = -1" path applies here too.
+            # Scoring never uses labels: NULL on an open snapshot, and on a
+            # finalised one they are the outcome, not an input. Drop them so
+            # process_raw_data's "column absent -> label = -1" path applies.
             df = self._ingest_checks(df)
             df = df.drop(columns=[config.TARGET_COL, "WORST_FUTURE_DPD"], errors="ignore")
             instances, feature_cols = self.process_raw_data(
                 df, max_loans, grain, feature_order=feature_order or FEATURE_ORDER
             )
             if use_cache and instances:
-                mature = int(snapshot_date) in set(
-                    filter_mature_snapshots([int(snapshot_date)])
-                )
                 self._save_cache(
                     npz, instances, feature_cols, max_loans or 99, key,
-                    meta={"snapshot": int(snapshot_date), "mature": mature,
-                          "etl_run": self._etl_run_tag(conn)},
+                    meta={"snapshot": int(snapshot_date), "etl_end_time": built},
                 )
             return instances, feature_cols
         finally:
@@ -710,35 +742,26 @@ class DataLoader:
                 conn.close()
 
     @staticmethod
-    def _etl_run_tag(conn) -> Optional[str]:
-        """
-        The newest SUCCESSful upstream load, identifying the current ETL cycle;
-        None when the ledger is unreadable (no grant, table absent).
-        """
+    def _build_time(conn, snapshot_date) -> Optional[str]:
+        """The snapshot's own ETL end_time; None when the job ledger is unreadable."""
         try:
-            runs = conn.get_etl_runs()
-        except Exception:
+            return conn.get_snapshot_build_time(int(snapshot_date))
+        except Exception as e:
+            logger.info(f"ETL job ledger not read ({e}) — pred cache not trusted.")
             return None
-        ok = runs[runs["status"].astype(str).str.upper() == "SUCCESS"]
-        return None if ok.empty else str(ok.iloc[0]["snapshot_date"])
 
-    @classmethod
-    def _pred_cache_is_fresh(cls, npz: Path, conn) -> bool:
-        """A mature snapshot's cache is final; an immature one is only good for
-        the ETL cycle that built it."""
+    @staticmethod
+    def _pred_cache_is_fresh(npz: Path, built: Optional[str]) -> bool:
+        """Reusable iff the snapshot is still the one the cached rows came from."""
         try:
             with open(_manifest_path(npz)) as f:
-                manifest = json.load(f)
+                cached = json.load(f).get("etl_end_time")
         except Exception:
             return False
-        if manifest.get("mature"):
-            return True
-        built = manifest.get("etl_run")
-        current = cls._etl_run_tag(conn)
-        if built is None or current is None or built != current:
+        if built is None or cached != built:
             logger.info(
-                f"{npz.name}: immature snapshot cached under ETL run {built!r}, "
-                f"current is {current!r} — re-reading from the DB."
+                f"{npz.name}: cached from the ETL run ending {cached!r}, current "
+                f"is {built!r} — re-reading from the DB."
             )
             return False
         return True
@@ -750,16 +773,16 @@ class DataLoader:
           - `requested` given: keep only dates present in TRAIN_TABLE (warn on
             misses). If any survive, return them.
           - Otherwise (nothing requested, or none of it found): auto-select
-            every currently-immature snapshot (labels not yet matured).
+            every open snapshot (no row in the label ledger yet).
           - If that's empty too: fall back to the single latest snapshot.
         """
         conn, close_conn = self._get_conn()
         try:
             self._warn_on_failed_etl_runs(conn)
             available = conn.get_available_snapshots()
-            # Maturity comes from the feed's own horizon column, not the
-            # calendar — read it before deciding what is still immature.
+            # Open = not in the label ledger. Read it before deciding.
             self._register_horizons_from_db(conn)
+            self._register_ledger_from_db(conn)
         finally:
             if close_conn:
                 conn.close()
@@ -797,19 +820,37 @@ class DataLoader:
         must not pass unremarked either.
         """
         register_label_horizons(label_horizons(df))
-        assert_feed_invariants(df)
+        assert_feed_invariants(df, ledger=temporal_split.LABEL_LEDGER)
         return df
 
     @staticmethod
     def _register_horizons_from_db(conn) -> None:
-        """Populate the snapshot -> LABEL_HORIZON_DATE map from the table."""
+        """Populate the snapshot -> LABEL_HORIZON_DATE map (display only)."""
         try:
             register_label_horizons(conn.get_label_horizons())
         except Exception as e:
-            logger.info(
-                f"{config.HORIZON_COL} not read ({e}) — maturity falls back to "
-                "the calendar rule."
-            )
+            logger.info(f"{config.HORIZON_COL} not read ({e}).")
+
+    @staticmethod
+    def _register_ledger_from_db(conn) -> None:
+        """
+        Populate the snapshot -> label-ledger map. Required: without it no
+        snapshot can be called mature, and guessing from the calendar is the
+        bug the ledger exists to remove — so an unreadable ledger raises.
+        """
+        try:
+            ledger = conn.get_label_ledger()
+        except Exception as e:
+            raise RuntimeError(
+                f"Label ledger {config.LABEL_LEDGER_TABLE} is unreadable ({e}). It "
+                "decides which snapshots are mature; check it exists and that "
+                "this account has SELECT on it."
+            ) from e
+        register_label_ledger(ledger)
+        counts: dict = {}
+        for row in ledger.values():
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        logger.info(f"Label ledger: {len(ledger)} finalised snapshot(s) {counts}.")
 
     @staticmethod
     def _warn_on_failed_etl_runs(conn) -> None:
@@ -873,8 +914,8 @@ def load_cached_arrays(cache_dir: Optional[Path] = None) -> tuple[dict, list[str
 
     This is what the standalone diagnostics (explore_iv_woe, explore_umap,
     explore_clip_impact) want: the arrays, not tens of millions of instance
-    dicts rebuilt from them. Label horizons are registered as a side effect,
-    so filter_mature_snapshots works afterwards without a DB.
+    dicts rebuilt from them. Each snapshot's label-ledger row is registered as
+    a side effect, so filter_mature_snapshots works afterwards without a DB.
 
     Takes an arbitrary directory, and deliberately does NOT check the cache key
     — `--baseline` exists to read an older cache on purpose. So it checks the
@@ -921,6 +962,7 @@ def load_cached_arrays(cache_dir: Optional[Path] = None) -> tuple[dict, list[str
             )
         feature_cols = cols
         register_label_horizons(manifest.get("label_horizons", {}))
+        register_label_ledger(manifest.get("label_ledger", {}))
 
     if feature_cols != list(FEATURE_ORDER):
         logger.warning(

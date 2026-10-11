@@ -109,7 +109,8 @@ def exposure_decile_ranking(y_true, scores, strata, exposure, tie_break=None,
 
 
 def full_evaluation(y_true, probs, strata=None, calibrator=None,
-                    portfolio_sizes=None, tie_break=None, exposure=None) -> dict:
+                    portfolio_sizes=None, tie_break=None, exposure=None,
+                    label_status=None) -> dict:
     """
     Single evaluation path shared by the baseline and the DeepSets+XGB model,
     so the two are compared under the SAME decision policy.
@@ -139,6 +140,13 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None,
                        siblings of severe loans now enter the queue) and the
                        severe base rate with it, and PR-AUC moves with the
                        base rate whatever the model does.
+    "ranking_by_label_status": the ranking block (its by_current_cat holds the
+                       current_cat_0 slice) per label vintage, 'FINAL' vs
+                       'LEGACY' (needs `label_status`, one per row). Only
+                       emitted when the test set holds both: FINAL labels
+                       also count loans that stopped paying after T and
+                       never paid again, which LEGACY called healthy, so the
+                       two have different base rates — mostly in cat_0.
     `tie_break` (e.g. per-instance LOAN_ID) decides the order of rows on
     identical scores in every ranking block. Calibrated probabilities tie in
     large blocks, so without it recall@K is a function of input order — see
@@ -180,6 +188,18 @@ def full_evaluation(y_true, probs, strata=None, calibrator=None,
         if exposure is not None:
             out["ranking_by_exposure"] = exposure_decile_ranking(
                 y_true, sev, strata, exposure, tie_break=tie_break)
+        if label_status is not None:
+            label_status = np.asarray(label_status, dtype=object)
+            vintages = sorted({v for v in label_status if v is not None})
+            if len(vintages) > 1:
+                out["ranking_by_label_status"] = {
+                    v: ranking_metrics(
+                        y_true[sel], sev[sel], np.asarray(strata)[sel],
+                        tie_break=None if tie_break is None else np.asarray(tie_break)[sel],
+                    )
+                    for v in vintages
+                    for sel in [label_status == v]
+                }
     out["_cost_preds"] = cost_preds
     out["_probs_cal"] = probs_cal
     return out

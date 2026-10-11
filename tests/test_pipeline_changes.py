@@ -21,7 +21,9 @@ import pytest
 
 import project_config as config
 from src.data.data_loader import DataLoader
-from src.data.temporal_split import filter_mature_snapshots, split_train_by_customer
+from src.data.temporal_split import (
+    filter_mature_snapshots, register_label_ledger, split_train_by_customer,
+)
 from src.evaluation.calibration import PerClassIsotonicCalibrator
 from src.evaluation.decision import cost_decisions, expected_costs, risk_scores
 from src.evaluation.metrics import compute_metrics, stratified_metrics
@@ -211,25 +213,31 @@ def test_iv_binning_handles_skewed_features():
 
 # ── snapshot maturity filtering ────────────────────────────────────────────────
 
-def _yyyymmdd(d: date) -> float:
-    return float(d.strftime("%Y%m%d"))
+MATURE_SNAP, IMMATURE_SNAP = 20250131.0, 20260831.0
+
+
+def _ledger(*snaps, status="FINAL"):
+    """Finalise `snaps` in the label ledger — the only thing that makes one mature."""
+    register_label_ledger({int(s): {"status": status, "loans_unlabelled": 0}
+                           for s in snaps})
 
 
 def test_filter_mature_snapshots_drops_only_immature():
-    horizon = config.LABEL_HORIZON_MONTHS
-    mature_snap   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2)))
-    immature_snap = _yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3)))
+    _ledger(MATURE_SNAP)
+    assert filter_mature_snapshots([MATURE_SNAP, IMMATURE_SNAP]) == [MATURE_SNAP]
 
-    result = filter_mature_snapshots([mature_snap, immature_snap])
-    assert result == [mature_snap]
+
+def test_filter_mature_snapshots_ignores_the_calendar():
+    """Past its horizon but not yet finalised (the few days before the ETL's
+    monthly run) is still open: its labels are NULL. No calendar fallback."""
+    assert filter_mature_snapshots([20200131.0], ledger={}) == []
 
 
 def test_iv_script_drops_immature_snapshot_instances():
     from explore_iv_woe import filter_matured_instances
 
-    horizon = config.LABEL_HORIZON_MONTHS
-    mature_snap   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2)))
-    immature_snap = _yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3)))
+    _ledger(MATURE_SNAP)
+    mature_snap, immature_snap = MATURE_SNAP, IMMATURE_SNAP
 
     X = np.zeros((4, 3))
     labels = np.array([0, 1, 2, 0])
@@ -245,12 +253,16 @@ def test_iv_script_drops_immature_snapshot_instances():
 class _FakeConnector:
     """Duck-types the MSSQLConnector methods DataLoader needs for predict."""
 
-    def __init__(self, available=None, pred_df=None):
+    def __init__(self, available=None, pred_df=None, ledger=()):
         self._available = available or []
         self._pred_df = pred_df
+        self._ledger = {int(s): {"status": "FINAL", "loans_unlabelled": 0} for s in ledger}
 
     def get_available_snapshots(self):
         return self._available
+
+    def get_label_ledger(self):
+        return self._ledger
 
     def load_prediction_data(self, snapshot_date=None, table=None):
         return self._pred_df
@@ -282,34 +294,30 @@ def test_resolve_pred_snapshots_requested_found():
 
 
 def test_resolve_pred_snapshots_requested_missing_falls_back_to_immature():
-    horizon = config.LABEL_HORIZON_MONTHS
-    mature_snap   = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2))))
-    immature_snap = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3))))
-    fake = _FakeConnector(available=[mature_snap, immature_snap])
-
+    fake = _FakeConnector(available=[20250131, 20260831], ledger=[20250131])
     resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots([99999999])
-    assert resolved == [immature_snap]
+    assert resolved == [20260831]
 
 
 def test_resolve_pred_snapshots_none_requested_selects_all_immature():
-    horizon = config.LABEL_HORIZON_MONTHS
-    mature_snap    = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2))))
-    immature_snap1 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3))))
-    immature_snap2 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon - 1))))
-    fake = _FakeConnector(available=[mature_snap, immature_snap1, immature_snap2])
-
+    fake = _FakeConnector(available=[20250131, 20260731, 20260831], ledger=[20250131])
     resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots(None)
-    assert resolved == sorted([immature_snap1, immature_snap2])
+    assert resolved == [20260731, 20260831]
 
 
 def test_resolve_pred_snapshots_no_immature_falls_back_to_latest():
-    horizon = config.LABEL_HORIZON_MONTHS
-    mature_snap1 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 5))))
-    mature_snap2 = int(_yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2))))
-    fake = _FakeConnector(available=[mature_snap1, mature_snap2])
-
+    fake = _FakeConnector(available=[20250131, 20250228], ledger=[20250131, 20250228])
     resolved = DataLoader(mssql_connector=fake).resolve_pred_snapshots(None)
-    assert resolved == [mature_snap2]
+    assert resolved == [20250228]
+
+
+def test_resolve_pred_snapshots_requires_the_ledger():
+    class _NoLedger(_FakeConnector):
+        def get_label_ledger(self):
+            raise RuntimeError("Invalid object name")
+
+    with pytest.raises(RuntimeError, match="unreadable"):
+        DataLoader(mssql_connector=_NoLedger(available=[20250131])).resolve_pred_snapshots(None)
 
 
 # ── 4-class support: model / loss / cost matrix ────────────────────────────────
@@ -539,10 +547,8 @@ def test_capture_curve_is_monotone_and_complete():
 def test_split_for_final_fit_uses_all_mature_snapshots():
     from src.data.temporal_split import split_for_final_fit
 
-    horizon = config.LABEL_HORIZON_MONTHS
-    mature_a   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 8)))
-    mature_b   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon + 2)))
-    immature   = _yyyymmdd(date.today() - timedelta(days=30 * (horizon - 3)))
+    mature_a, mature_b, immature = 20240731.0, 20250131.0, 20260831.0
+    _ledger(mature_a, mature_b)
 
     instances = [
         {"national_code": f"c{i}", "snapshot_date": snap, "label": 0, "current_cat": 0}

@@ -2,10 +2,8 @@
 Temporal split for the Loan Default Classification pipeline.
 
 Rules:
-  1. Drop any snapshot whose label has not yet matured. Maturity is read from
-     the feed's own LABEL_HORIZON_DATE where available (see
-     filter_mature_snapshots), falling back to a calendar computation over
-     LABEL_HORIZON_MONTHS.
+  1. Drop any snapshot whose label is not yet final — one with no row in the
+     ETL's label ledger, EDP_LABEL_FINALIZATION (see filter_mature_snapshots).
   2. Among the remaining (usable) snapshots, ensure that:
        - test  snapshot is at least LABEL_HORIZON_MONTHS months after val
        - val   snapshot is at least LABEL_HORIZON_MONTHS months after the
@@ -56,12 +54,18 @@ def _months_apart(earlier: date, later: date) -> float:
 
 # ── Label maturity ────────────────────────────────────────────────────────────
 
-#: snapshot (int YYYYMMDD) -> LABEL_HORIZON_DATE (int YYYYMMDD), populated by
-#: DataLoader from the feed's own column and carried in the NPZ cache
-#: manifest so cache-only workflows see it too. Module-level because the
-#: readers of maturity (the split, the diagnostics, resolve_pred_snapshots)
-#: are handed bare snapshot values, not the frame they came from.
+#: snapshot (int YYYYMMDD) -> LABEL_HORIZON_DATE (int YYYYMMDD). Display and
+#: diagnostics only since the label ledger went live — maturity is decided by
+#: LABEL_LEDGER below, never by the horizon.
 LABEL_HORIZONS: Dict[int, int] = {}
+
+#: snapshot (int YYYYMMDD) -> its EDP_LABEL_FINALIZATION row, as a dict with
+#: "status" ('FINAL' | 'LEGACY') and the counts "loans_unlabelled" /
+#: "loans_missing_months" (None on LEGACY). Populated by DataLoader from the DB
+#: or from the NPZ manifests, so cache-only workflows see it too. Module-level
+#: because the readers of maturity are handed bare snapshot values, not the
+#: frame they came from.
+LABEL_LEDGER: Dict[int, dict] = {}
 
 
 def register_label_horizons(mapping: Dict) -> None:
@@ -72,51 +76,39 @@ def register_label_horizons(mapping: Dict) -> None:
         LABEL_HORIZONS[int(snap)] = int(horizon)
 
 
-def filter_mature_snapshots(raw_snaps, horizons: Optional[Dict] = None) -> list:
+def register_label_ledger(mapping: Dict) -> None:
+    """Record snapshot -> ledger row. Later calls merge, not replace."""
+    for snap, row in mapping.items():
+        LABEL_LEDGER[int(snap)] = dict(row)
+
+
+def label_status(snap) -> Optional[str]:
+    """'FINAL' / 'LEGACY' for a finalised snapshot, None for an open one."""
+    row = LABEL_LEDGER.get(int(snap))
+    return row["status"] if row else None
+
+
+def filter_mature_snapshots(raw_snaps, ledger: Optional[Dict] = None) -> list:
     """
     Given raw YYYYMMDD snapshot values, return only those whose
-    WORST_FUTURE_* label has had time to materialise. Any script that reads
-    WORST_FUTURE_CAT/DPD — training split, IV/UMAP diagnostics, data
-    profiling — must filter through this before trusting that column.
-    Immature rows carry a well-formed, non-null, systematically optimistic
-    label (the worst category observed SO FAR), with nothing in the value to
-    reveal it, so an unfiltered read does not fail — it just silently trains
-    on optimistic labels.
+    WORST_FUTURE_* label is final. Any script that reads WORST_FUTURE_CAT/DPD
+    — training split, IV/UMAP diagnostics, data profiling — must filter
+    through this before trusting that column.
 
-    Maturity is `LABEL_HORIZON_DATE <= today`, an integer comparison between
-    two Gregorian YYYYMMDD values. The horizon is carried by the feed; it is
-    derived upstream on a different calendar, so re-deriving it here in
-    Gregorian months (as this function used to) can disagree at month
-    boundaries. When no horizon is known for a snapshot the old calendar rule
-    still applies, so synthetic frames and older caches keep working.
+    Mature means the snapshot has a row in EDP_LABEL_FINALIZATION — nothing
+    else. The label is NULL until the first monthly ETL run after the horizon
+    writes that row, so `LABEL_HORIZON_DATE <= today` (the old rule) admits a
+    few days of snapshots whose labels are all NULL. There is deliberately no
+    calendar fallback: a snapshot the ledger does not know is open.
     """
-    horizons = LABEL_HORIZONS if horizons is None else horizons
-    horizon_months = config.LABEL_HORIZON_MONTHS
-    today     = date.today()
-    today_int = int(today.strftime("%Y%m%d"))
-
+    ledger = LABEL_LEDGER if ledger is None else ledger
     raw_snaps = sorted(set(raw_snaps))
-    mature, dropped, guessed = [], [], []
-
-    for snap in raw_snaps:
-        known = horizons.get(int(snap))
-        if known is not None:
-            is_mature = int(known) <= today_int
-        else:
-            guessed.append(snap)
-            is_mature = _months_apart(_snap_to_date(snap), today) >= horizon_months
-        (mature if is_mature else dropped).append(snap)
-
-    if guessed:
-        logger.warning(
-            f"No LABEL_HORIZON_DATE for {len(guessed)} snapshot(s) {guessed} — "
-            f"falling back to the {horizon_months}-month calendar rule. Expected "
-            "only for synthetic frames or a pre-v1.4 cache."
-        )
+    mature  = [s for s in raw_snaps if int(s) in ledger]
+    dropped = [s for s in raw_snaps if int(s) not in ledger]
     if dropped:
         logger.warning(
-            f"Dropping {len(dropped)} snapshot(s) whose labels are not yet "
-            f"mature (LABEL_HORIZON_DATE > {today_int}): {dropped}"
+            f"Dropping {len(dropped)} snapshot(s) not yet finalised in the label "
+            f"ledger: {dropped}"
         )
     return mature
 
@@ -151,7 +143,7 @@ def _apply_train_window(train_snaps: Set, quiet: bool = False) -> Set:
 def _get_usable_snapshots(instances: List[Dict]) -> Tuple[list, list]:
     """
     From a list of instances, return (usable_raw, usable_dates) —
-    snapshots that are mature (>= horizon months old).
+    snapshots that are finalised in the label ledger.
     """
     raw_snaps = sorted(set(inst["snapshot_date"] for inst in instances))
     logger.info(f"All snapshot dates found: {raw_snaps}")
@@ -172,8 +164,7 @@ def split_by_time(instances: List[Dict]) -> tuple:
     Steps
     -----
     1. Collect unique snapshot dates and sort oldest → newest.
-    2. Discard snapshots that are < LABEL_HORIZON_MONTHS from today
-       (their labels have not yet settled).
+    2. Discard snapshots whose labels are not yet final (no ledger row).
     3. Assign:
          - test  → newest usable snapshot
          - val   → second newest usable snapshot
@@ -188,9 +179,8 @@ def split_by_time(instances: List[Dict]) -> tuple:
 
     if not usable_raw:
         raise ValueError(
-            f"No usable snapshots remain after excluding those within the "
-            f"last {horizon} months of today ({date.today()}). "
-            f"Cannot build a train/val/test split."
+            "No usable snapshots remain after excluding those not yet "
+            "finalised in the label ledger. Cannot build a train/val/test split."
         )
 
     # ── 3. Assign test, val, train ────────────────────────────────────────────

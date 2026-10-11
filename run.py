@@ -50,6 +50,7 @@ from src.data.temporal_split import (
     split_for_final_fit,
     generate_walk_forward_folds,
     build_fold_instances,
+    label_status,
 )
 from src.baselines.aggregated_xgboost import ARM_BUILDERS, build_features
 from src.evaluation.fold_aggregator import (
@@ -139,6 +140,15 @@ def timed(label: str, timing_log: dict):
     elapsed = time.perf_counter() - t0
     timing_log[label] = round(elapsed, 2)
     logger.info(f"✓  {label} completed in {elapsed:.1f}s")
+
+
+def _vintage_counts(instances: list) -> dict:
+    """{'FINAL': n, 'LEGACY': n} over the distinct snapshots in `instances`."""
+    counts: dict = {}
+    for snap in {i["snapshot_date"] for i in instances}:
+        v = label_status(snap) or "UNFINALISED"
+        counts[v] = counts.get(v, 0) + 1
+    return counts
 
 
 def _effective_config() -> dict:
@@ -244,7 +254,17 @@ def train_single_fold(
         # with 5 Optuna trials while the repo said "multiclass" and 0, and
         # nothing in the artifacts said so.
         "config": _effective_config(),
+        # Label vintage of each split, in snapshots. A FINAL test fold scored
+        # by a model trained on LEGACY labels sees a higher severe base rate
+        # by DEFINITION (AGENT_HANDOFF §28), not drift.
+        "label_vintage": {
+            name: _vintage_counts(part)
+            for name, part in (("train", train_inst), ("val", val_inst), ("test", test_inst))
+        },
     }))
+    logger.info(f"{fold_label} | label vintage (snapshots): "
+                + "  ".join(f"{n}={_vintage_counts(p)}" for n, p in
+                            (("train", train_inst), ("val", val_inst), ("test", test_inst))))
 
     # Current-category strata for slice-level evaluation and stratified
     # calibration (order matches the dataloaders: shuffle=False for val/test)
@@ -255,6 +275,11 @@ def train_single_fold(
     # so this slice is the apples-to-apples bridge to the portfolio-grain
     # benchmark (results_3..results_6). See full_evaluation's docstring.
     test_sizes   = np.array([i.get("portfolio_n_loans", i["n_loans"]) for i in test_inst])
+    # Label vintage per test row ('FINAL' / 'LEGACY' from the ledger). The two
+    # define the label differently, so a test set holding both gets a ranking
+    # block per vintage — see full_evaluation.
+    test_label_status = np.array(
+        [label_status(i["snapshot_date"]) for i in test_inst], dtype=object)
     # Explicit tie-break for every ranking block. Calibrated probabilities tie
     # in large blocks, and a stable sort resolves ties by input order — so
     # recall@K would otherwise move with how the rows arrived. LOAN_ID is
@@ -381,6 +406,7 @@ def train_single_fold(
                             y_test, test_probs,
                             strata=test_strata, calibrator=arm_cal,
                             portfolio_sizes=test_sizes, tie_break=test_tie_break, exposure=test_exposure,
+                            label_status=test_label_status,
                         )
                         sev = arm_metrics.pop("_probs_cal")[:, -1]
                         arm_metrics.pop("_cost_preds", None)
@@ -475,6 +501,7 @@ def train_single_fold(
                 fe = full_evaluation(
                     y_test, probs_test, strata=test_strata, calibrator=arm_cal,
                     portfolio_sizes=test_sizes, tie_break=test_tie_break, exposure=test_exposure,
+                    label_status=test_label_status,
                 )
                 y_pred     = fe.pop("_cost_preds")
                 y_prob_cal = fe.pop("_probs_cal")

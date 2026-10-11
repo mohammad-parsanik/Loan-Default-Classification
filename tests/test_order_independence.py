@@ -455,12 +455,25 @@ def test_ranking_metrics_are_identical_under_permutation():
 # ── per-snapshot streaming load & cache ───────────────────────────────────────
 
 class _FakeConn:
-    """Serves a multi-snapshot frame the way MSSQLConnector would."""
+    """
+    Serves a multi-snapshot frame the way MSSQLConnector would. `open_snaps`
+    are the snapshots with no label-ledger row; every other one is finalised.
+    `build_time` is each snapshot's etl_job_control end_time.
+    """
 
-    def __init__(self, df: pd.DataFrame, etl_run: str = "20260901"):
+    def __init__(self, df: pd.DataFrame, build_time: str = "2026-09-01 03:00",
+                 open_snaps=()):
         self.df = df
-        self.etl_run = etl_run
+        self.build_time = build_time
+        self.open_snaps = {int(s) for s in open_snaps}
         self.queries: list = []
+
+    def get_label_ledger(self):
+        return {int(s): {"status": "FINAL", "loans_unlabelled": 0}
+                for s in self.get_available_snapshots() if int(s) not in self.open_snaps}
+
+    def get_snapshot_build_time(self, snapshot_date):
+        return self.build_time
 
     def get_available_snapshots(self):
         return sorted(self.df[config.SNAPSHOT_COL].unique().tolist())
@@ -547,10 +560,10 @@ def test_streaming_load_skips_immature_snapshots():
     df = _multi_snapshot_frame()
     future = df[df[config.SNAPSHOT_COL] == 20250331.0].copy()
     future[config.SNAPSHOT_COL] = 20260831.0
-    future[config.HORIZON_COL] = 20270228          # horizon in the future
+    future[config.HORIZON_COL] = 20270228
     df = pd.concat([df, future], ignore_index=True)
 
-    conn = _FakeConn(df)
+    conn = _FakeConn(df, open_snaps=[20260831])
     instances, _ = DataLoader(conn).load_train_portfolios(
         use_cache=False, grain="loan", feature_order=FEATURE_ORDER)
 
@@ -590,31 +603,34 @@ def test_mature_snapshot_cache_is_permanent_and_incremental(tmp_path, monkeypatc
     assert len(grown) == len(first) + 120
 
 
-def test_immature_pred_cache_is_rebuilt_on_a_new_etl_run(tmp_path, monkeypatch):
+def test_pred_cache_follows_the_snapshots_own_build(tmp_path, monkeypatch):
     """
-    The ETL rewrites the newest 7 snapshots every month, so a cached immature
-    snapshot is only good for the ETL cycle that produced it. Reusing it past
-    that serves last month's rows under this month's snapshot date.
+    A published snapshot is built once, so its pred cache is good until that
+    snapshot's own etl_job_control row changes (a deliberate rebuild). Later
+    monthly loads of OTHER snapshots must not invalidate it; an unreadable
+    build time must not be trusted.
     """
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    df = _multi_snapshot_frame(snaps=(20260831.0,), horizon=20270228)  # immature
+    df = _multi_snapshot_frame(snaps=(20260831.0,), horizon=20270228)
+    df[config.TARGET_COL] = np.nan                 # open: labels are NULL
+    load = dict(use_cache=True, grain="loan", feature_order=FEATURE_ORDER)
 
-    conn = _FakeConn(df, etl_run="20260901")
-    DataLoader(conn).load_pred_portfolios(20260831, use_cache=True, grain="loan",
-                                          feature_order=FEATURE_ORDER)
+    conn = _FakeConn(df, open_snaps=[20260831])
+    first, _ = DataLoader(conn).load_pred_portfolios(20260831, **load)
     assert conn.queries == [[20260831]]
+    assert len(first) == len(df)                   # NULL labels did not drop rows
 
-    # Same ETL cycle -> cache hit.
-    conn2 = _FakeConn(df, etl_run="20260901")
-    DataLoader(conn2).load_pred_portfolios(20260831, use_cache=True, grain="loan",
-                                           feature_order=FEATURE_ORDER)
+    conn2 = _FakeConn(df, open_snaps=[20260831])   # same build -> cache hit
+    DataLoader(conn2).load_pred_portfolios(20260831, **load)
     assert conn2.queries == []
 
-    # Next monthly load -> the snapshot was recomputed upstream, re-read it.
-    conn3 = _FakeConn(df, etl_run="20261001")
-    DataLoader(conn3).load_pred_portfolios(20260831, use_cache=True, grain="loan",
-                                           feature_order=FEATURE_ORDER)
+    conn3 = _FakeConn(df, build_time="2026-10-02 03:00", open_snaps=[20260831])
+    DataLoader(conn3).load_pred_portfolios(20260831, **load)   # rebuilt upstream
     assert conn3.queries == [[20260831]]
+
+    conn4 = _FakeConn(df, build_time=None, open_snaps=[20260831])
+    DataLoader(conn4).load_pred_portfolios(20260831, **load)   # unknown -> re-read
+    assert conn4.queries == [[20260831]]
 
 
 def test_load_cached_arrays_rebases_offsets_across_snapshots(tmp_path, monkeypatch):

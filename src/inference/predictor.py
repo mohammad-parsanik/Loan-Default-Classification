@@ -247,10 +247,12 @@ def score_dataframe(
     present they're ignored). Multiple snapshots may be mixed in one call;
     dedup/supersede logic applies exactly as in Predictor.predict().
 
-    `calibration_df` (optional): a DataFrame of a single MATURED snapshot
-    WITH WORST_FUTURE_CAT populated, used to refresh the calibrator before
-    scoring — the DB-free equivalent of Predictor's RECALIBRATE_ON_PREDICT.
-    Omit to use the calibrator shipped in the bundle unchanged.
+    `calibration_df` (optional): a DataFrame of a single FINALISED snapshot
+    (one with a row in EDP_LABEL_FINALIZATION), used to refresh the
+    calibrator before scoring — the DB-free equivalent of Predictor's
+    RECALIBRATE_ON_PREDICT. Rows with a NULL WORST_FUTURE_CAT are dropped; an
+    open snapshot is all NULL and leaves the calibrator unchanged. Omit to use
+    the calibrator shipped in the bundle unchanged.
     """
     from src.data.data_loader import DataLoader   # local: keeps this function's
                                                     # dependency footprint explicit
@@ -273,7 +275,13 @@ def score_dataframe(
                 min_stratum_n=config.CALIBRATION_MIN_STRATUM_N
             ).fit(probs, y, strata)
             logger.info(f"Calibrator refreshed on {len(cal_inst):,} supplied instances.")
+        else:
+            logger.warning("calibration_df has no labelled rows (an open snapshot?) — "
+                           "calibrator left unchanged.")
 
+    # Labels are never scoring inputs, and process_raw_data drops rows whose
+    # label is NULL — which on an open snapshot is every row.
+    df = df.drop(columns=[config.TARGET_COL, "WORST_FUTURE_DPD"], errors="ignore")
     instances, _ = dl.process_raw_data(df, max_loans or scorer.truncate_loans,
                                        scorer.grain, feature_order=features)
     called_log = Predictor._load_called_log(called_log_path)
@@ -300,7 +308,7 @@ class Predictor:
     # ── Calibration refresh ───────────────────────────────────────────────────
 
     def _refresh_calibrator(self) -> None:
-        """Refit the calibrator on the newest matured-label snapshot."""
+        """Refit the calibrator on the newest finalised snapshot (label-ledger row)."""
         try:
             instances, _ = self.data_loader.load_train_portfolios(
                 use_cache=True, grain=self.scorer.grain, feature_order=self.features

@@ -11,7 +11,7 @@ import seaborn as sns
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 import project_config as config
 from src.data.data_loader import DataLoader
-from src.data.temporal_split import filter_mature_snapshots, register_label_horizons
+from src.data.temporal_split import filter_mature_snapshots, register_label_ledger
 
 try:
     from src.db.mssql_connection import MSSQLConnector
@@ -48,20 +48,15 @@ def explore_data(sample_size=1000):
 
         df = conn.load_training_data(snapshot_dates=[latest_snap])
 
-        # WORST_FUTURE_CAT is a forward-looking label: on an immature
-        # snapshot it degenerates to "worst category observed so far" and
-        # is not representative of the real training target distribution.
-        # Use the newest MATURED snapshot for that number instead.
-        try:
-            register_label_horizons(conn.get_label_horizons())
-        except Exception as e:                       # deprecated table, no grant
-            logger.info(f"{config.HORIZON_COL} not read ({e}).")
+        # WORST_FUTURE_CAT is NULL until the ETL finalises a snapshot, so
+        # take the target distribution from the newest finalised one.
+        register_label_ledger(conn.get_label_ledger())
         mature_snaps = filter_mature_snapshots(snapshots)
         label_snap   = mature_snaps[-1] if mature_snaps else None
 
         if label_snap is None:
             logger.warning(
-                "No snapshot has a matured label window yet — "
+                "No snapshot is finalised in the label ledger yet — "
                 "target class distribution cannot be computed."
             )
             df_label = None
