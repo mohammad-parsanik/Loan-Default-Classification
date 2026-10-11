@@ -1504,3 +1504,51 @@ in `metrics.json`. The monitor no longer reads them.
   from not called.
 - **Predicted severe counts will sit below actual** (§24). The report says so next to the
   chart.
+
+---
+
+## 27. The Label Bug and the Monthly State Log (October 3, 2026)
+
+**The label misses loans that stop paying after T and never pay.** `q1.sql` classifies
+installments relative to the snapshot's own date. An installment due after T and still
+unreceived is `STATUS_ID = 1` ("upcoming"), and `Label_DPD` gives it 0
+(`q1.sql:573`). That holds however late the snapshot is rebuilt, because the reference
+date stays T. A loan current at T that then misses every payment is labelled healthy,
+unless it eventually pays late (status 4 counts). The owner's query (`WORST_FUTURE_CAT`
+below the T+6 snapshot's `LOAN_CATEGORY`) returned a few hundred violations per snapshot,
+rising to thousands in recent ones; a correct label gives zero. That is a floor, since
+loans that left the feed drop out of the join.
+
+**What it means for the model:**
+- **The damage concentrates in `current_cat_0`, the slice we judge on.** Loans already
+  behind at T are unaffected, because their oldest unpaid installment keeps accruing.
+- **Every training label to date carries it.**
+- **It varies with snapshot age.** Old snapshots had time for missed installments to be
+  paid late and get counted. §24's reading of the base-rate trend as pure deletion is
+  therefore confounded, and needs re-reading once clean labels exist.
+
+**Agreed design** (work order: `etl_integration/LABEL_STATE_LOG_ETL_PLAN.md`):
+- **Snapshots are built once and never rebuilt.** This also stops rebuilds re-reading
+  deleted installments, Group F's current-balance tag, and the post-T data in REVIEW
+  §24/§25.
+- **New snapshots carry `NULL` labels.**
+- **An append-only `EDP_LOAN_MONTHLY_STATE`** holds each open-window loan's month-end
+  DPD plus the worst DPD reached during the month, including loans that left the feed.
+- **The label is finalised exactly once** from that log, through an `UPDATE` of the two
+  label columns, recorded in `EDP_LABEL_FINALIZATION`. Existing matured snapshots are
+  marked `LEGACY`.
+- **The label keeps its meaning** ("worst at any moment in T…T+6"; today's `Label_DPD`
+  already uses lateness at payment, not month-end), except that the status-1 case is
+  now counted.
+
+**Consumer tasks once the ETL lands** (plan §ML-L1…L5):
+- **Maturity must mean "in the ledger".** It can no longer mean "horizon passed": a
+  snapshot sits with `NULL` labels for the days between its horizon date and the ETL
+  run.
+- **Carry the label vintage per snapshot.**
+- **Move the monitor onto the state log** and delete `reconcile_labels` / `monitoring/labels/`.
+- **Simplify the immature-snapshot cache.**
+
+**Until then:** the monitor's interim outcomes still read the refreshed worst-so-far
+labels, and those carry the status-1 blind spot too.
+
