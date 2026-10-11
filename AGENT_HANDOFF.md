@@ -1600,9 +1600,9 @@ pre-go-live feed**, which has no ledger. It lives on branch
   LEGACY). The self-check also covers the fact that invariant 1 ignores NULL
   labels.
 
-Left for later: ML-L3. Also merging CONSUMER_CONTRACT §2b/3/7/8/10/12 from
-the ETL repo into the local copy by hand (the handoff asks for this; it is not
-done).
+Left for later: ML-L3 (done since, §29). The local CONSUMER_CONTRACT copy
+already matches ETL `921640f`, §12 included (checked against the ETL repo,
+2026-10-11).
 
 ## 29. Monitoring on the Label State Log (October 11, 2026)
 
