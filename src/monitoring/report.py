@@ -81,9 +81,24 @@ class _Charts:
 
 # ── Charts ────────────────────────────────────────────────────────────────────
 
-def _trend(ch, snaps, series, title, name, ci=None):
+def _vintage_start(matured, snaps):
+    """Index of the first FINAL-label snapshot when LEGACY ones precede it, else None."""
+    st = [matured[s]["label_status"] for s in snaps]
+    i = next((i for i, v in enumerate(st) if v == "FINAL"), None)
+    return i if i and "LEGACY" in st[:i] else None
+
+
+VINTAGE_NOTE = ("Dashed line: outcomes from here on use the corrected label, which also counts "
+                "loans that stopped paying and never resumed (the old one called them healthy). "
+                "The severe rate steps up there by definition, mostly among loans with no delay "
+                "when scored; it is not drift.")
+
+
+def _trend(ch, snaps, series, title, name, ci=None, boundary=None):
     fig, ax = plt.subplots(figsize=(6.2, 3.0))
     x = [_d(s) for s in snaps]
+    if boundary is not None:
+        ax.axvline(boundary - 0.5, color=MUTED, lw=1, ls="--", label="New label definition")
     for (label, ys), color in zip(series.items(), SERIES):
         ax.plot(x, ys, color=color, lw=2, marker="o", ms=5, label=label)
         if ci and label in ci:
@@ -94,8 +109,9 @@ def _trend(ch, snaps, series, title, name, ci=None):
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
     ax.set_ylim(bottom=0)
     ax.set_title(title, loc="left", color=INK, fontsize=11)
-    if len(series) > 1:
-        _legend_top(ax, len(series))
+    n_keys = len(series) + (boundary is not None)
+    if n_keys > 1:
+        _legend_top(ax, n_keys)
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     return ch.emit(fig, name, title)
 
@@ -111,7 +127,7 @@ def _early_warning(ch, interim):
         ys = [(interim[s]["rest"] if key == "rest" else interim[s]["cutoffs"][key])
               ["deteriorated_rate"] for s in snaps]
         ax.bar(x + (i - (len(groups) - 1) / 2) * width, ys, width * 0.92, color=color, label=label)
-    ax.set_xticks(x, [f"{_d(s)}\n{interim[s]['months_elapsed']:.0f} mo" for s in snaps])
+    ax.set_xticks(x, [f"{_d(s)}\n{interim[s]['months_observed']} of 6 mo" for s in snaps])
     ax.yaxis.set_major_formatter(PercentFormatter(1.0))
     ax.set_title("Loans already worse than when scored", loc="left", color=INK, fontsize=11)
     _legend_top(ax, len(groups))
@@ -242,6 +258,7 @@ def _management(ch, m) -> str:
             f'<div class="tiles">{"".join(tiles)}</div>')
         snaps = sorted(scored)
         if len(snaps) > 1:
+            vb = _vintage_start(scored, snaps)
             series = {_cap(n): [scored[x]["cutoffs"][n]["recall"] for x in snaps]
                       for n in config.MONITOR_CUTOFFS}
             ci = {_cap(n): ([scored[x]["cutoffs"][n]["recall_ci"][0] for x in snaps],
@@ -249,13 +266,14 @@ def _management(ch, m) -> str:
                   for n in config.MONITOR_CUTOFFS}
             parts.append('<div class="row">'
                          + _trend(ch, snaps, series, "Share of severe loans caught, by snapshot",
-                                  "trend_recall", ci)
+                                  "trend_recall", ci, vb)
                          + _trend(ch, snaps, {"Severe rate": [scored[x]["base_rate"] for x in snaps]},
-                                  "Share of loans that went severe", "trend_base_rate")
+                                  "Share of loans that went severe", "trend_base_rate", boundary=vb)
                          + "</div>"
                          '<p class="note">Shaded band: 95% interval. Movement inside it is noise. '
                          "Read the fixed-count line next to the severe rate: when more loans go "
-                         "severe, the same number of loans can hold a smaller share of them.</p>")
+                         "severe, the same number of loans can hold a smaller share of them.</p>"
+                         + (f'<p class="note">{VINTAGE_NOTE}</p>' if vb is not None else ""))
     else:
         parts.append('<div class="empty">No snapshot with predictions has reached its 6-month '
                      "outcome date yet.</div>")
@@ -268,8 +286,10 @@ def _management(ch, m) -> str:
             f'<p class="lead">Loans in the {cutoff_label(main)} of the {_d(max(interim))} list '
             f"have already worsened at <b>{lift:.1f}×</b> the rate of the rest of the list.</p>"
             + _early_warning(ch, interim)
-            + '<p class="note">"Worse" = a higher delinquency category than when scored. Partial '
-            "window: these rates only rise until the 6 months are up.</p>")
+            + '<p class="note">"Worse" = a higher delinquency category than when scored, by the '
+            "worst lateness seen in the months observed so far (under each date). These rates only "
+            "rise until the 6 months are up; a 1-month figure and a 5-month one are not comparable."
+            "</p>")
 
     if scored:
         s = max(scored)
@@ -304,7 +324,8 @@ def _analyst(ch, m) -> str:
                 "All ranked": [matured[x].get("pr_auc") for x in snaps],
                 "No delay when scored (cat 0)": [
                     matured[x]["queue_by_cat"].get(0, {}).get("pr_auc", np.nan)
-                    for x in snaps]}, "PR-AUC by snapshot", "trend_pr_auc"))
+                    for x in snaps]}, "PR-AUC by snapshot", "trend_pr_auc",
+                boundary=_vintage_start(matured, snaps)))
         rows = []
         for cat, sub in sorted(c.get("queue_by_cat", {}).items()):
             cells = [CAT_NAMES[cat], _num(sub["n"]), _num(sub["n_severe"]),
@@ -343,7 +364,7 @@ def _analyst(ch, m) -> str:
                   _pct(v["enrichment_rule"]["precision"]), _pct(v["enrichment_rule"]["recall"], 1),
                   _pct(v["enrichment_rule"]["recall_top_same_size"], 1)]
                  for x, v in sorted(matured.items()) if "enrichment_rule" in v]
-    rule_rows += [[f"{_d(x)} ({v['months_elapsed']:.0f} mo, open)", _num(v["enrichment_rule"]["n"]),
+    rule_rows += [[f"{_d(x)} ({v['months_observed']} of 6 mo, open)", _num(v["enrichment_rule"]["n"]),
                    _pct(v["enrichment_rule"]["severe_so_far_rate"]), "–", "–"]
                   for x, v in sorted(m["interim"].items()) if "enrichment_rule" in v]
     if rule_rows:
@@ -353,23 +374,32 @@ def _analyst(ch, m) -> str:
 
     q = m["quality"]
     unmatched = ", ".join(f"{_d(s)}: {n:,}" for s, n in q["unmatched_by_snapshot"].items()) or "none"
-    parts.append("<h3>Data quality</h3><ul>"
-                 f"<li>{q['n_prediction_rows']:,} scored rows read.</li>"
-                 f"<li>Scored loans missing from {html.escape(config.TRAIN_TABLE)}: {unmatched}.</li>"
-                 "</ul>")
+    items = [f"{q['n_prediction_rows']:,} scored rows read.",
+             f"Scored loans missing from {html.escape(config.TRAIN_TABLE)}: {unmatched}."]
+    if q.get("no_months_yet"):
+        items.append("Scored, no month observed yet (left out): "
+                     + ", ".join(_d(s) for s in q["no_months_yet"]) + ".")
+    for s, v in sorted(q.get("no_interim_outcome", {}).items()):
+        items.append(f"{_d(s)} (open): {v['deleted']:,} loans with installments deleted upstream "
+                     f"and {v['no_state_rows']:,} with no state-log row — left out of the rates.")
+    for s, v in sorted(m["interim"].items()):
+        if v.get("n_short_months"):
+            items.append(f"{_d(s)} (open): {v['n_short_months']:,} ranked loans have fewer than "
+                         f"{v['months_observed']} months in the state log.")
+    parts.append("<h3>Data quality</h3><ul>" + "".join(f"<li>{i}</li>" for i in items) + "</ul>")
     labels = q.get("labels", {})
-    hit = {s: v for s, v in labels.items() if v["n_label_lowered"] or v["n_vanished"]}
-    if hit:
-        parts.append("<h3>Outcome labels changed upstream</h3>" + _table(
-            ["Snapshot", "Labels lower than last read", "Loans gone from the feed"],
-            [[_d(s), _num(v["n_label_lowered"]), _num(v["n_vanished"])]
-             for s, v in sorted(hit.items())])
-            + '<p class="note">A rebuilt snapshot has seen more installments, so a label can only '
-            "rise. A drop or a vanished loan means installment records were deleted upstream; "
-            "the report keeps the highest label it has read for each loan.</p>")
-    elif labels:
-        parts.append('<p class="note">No outcome label went down and no scored loan left the feed '
-                     "since the last run.</p>")
+    if labels:
+        checked = q.get("cross_checked", {})
+        parts.append("<h3>Outcome labels</h3>" + _table(
+            ["Snapshot", "Label", "Unlabelled loans", "Ledger says", "Labelled from < 7 months",
+             "Cross-checked loans"],
+            [[_d(s), v["status"], _num(v["unlabelled"]), _num(v["ledger_unlabelled"]),
+              _num(v["missing_months"]), _num(checked.get(s))]
+             for s, v in sorted(labels.items())])
+            + '<p class="note">Unlabelled loans had every installment record deleted upstream and '
+            "are left out. Cross-checked: FINAL loans whose label was recomputed here from the "
+            "monthly state log and matched exactly (any mismatch stops the run). LEGACY labels use "
+            "the old definition and cannot be cross-checked.</p>")
     if q.get("runs"):
         parts.append(_table(
             ["Snapshot", "Engine run used", "Status", "Run date", "Failed loans", "Usable runs"],

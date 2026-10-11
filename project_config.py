@@ -32,6 +32,9 @@ TRAIN_TABLE = CONTRACT_TABLE
 # The ETL's label ledger: one row per snapshot whose label is final ('FINAL' or
 # 'LEGACY'). A snapshot is mature iff it is here — see filter_mature_snapshots.
 LABEL_LEDGER_TABLE = "D_ANALYTICS.EDP_LABEL_FINALIZATION"
+# Append-only per-loan month-end state the labels are finalised from; the
+# monitor reads interim (not-yet-final) outcomes from it.
+LABEL_STATE_TABLE = "D_ANALYTICS.EDP_LOAN_MONTHLY_STATE"
 
 ID_COL       = "LOAN_ID"
 CONTRACT_COL = "CONTRACT_NUMBER"

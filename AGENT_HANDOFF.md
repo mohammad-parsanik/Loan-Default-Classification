@@ -1603,3 +1603,54 @@ pre-go-live feed**, which has no ledger. It lives on branch
 Left for later: ML-L3. Also merging CONSUMER_CONTRACT §2b/3/7/8/10/12 from
 the ETL repo into the local copy by hand (the handoff asks for this; it is not
 done).
+
+## 29. Monitoring on the Label State Log (October 11, 2026)
+
+ML-L3 from `etl_integration/LABEL_STATE_LOG_ML_HANDOFF.md`, on branch
+`feat/monitor-state-log`. Like §28, it needs the ledger, so **the monitor no
+longer runs against the pre-go-live feed**.
+
+- **Outcomes** come from one query per scored snapshot (`monitor.OUTCOME_SQL`):
+  the feature row, left-joined to `EDP_LOAN_MONTHLY_STATE` over
+  `SNAPSHOT_DATE..LABEL_HORIZON_DATE`. It returns the worst DPD so far (month
+  S's end state, then each later month's in-month worst, which is the ETL's own
+  label rule), the months observed, and the feed label. The ledger is read
+  once (`load_ledger`).
+- **Matured = ledgered.** The outcome is the feed label. Each cohort carries
+  `label_status`, which goes into `metrics.json` and `history.csv`. Where
+  LEGACY gives way to FINAL, the trend charts draw a dashed "New label
+  definition" line with a note that the severe rate steps up there by
+  definition. Unlabelled loans (NULL label on a ledgered snapshot) are dropped
+  and counted over the **whole** snapshot, not just the scored loans, so the
+  count compares with the ledger's `LOANS_UNLABELLED`; any mismatch logs a
+  warning.
+- **Cross-check (raises).** On a FINAL snapshot, every loan with 6 observed
+  months must have `band_dpd(worst so far) == label`. It also raises if any
+  loan has more than 6 months. `finalize.py:294` in the ETL already refuses to
+  finalise unless `LABEL_HORIZON_DATE` equals the sixth following month-end, so
+  the `BETWEEN` bound covers exactly the label window. If a FINAL snapshot has
+  no loan with 6 months, the run warns that the check could not run. The
+  report's "Outcome labels" table shows how many loans were checked per
+  snapshot.
+- **Interim = not ledgered, and at least 1 month observed.** The outcome is the
+  banded worst so far, a lower bound. It is reported with `months_observed`
+  (the modal count) and `n_short_months` (loans below it, which means a
+  coverage gap, because the state log keeps writing loans that left the feed).
+  A snapshot with 0 months observed is the one just scored. It is left out and
+  listed in data quality. Loans with no worst-so-far value are left out of the
+  rates and counted under two causes: installments deleted upstream, or no
+  state-log row at all (a coverage gap upstream, which also logs a warning).
+- **Matching** is on row existence (`indicator=True`), no longer on a non-NULL
+  label.
+- **`--asof`** filters engine runs on `operation_date`, the ledger on
+  `FINALIZED_AT` and state rows on `BUILT_AT`, each to before the start of the
+  following day. A back-dated report then reproduces what it would have shown
+  on that day.
+- **Deleted:** `reconcile_labels` and the `monitoring/labels/` archive (the
+  state log is written before deletion can reach a loan, and is never
+  rewritten), plus the "Outcome labels changed upstream" table.
+  `band_dpd()` is new (bands 0 / 1–60 / 61–155 / 156–180 / 181+).
+
+At go-live: grant `SELECT` on both new tables, run the monitor once G-6 is
+finalised (that is the first FINAL cross-check), then delete
+`monitoring/labels/` on the server.

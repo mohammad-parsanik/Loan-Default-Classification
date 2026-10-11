@@ -89,7 +89,10 @@ subset you should double-check before a production `--final` run.
 | `INFERENCE_TRACKING_TABLE` | `"D_ANALYTICS.ContractTracking"` | `operation_status_enrichment` other than `NOT_APPLICABLE` marks a loan the engine's exception rule sent to enrichment. |
 | `MONITOR_CUTOFFS` | `{"top_1pct": 0.01, "top_5pct": 0.05, "top_1000": 1000}` | Where the report cuts the list ordered by `p3`: a float is a share of the list (rounded up), an int a fixed number of loans (capped at the list size). Each cutoff gets recall with a 95% interval, hit rate, lift and exposure caught. These replace the API-budget windows (`RANKING_REF_WINDOWS`), which the monitor no longer uses. |
 | `MONITOR_MAIN_CUTOFF` | `"top_5pct"` | The cutoff behind the lead sentence, the migration matrix and every "rest of the list" comparison. Must be a key of `MONITOR_CUTOFFS`. |
-| `MONITOR_OUTPUT_DIR` | `"monitoring"` | Root for `<asof>/metrics.json`, `<asof>/report_<asof>.html`, `<asof>/charts/*.png`, `history.csv` and **`labels/`**. `labels/` is the label archive (one `.npz` per snapshot, holding the highest `WORST_FUTURE_CAT` ever read per loan). It is state, not output: it is what protects the outcomes against upstream deletion, so keep it on the server across runs. Gitignored. |
+| `MONITOR_OUTPUT_DIR` | `"monitoring"` | Root for `<asof>/metrics.json`, `<asof>/report_<asof>.html`, `<asof>/charts/*.png` and `history.csv`. All of it is output and can be regenerated. The old `labels/` archive is no longer used and can be deleted after the first run on the state log. Gitignored. |
+| `LABEL_STATE_TABLE` | `"D_ANALYTICS.EDP_LOAN_MONTHLY_STATE"` | The ETL's append-only month-end state per loan. The monitor reads the interim outcome of an open snapshot from it (worst DPD so far, banded) and recomputes every FINAL label from it as a cross-check. Needs `SELECT`, as does `LABEL_LEDGER_TABLE`. |
+
+`run.py monitor --asof <YYYYMMDD>` is a reproducible cut: only engine runs (`operation_date`), ledger rows (`FINALIZED_AT`) and state rows (`BUILT_AT`) that existed by the end of that day are read. Maturity is ledger membership, as in training.
 
 ## Cache
 
