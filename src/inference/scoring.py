@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import project_config as config
+
 from src.evaluation.calibration import StratifiedCalibrator
 from src.inference.model_loader import ModelLoader
 from src.inference.predictor import score_instances
@@ -81,8 +83,11 @@ def run_scoring(df: pd.DataFrame, params: ScoringParams) -> pd.DataFrame:
             ).fit(probs, y, strata)
             logger.info(f"Calibrator refreshed on {len(cal_inst):,} supplied instances.")
         else:
-            logger.warning("calibration_df had no matured/labelled rows — calibrator unchanged.")
+            logger.warning("calibration_df had no labelled rows (an open snapshot?) — calibrator unchanged.")
 
+    # Labels are never scoring inputs, and process_raw_data drops rows whose
+    # label is NULL — which on an open snapshot is every row.
+    df = df.drop(columns=[config.TARGET_COL, "WORST_FUTURE_DPD"], errors="ignore")
     instances, _ = dl.process_raw_data(df, scorer.truncate_loans, scorer.grain,
                                        feature_order=features)
     called_log = _load_called_log(params.called_log_path)

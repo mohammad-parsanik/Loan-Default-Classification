@@ -29,16 +29,18 @@ MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "password")
 # "EDP_Feature_Train" / "D_ANALYTICS.DPD_SAMPLE1" referred to is deprecated
 # and left in place; nothing here reads it any more.
 TRAIN_TABLE = CONTRACT_TABLE
+# The ETL's label ledger: one row per snapshot whose label is final ('FINAL' or
+# 'LEGACY'). A snapshot is mature iff it is here — see filter_mature_snapshots.
+LABEL_LEDGER_TABLE = "D_ANALYTICS.EDP_LABEL_FINALIZATION"
 
 ID_COL       = "LOAN_ID"
 CONTRACT_COL = "CONTRACT_NUMBER"
 CUSTOMER_COL = "NATIONAL_CODE"
 SNAPSHOT_COL = "SNAPSHOT_DATE"
 TARGET_COL   = "WORST_FUTURE_CAT"
-# T+6 as a Gregorian YYYYMMDD int: the date this row's label becomes
-# trustworthy. Carried per row by the feed, so maturity is a comparison
-# rather than a re-derivation of the horizon from the wall clock in a
-# different calendar. See src/data/temporal_split.filter_mature_snapshots.
+# T+6 as a Gregorian YYYYMMDD int: the end of this row's label window. NOT the
+# maturity test — the label stays NULL until the ETL finalises the snapshot a
+# few days later (LABEL_LEDGER_TABLE). Meta column; never a feature.
 HORIZON_COL  = "LABEL_HORIZON_DATE"
 
 # META_COLS / BINARY_FEATURES / FEATURE_ORDER are NOT maintained here — they
@@ -302,7 +304,14 @@ MONITOR_OUTPUT_DIR       = "monitoring"
 # backfilled: train and score populations stay consistent. Expect the severe
 # base rate, the monetary features' p99 (PAYED_OVERDUE_AMNT / UPCOMING_AMNT /
 # REMAINING_AMNT) and therefore PR-AUC to move. Not comparable to results_1-6.
-DATA_VERSION = "v1.5"
+# v1.6: LABEL MEANING change (label & monthly-state log, ETL go-live; see
+# etl_integration/LABEL_STATE_LOG_ML_HANDOFF.md, AGENT_HANDOFF §28). Maturity is
+# now "has a row in EDP_LABEL_FINALIZATION", not "LABEL_HORIZON_DATE <= today",
+# and FINAL-vintage labels also count installments never paid in (T, T+6] — the
+# old label called those loans healthy. A snapshot cached as mature under the
+# horizon rule may hold the old label where the table now holds the new one;
+# the schema hash cannot see that. Train manifests also gain `label_ledger`.
+DATA_VERSION = "v1.6"
 
 # ── Model — DeepSets (CPU-optimized) ────────────────────
 MAX_LOANS_PER_CUSTOMER = None  # Computed from data (99th percentile)

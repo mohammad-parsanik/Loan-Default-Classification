@@ -15,6 +15,7 @@ only asserts relationships the consumer already relies on.
 """
 
 import logging
+from typing import Optional
 
 import pandas as pd
 
@@ -42,12 +43,17 @@ def _has(df: pd.DataFrame, cols) -> bool:
     return all(c in df.columns for c in cols)
 
 
-def assert_feed_invariants(df: pd.DataFrame, strict: bool = False) -> list[str]:
+def assert_feed_invariants(df: pd.DataFrame, strict: bool = False,
+                           ledger: Optional[dict] = None) -> list[str]:
     """
     Check the feed's row-level invariants. Returns the list of violation
     messages (empty when clean); logs each one. Columns absent from `df` are
     skipped — prediction frames legitimately lack the label columns, and
     synthetic test frames carry only a subset.
+
+    `ledger` (snapshot -> EDP_LABEL_FINALIZATION row, see
+    temporal_split.LABEL_LEDGER) enables the label-nullity checks; None skips
+    them.
     """
     problems: list[str] = []
 
@@ -58,6 +64,8 @@ def assert_feed_invariants(df: pd.DataFrame, strict: bool = False) -> list[str]:
     #    current month and both go through the same banding function, so a
     #    loan cannot end up in a better band than it is in today. This is
     #    arithmetic, not leakage — and it is why aggregate accuracy misleads.
+    #    NULL labels (open snapshots, unlabelled loans) are not violations;
+    #    NaN < x is False, which is what skips them.
     if _has(df, [config.TARGET_COL, "LOAN_CATEGORY"]):
         bad = int((df[config.TARGET_COL] < df["LOAN_CATEGORY"]).sum())
         if bad:
@@ -127,6 +135,27 @@ def assert_feed_invariants(df: pd.DataFrame, strict: bool = False) -> list[str]:
                     "clip/scale exemptions"
                 )
 
+    # 9. label nullity follows the ledger. An open snapshot (no ledger row)
+    #    has every label NULL; a finalised one has exactly LOANS_UNLABELLED
+    #    NULLs (0 for LEGACY, whose count is NULL). A label on an open
+    #    snapshot means the ETL wrote it early; a count mismatch means the
+    #    ledger and the table disagree about what was finalised.
+    if ledger is not None and _has(df, [config.SNAPSHOT_COL, config.TARGET_COL]):
+        nulls = df[config.TARGET_COL].isna().groupby(df[config.SNAPSHOT_COL]).agg(["sum", "size"])
+        for snap, (n_null, n_rows) in nulls.iterrows():
+            row = ledger.get(int(snap))
+            if row is None:
+                if n_null != n_rows:
+                    fail(f"open snapshot {int(snap)} has non-NULL {config.TARGET_COL}",
+                         int(n_rows - n_null))
+            else:
+                expected = row.get("loans_unlabelled") or 0
+                if n_null != expected:
+                    problems.append(
+                        f"snapshot {int(snap)} ({row['status']}) has {int(n_null):,} "
+                        f"NULL {config.TARGET_COL}, ledger says LOANS_UNLABELLED = {expected:,}"
+                    )
+
     if problems:
         summary = f"Feed invariant check on {len(df):,} rows found {len(problems)} problem(s):"
         if strict:
@@ -188,6 +217,23 @@ if __name__ == "__main__":
     assert any("DAYS_SINCE_LAST_DPD > DAYS_SINCE_LAST_30_DPD" in f for f in found)
     assert any("MONTHS_IN_CURRENT_CATEGORY" in f for f in found)
     assert any("HAS_EVER_BEEN_NPL" in f for f in found)
+
+    # NULL labels are not invariant-1 violations (NaN < x is False).
+    unlabelled = good.astype({config.TARGET_COL: float})
+    unlabelled.loc[1, config.TARGET_COL] = float("nan")
+    assert assert_feed_invariants(unlabelled) == []
+
+    # Check 9: label nullity follows the ledger.
+    snap = 20250131
+    final = {snap: {"status": "FINAL", "loans_unlabelled": 1}}
+    legacy = {snap: {"status": "LEGACY", "loans_unlabelled": None}}
+    open_ = good.assign(**{config.TARGET_COL: float("nan")})
+    assert assert_feed_invariants(open_, ledger={}) == []
+    assert any("open snapshot" in f for f in assert_feed_invariants(good, ledger={}))
+    assert assert_feed_invariants(unlabelled, ledger=final) == []
+    assert assert_feed_invariants(good, ledger=legacy) == []
+    assert any("LOANS_UNLABELLED = 1" in f for f in assert_feed_invariants(good, ledger=final))
+    assert any("LOANS_UNLABELLED = 0" in f for f in assert_feed_invariants(unlabelled, ledger=legacy))
     try:
         assert_feed_invariants(bad, strict=True)
         raise AssertionError("strict=True should have raised")

@@ -1552,3 +1552,54 @@ loans that left the feed drop out of the join.
 **Until then:** the monitor's interim outcomes still read the refreshed worst-so-far
 labels, and those carry the status-1 blind spot too.
 
+---
+
+## 28. Consumer Side of the Label Ledger (October 11, 2026)
+
+The ETL side of §27 is merged upstream (ETL `main` @ `921640f`), but **not
+deployed**. The handoff is `etl_integration/LABEL_STATE_LOG_ML_HANDOFF.md`. This
+section covers ML-L1, L2, L4 and L5. **ML-L3 (the monitor reading the state
+log) is deliberately not done yet**: `src/monitoring/` still uses the old
+horizon rule and `reconcile_labels`.
+
+**Decision: no backward compatibility.** Production will be a new server whose
+snapshots and caches get rebuilt. So the ledger is *required*, with no fallback
+to the horizon rule: an unreadable `EDP_LABEL_FINALIZATION` raises in training
+and in `resolve_pred_snapshots`. **This code cannot train against the
+pre-go-live feed**, which has no ledger. It lives on branch
+`feat/label-ledger` until go-live.
+
+- **ML-L1, maturity = ledgered.** `filter_mature_snapshots` checks membership
+  in `temporal_split.LABEL_LEDGER`, which is filled from the DB
+  (`MSSQLConnector.get_label_ledger`) or from the NPZ manifests.
+  `LABEL_HORIZONS` is now for display only. `process_raw_data` drops rows with
+  a NULL label before it casts anything (these are the ledger's
+  `LOANS_UNLABELLED`: drop them, never impute). `_save_cache` raises before it
+  writes a mature NPZ that is unledgered or holds an unlabelled row.
+  `score_dataframe` / `run_scoring` now strip the label columns before
+  processing. Otherwise the NULL-label drop would have silently emptied every
+  open snapshot handed to them with the columns present.
+- **ML-L2, vintage.** Each train manifest carries its snapshot's ledger row
+  (`label_ledger`). `metadata.json` records `label_vintage` (snapshots per
+  status for train, val and test), and the run log prints it.
+  `full_evaluation(label_status=)` emits `ranking_by_label_status` (the ranking
+  block per vintage, with the cat_0 slice inside) **only when the test set
+  holds both**. The test fold is a single snapshot, in walk-forward too, so in
+  practice it never does. The handoff's "a FINAL/LEGACY mix in test" does not
+  apply to this pipeline. The real mix is **train on LEGACY, test on FINAL**
+  once G-6 finalises. The test base rate then steps up *by definition*, so read
+  `label_vintage` before reading the metrics. `DATA_VERSION` → `v1.6`.
+- **ML-L4, pred cache.** A pred NPZ is reused while its snapshot's own
+  `etl_job_control.end_time` is unchanged (`get_snapshot_build_time`). It used
+  to be "the newest ETL cycle". If the end time is unreadable, the snapshot is
+  re-read. `end_time` is taken from the handoff and is **not yet verified
+  against the real table**. If the column has a different name, the cache is
+  simply never reused, which is safe but slow.
+- **ML-L5, feed checks.** Check 9 has two parts. An open snapshot must be all
+  NULL. A ledgered one must have exactly `LOANS_UNLABELLED` NULLs (0 for
+  LEGACY). The self-check also covers the fact that invariant 1 ignores NULL
+  labels.
+
+Left for later: ML-L3. Also merging CONSUMER_CONTRACT §2b/3/7/8/10/12 from
+the ETL repo into the local copy by hand (the handoff asks for this; it is not
+done).

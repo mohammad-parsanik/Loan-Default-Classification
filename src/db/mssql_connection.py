@@ -4,6 +4,7 @@ import pandas as pd
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -110,10 +111,8 @@ class MSSQLConnector:
         """
         snapshot -> LABEL_HORIZON_DATE for every snapshot in the table.
 
-        A cheap DISTINCT (the horizon is constant within a snapshot), so any
-        code that has to tell a matured snapshot from an immature one can read
-        the feed's own answer instead of re-deriving it from the wall clock in
-        a different calendar. See temporal_split.filter_mature_snapshots.
+        A cheap DISTINCT (the horizon is constant within a snapshot). For
+        display and the gap logic only — maturity is get_label_ledger().
         """
         table = table or config.TRAIN_TABLE
         query = (f"SELECT DISTINCT {config.SNAPSHOT_COL}, {config.HORIZON_COL} "
@@ -121,6 +120,51 @@ class MSSQLConnector:
         df = self.read_sql(query)
         return {int(s): int(h)
                 for s, h in df.dropna().itertuples(index=False)}
+
+    def get_label_ledger(self) -> dict:
+        """
+        snapshot -> {"status", "loans_unlabelled", "loans_missing_months"} for
+        every snapshot whose label is final. The ETL writes one row per
+        snapshot at finalisation (STATUS 'FINAL') or at go-live for history
+        (STATUS 'LEGACY', counts NULL), and never rewrites it — so this table,
+        not LABEL_HORIZON_DATE, is what makes a snapshot mature. Raises if the
+        table is unreadable; there is no fallback by design.
+        """
+        df = self.read_sql(
+            "SELECT SNAPSHOT_DATE, STATUS, LOANS_UNLABELLED, LOANS_MISSING_MONTHS "
+            f"FROM {config.LABEL_LEDGER_TABLE}"
+        )
+
+        def _count(v):
+            return None if pd.isna(v) else int(v)
+
+        return {
+            int(r.SNAPSHOT_DATE): {
+                "status": str(r.STATUS).strip().upper(),
+                "loans_unlabelled": _count(r.LOANS_UNLABELLED),
+                "loans_missing_months": _count(r.LOANS_MISSING_MONTHS),
+            }
+            for r in df.itertuples(index=False)
+        }
+
+    def get_snapshot_build_time(self, snapshot_date: int) -> Optional[str]:
+        """
+        end_time of the SUCCESSful ETL run that published `snapshot_date`, as a
+        string; None if there is no such row. Snapshots are built once and
+        never rebuilt (a rebuild of a finalised one needs its ledger row
+        deleted by hand), so an unchanged end_time means unchanged rows.
+        run_month is varchar (it also holds legacy Jalali 'YYYY-MM' values), so
+        the snapshot is passed as a string.
+        """
+        df = self.read_sql(
+            f"SELECT TOP 1 end_time FROM {self.ETL_JOB_CONTROL_TABLE} "
+            "WHERE job_name = ? AND run_month = ? AND status = 'SUCCESS' "
+            "ORDER BY end_time DESC",
+            (self.ETL_JOB_NAME, str(int(snapshot_date))),
+        )
+        if df.empty or pd.isna(df.iloc[0, 0]):
+            return None
+        return str(df.iloc[0, 0])
 
     def close(self):
         if hasattr(self, 'conn') and self.conn is not None:
